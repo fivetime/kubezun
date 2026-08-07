@@ -20,6 +20,14 @@ const syncInterval = 5 * time.Second
 // be read by name is treated as lost rather than as not yet recorded.
 const capsuleAppearGrace = 30 * time.Second
 
+// capsuleCreateTimeout is how long a capsule may stay in Creating before the
+// pod is failed. A capsule normally reaches Running in a couple of minutes;
+// one that never leaves Creating has usually lost its request — a create sent
+// while zun-compute was restarting leaves the record in place with no compute
+// node ever having seen it, and nothing in Zun retries. Failing the pod lets
+// its controller replace it, which is the only thing that recovers.
+const capsuleCreateTimeout = 10 * time.Minute
+
 func (p *Provider) syncLoop(ctx context.Context) {
 	t := time.NewTicker(syncInterval)
 	defer t.Stop()
@@ -78,6 +86,18 @@ func (p *Provider) syncOnce(ctx context.Context) error {
 					pod.Status.Conditions = zun.PodConditions("Error", false, now)
 				})
 			}
+			continue
+		}
+
+		if cap.Status == "Creating" && pod.Status.StartTime != nil &&
+			time.Since(pod.Status.StartTime.Time) > capsuleCreateTimeout {
+			log.G(ctx).WithField("pod", key).WithField("capsule", cap.UUID).
+				Warn("capsule never left Creating; failing the pod so it can be replaced")
+			p.updateStatus(pod, func(pod *corev1.Pod) {
+				pod.Status.Phase = corev1.PodFailed
+				pod.Status.Reason = "CapsuleStuckCreating"
+				pod.Status.Conditions = zun.PodConditions("Error", false, now)
+			})
 			continue
 		}
 
