@@ -308,7 +308,23 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
       → 状态不刷新，kubezun GetPodStatus 会读到陈旧值）；积木已有
       （cri/driver.py `_show_container` / `_populate_container_state`），
       钩子已在 `feat/cri-only-compute` 的 sync_container_state 留好
-- [ ] **（门槛，卡阶段 3）ExecSync + liveness 重启**：stub 现成
+- [x] **探针 step1：传递链打通（2026-08-07）**——capsule 模板 container schema 加
+      `livenessProbe/readinessProbe/startupProbe`（core/v1.Probe 形状，fork
+      `feat/capsule-probes` commit `e40cf2bc`）+ 创建路径存进 `healthcheck.k8s_probes`
+      （复用现有 JSON 列，免 DB migration）；provider 不再拒绝探针而是原样传递
+      （kubezun commit `5cd5e1f`）。**实测**：带 exec + httpGet 探针的 Deployment
+      1/1 Running，探针定义（命令/路径/端口/全部阈值）已落 Zun 数据库
+      ⚠️ 仍拒绝两类无法忠实执行的形式：无 handler 的探针、指向容器自身以外
+      host 的 httpGet/tcpSocket（探针在容器内执行，否则会静默探错对象）
+- [ ] **探针 step2（门槛，卡阶段 3）：Zun 侧 prober 执行**——ExecSync + 周期执行 +
+      阈值计数 + liveness 失败重启 + readiness 结果回流。
+      ⚠️ **实测定案（DESIGN §6.0）：所有探针类型都必须在容器内执行**——
+      宿主机网络与 kata sandbox netns **均不可达 capsule IP**（实测 ping/curl 全失败；
+      kata 的 netns 里只有 tap 设备，网络栈在 VM guest 内），
+      而容器内 `wget 127.0.0.1` / `nc -z 127.0.0.1` 实测可行。
+      故 httpGet/tcpSocket/grpc 需注入**静态** helper（distroless 无 curl/nc）——
+      **kubetron `cmd/probe/main.go` 现成可复用**（get/tcp/install 自安装）
+- [ ] （原）**ExecSync + liveness 重启**：stub 现成
       （(Zun) api_pb2_grpc.py:100-103），zun-compute 落实 capsule 内执行 + restart 语义
 - [ ] **（门槛，卡阶段 4 logs）logs**：CRI 补 log_directory/log_path
       （cri/driver.py:89-94,181-192）+ 新增 GET /capsules/{id}/logs
