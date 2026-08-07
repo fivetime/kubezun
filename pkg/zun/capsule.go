@@ -70,6 +70,49 @@ type Container struct {
 	StatusDetail string `json:"status_detail"`
 	StartedAt    Time   `json:"started_at"`
 	UpdatedAt    Time   `json:"updated_at"`
+
+	// Healthcheck carries both the probe definitions and the state the prober
+	// keeps for them; readiness lives under k8s_probe_state.
+	Healthcheck map[string]any `json:"healthcheck"`
+}
+
+// Ready reports whether the container is serving, as its readiness probe last
+// answered. A container with no readiness probe is ready as soon as it runs,
+// which is what Kubernetes does: absent a probe there is nothing that could
+// say otherwise.
+func (c *Container) Ready() bool {
+	state, ok := c.Healthcheck["k8s_probe_state"].(map[string]any)
+	if !ok {
+		return true
+	}
+	ready, ok := state["ready"].(bool)
+	if !ok {
+		return true
+	}
+	return ready
+}
+
+// HasReadinessProbe reports whether a readiness probe was declared for this
+// container. Until the prober has run once there is no state to read, and a
+// container must not be called ready on the strength of a probe that has not
+// answered yet.
+func (c *Container) HasReadinessProbe() bool {
+	probes, ok := c.Healthcheck["k8s_probes"].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = probes["readinessProbe"]
+	return ok
+}
+
+// ProbeAnswered reports whether the prober has recorded a readiness result.
+func (c *Container) ProbeAnswered() bool {
+	state, ok := c.Healthcheck["k8s_probe_state"].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = state["ready"]
+	return ok
 }
 
 // Time decodes the timestamps Zun emits. They are neither RFC 3339 nor

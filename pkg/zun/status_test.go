@@ -104,3 +104,76 @@ func conditionByType(conds []corev1.PodCondition, t corev1.PodConditionType) cor
 	}
 	return corev1.PodCondition{}
 }
+
+func containerWithProbeState(status string, probes, state map[string]any) *Container {
+	hc := map[string]any{}
+	if probes != nil {
+		hc["k8s_probes"] = probes
+	}
+	if state != nil {
+		hc["k8s_probe_state"] = state
+	}
+	return &Container{Status: status, Healthcheck: hc}
+}
+
+func TestReadinessDecidesWhetherTrafficArrives(t *testing.T) {
+	readinessDeclared := map[string]any{"readinessProbe": map[string]any{}}
+
+	cases := []struct {
+		name string
+		c    *Container
+		want bool
+		why  string
+	}{{
+		name: "no probe declared",
+		c:    containerWithProbeState("Running", nil, nil),
+		want: true,
+		why:  "with no probe nothing can say the container is not serving",
+	}, {
+		name: "probe declared but not yet answered",
+		c:    containerWithProbeState("Running", readinessDeclared, nil),
+		want: false,
+		why:  "traffic must not go to a container that has never been checked",
+	}, {
+		name: "probe passing",
+		c: containerWithProbeState("Running", readinessDeclared,
+			map[string]any{"ready": true}),
+		want: true,
+	}, {
+		name: "probe failing",
+		c: containerWithProbeState("Running", readinessDeclared,
+			map[string]any{"ready": false}),
+		want: false,
+		why:  "this is the split-brain case: the port is open, the data is not",
+	}, {
+		name: "not running",
+		c: containerWithProbeState("Stopped", readinessDeclared,
+			map[string]any{"ready": true}),
+		want: false,
+		why:  "a stale probe result must not outlive the container",
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ContainerReady(tc.c); got != tc.want {
+				t.Errorf("ready = %v, want %v — %s", got, tc.want, tc.why)
+			}
+		})
+	}
+}
+
+func TestCapsuleIsReadyOnlyWhenEveryContainerIs(t *testing.T) {
+	declared := map[string]any{"readinessProbe": map[string]any{}}
+	serving := containerWithProbeState("Running", declared, map[string]any{"ready": true})
+	broken := containerWithProbeState("Running", declared, map[string]any{"ready": false})
+
+	if !CapsuleReady(&Capsule{Containers: []Container{*serving, *serving}}) {
+		t.Error("a capsule whose containers all serve was reported not ready")
+	}
+	if CapsuleReady(&Capsule{Containers: []Container{*serving, *broken}}) {
+		t.Error("a capsule with one container not serving was reported ready")
+	}
+	if CapsuleReady(&Capsule{}) {
+		t.Error("a capsule with no containers was reported ready")
+	}
+}

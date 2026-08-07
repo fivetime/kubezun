@@ -130,12 +130,44 @@ func ContainerStatuses(pod *corev1.Pod, cap *Capsule) []corev1.ContainerStatus {
 		if i < len(cap.Containers) {
 			c := &cap.Containers[i]
 			st.State = ContainerState(c)
-			st.Ready = c.Status == "Running"
+			st.Ready = ContainerReady(c)
 			st.ContainerID = "zun://" + c.UUID
 		}
 		out = append(out, st)
 	}
 	return out
+}
+
+// ContainerReady reports whether a container should receive traffic.
+//
+// Running is not enough on its own: an application can hold its port open
+// while serving stale data, which is exactly what a readiness probe exists to
+// catch — a database mid-failover, a RAFT member on the losing side of a
+// split. Where a readiness probe was declared, its answer decides; until it
+// has answered once the container is not ready, since assuming otherwise would
+// send traffic to something that has never been checked.
+func ContainerReady(c *Container) bool {
+	if c.Status != "Running" {
+		return false
+	}
+	if c.HasReadinessProbe() && !c.ProbeAnswered() {
+		return false
+	}
+	return c.Ready()
+}
+
+// CapsuleReady reports whether every container in a capsule is ready. A pod is
+// only ready when all of its containers are.
+func CapsuleReady(cap *Capsule) bool {
+	if len(cap.Containers) == 0 {
+		return false
+	}
+	for i := range cap.Containers {
+		if !ContainerReady(&cap.Containers[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // PodIP returns the capsule's address on the tenant network. Keeping podIP

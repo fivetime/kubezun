@@ -82,10 +82,14 @@ func (p *Provider) syncOnce(ctx context.Context) error {
 		}
 
 		phase := zun.PodPhase(cap.Status)
-		// Ready means the workload is reachable, which needs the data plane as
-		// well as the process: a capsule whose port has no address yet is
-		// running but unreachable.
-		ready := cap.Status == "Running" && zun.PodIP(cap) != ""
+		// Ready has to satisfy three separate things before traffic is sent
+		// here: the capsule runs, it has an address to reach it on, and its
+		// containers say they are serving. The last one is the only source
+		// that can tell a healthy application from one that merely holds its
+		// port open, which is what readiness probes are for.
+		ready := cap.Status == "Running" &&
+			zun.PodIP(cap) != "" &&
+			zun.CapsuleReady(cap)
 		statuses := zun.ContainerStatuses(pod, cap)
 		ip := zun.PodIP(cap)
 
