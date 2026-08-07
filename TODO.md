@@ -151,6 +151,15 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 - [x] ⚠️ 不可支持字段显式拒绝（hostNetwork/hostPID/hostIPC/hostPath/projected/
       privileged/**探针**），错误信息点名字段与原因；测试逐项覆盖
 - [x] **podIP 回填 capsule OVN IP**（`sync.go`，同时填 PodIPs/HostIP）
+- [x] **节点级健康：Ready 反映 Zun 可达性（2026-08-07，`pkg/provider/nodehealth.go`）**——
+      消除节点级假健康。此前节点恒 Ready，Zun 挂掉时调度器仍把 pod 送来、
+      永远卡 ContainerCreating。现实现 NodeProvider：连续 3 次探测失败才转
+      NotReady（单次失败多为抖动，据此翻转会驱逐节点上全部 pod），
+      Ready condition 直接携带失败原因。
+      **实测（停 devstack@zun-api）**：两租户节点均转 NotReady 并显示
+      "zun is unreachable: ...connection refused"；新 pod 停在 **Pending**
+      （而非假装在创建）；**运行中的 pod 不受影响**；zun-api 恢复后
+      两节点自动回到 Ready、Pending 的 pod 随即 1/1 Running
 - [x] Ready 判定 = capsule Running ∧ 有地址（`zun.PodConditions(status, ready, t)`，
       未就绪时 Reason=NetworkNotReady）
 - [x] NotifyPods 异步状态推送（`provider.NotifyPods` + 5s `syncLoop`）；
