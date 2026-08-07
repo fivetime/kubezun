@@ -406,6 +406,8 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       （FIP 计数 4→3，LB 一并删除）。
       ⚠️ 前置条件：**VIP 子网必须接在带外网网关的 router 上**，否则报
       `ExternalGatewayForFloatingIPNotFound`（本环境原先只接了 pod 子网，已补接）
+- [ ] ⚠️ **多集群共用 Designate 会撞 zone 名**（DESIGN §7.5c）：zone 名全局唯一（实测），
+      两个平台各有租户 111111 时同名。需在 zone 名里加集群标识。单集群不暴露，未处理
 - [ ] ⚠️ **DNS 仍有两个待决项**（DESIGN §7.6）：① capsule 的 `resolv.conf` 来自子网
       `dns_nameservers`（实测 8.8.8.8），**不能直接指 Designate 后端**——那是权威 DNS 不做递归，
       指过去公网域名全断；需要一个"持有这些 zone 为权威 + 其余递归"的 resolver；

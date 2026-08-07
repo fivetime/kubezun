@@ -554,6 +554,33 @@ watch 租户 TLS Secret → 内容变了重新镜像 → 更新 listener 引用�
 ⚠️ **范围仅限 Ingress**：Service（L4）根本不终止 TLS，流量直通 pod，证书在租户容器里，
 我们看不见也不需要看见。
 
+### 7.5c ⚠️ Designate 的 zone 名**全局唯一**（2026-08-07 实测）
+
+实测：同一个 zone 名在第二个 project 建立时直接 `duplicate_zone` 被拒。
+**跨 project 不隔离命名空间。**
+
+**我们的方案成立，但依赖一个前提，必须写下来：**
+
+zone 名是 `<上游 namespace>.svc.cluster.local.`，而 kubezoo 的上游 namespace **带租户前缀**
+（实测：`111111-default`、`111111-kube-system`…）。所以：
+
+- 租户 111111 → `111111-default.svc.cluster.local.`
+- 租户 222222 → `222222-default.svc.cluster.local.`
+
+天然不同。实测两者在各自 project 下并存成功。
+
+⚠️ **关键：`svc.cluster.local.` 这个 zone 本身从不创建**（实测确认不存在）。我们只建它的
+下一级，父域不被任何租户占有——否则第一个建它的租户就会把其余所有租户挡在门外。
+
+**由此产生的硬约束（改动前必读）：**
+
+1. **zone 名必须包含租户前缀。** 若将来改成用租户可见的 namespace（`default`）命名，
+   **第二个租户就建不出 zone**。租户前缀是这套命名唯一的隔离来源。
+2. **不得创建 `svc.cluster.local.` 或 `cluster.local.` 作为 zone。**
+3. ⚠️ **多集群共用一个 Designate 时会撞车**：两个平台各有租户 111111 → 同名 zone。
+   需在名字里加集群标识（kubetron 用 `device_owner` tag 加 cluster id 解同类问题，
+   `pkg/neutron/clusterid_test.go`）。**当前未处理**，单集群下不暴露。
+
 ### 7.6a VIP port 与生命周期（2026-08-07 实测，含一次自我更正）
 
 **OVN provider 会建 VIP port**（`helper.py:3040 create_vip_port`，命名
