@@ -230,10 +230,18 @@ func BuildTemplate(pod *corev1.Pod, opts TemplateOptions) ([]byte, error) {
 	}
 
 	for _, c := range pod.Spec.InitContainers {
-		t.Spec.InitContainers = append(t.Spec.InitContainers, buildContainer(c))
+		built, err := buildContainer(c)
+		if err != nil {
+			return nil, err
+		}
+		t.Spec.InitContainers = append(t.Spec.InitContainers, built)
 	}
 	for _, c := range pod.Spec.Containers {
-		t.Spec.Containers = append(t.Spec.Containers, buildContainer(c))
+		built, err := buildContainer(c)
+		if err != nil {
+			return nil, err
+		}
+		t.Spec.Containers = append(t.Spec.Containers, built)
 	}
 	if len(t.Spec.Containers) == 0 {
 		return nil, errdefs.InvalidInput("pod has no containers")
@@ -242,7 +250,7 @@ func BuildTemplate(pod *corev1.Pod, opts TemplateOptions) ([]byte, error) {
 	return json.Marshal(t)
 }
 
-func buildContainer(c corev1.Container) container {
+func buildContainer(c corev1.Container) (container, error) {
 	out := container{
 		Name:    c.Name,
 		Image:   c.Image,
@@ -270,10 +278,20 @@ func buildContainer(c corev1.Container) container {
 	if r := buildResources(c.Resources); r != nil {
 		out.Resources = r
 	}
-	out.LivenessProbe = c.LivenessProbe
-	out.ReadinessProbe = c.ReadinessProbe
-	out.StartupProbe = c.StartupProbe
-	return out
+	// Network probes are turned into exec probes against the container itself
+	// here rather than in the pod: what Kubernetes stores stays what its author
+	// wrote, and only the capsule sees the rewritten form.
+	var err error
+	if out.LivenessProbe, err = RewriteProbe(c.LivenessProbe, &c); err != nil {
+		return out, err
+	}
+	if out.ReadinessProbe, err = RewriteProbe(c.ReadinessProbe, &c); err != nil {
+		return out, err
+	}
+	if out.StartupProbe, err = RewriteProbe(c.StartupProbe, &c); err != nil {
+		return out, err
+	}
+	return out, nil
 }
 
 func buildResources(r corev1.ResourceRequirements) *resources {

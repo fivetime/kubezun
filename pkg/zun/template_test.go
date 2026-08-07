@@ -201,12 +201,82 @@ func TestBuildTemplateCarriesProbes(t *testing.T) {
 		t.Errorf("periodSeconds = %v, want 10", live["periodSeconds"])
 	}
 
+	// The httpGet became an exec against the container itself, since nothing
+	// outside the container can reach its address.
 	ready, ok := c["readinessProbe"].(map[string]any)
 	if !ok {
 		t.Fatal("readinessProbe did not reach the template")
 	}
-	if ready["httpGet"].(map[string]any)["path"] != "/ready" {
-		t.Errorf("httpGet path was not carried through: %v", ready["httpGet"])
+	if _, still := ready["httpGet"]; still {
+		t.Error("httpGet reached the capsule unrewritten; it could never succeed there")
+	}
+	shell := ready["exec"].(map[string]any)["command"].([]any)
+	script := shell[len(shell)-1].(string)
+	if !strings.Contains(script, "127.0.0.1:8080/ready") {
+		t.Errorf("rewritten probe does not target the container itself: %s", script)
+	}
+	if ready["failureThreshold"].(float64) != 3 {
+		t.Errorf("failureThreshold = %v, want 3: timing must survive the rewrite",
+			ready["failureThreshold"])
+	}
+}
+
+func TestRewriteResolvesNamedPorts(t *testing.T) {
+	// A probe naming a port resolves it from the container's declarations,
+	// which is what the kubelet does; leaving the name in the command would
+	// probe nothing.
+	p := pod(func(p *corev1.Pod) {
+		p.Spec.Containers[0].Ports = []corev1.ContainerPort{
+			{Name: "metrics", ContainerPort: 9090},
+		}
+		p.Spec.Containers[0].ReadinessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("metrics")},
+			},
+		}
+	})
+	raw, err := BuildTemplate(p, TemplateOptions{})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	c := decode(t, raw)["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)
+	cmd := c["readinessProbe"].(map[string]any)["exec"].(map[string]any)["command"].([]any)
+	if script := cmd[len(cmd)-1].(string); !strings.Contains(script, "127.0.0.1:9090/healthz") {
+		t.Errorf("named port was not resolved: %s", script)
+	}
+}
+
+func TestRewriteRefusesUndeclaredNamedPort(t *testing.T) {
+	p := pod(func(p *corev1.Pod) {
+		p.Spec.Containers[0].LivenessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("nope")},
+			},
+		}
+	})
+	if _, err := BuildTemplate(p, TemplateOptions{}); err == nil {
+		t.Fatal("a probe naming an undeclared port was accepted; it would probe nothing")
+	}
+}
+
+func TestExecProbesAreLeftAlone(t *testing.T) {
+	// An exec probe needs no network and must reach the runtime verbatim —
+	// this is the form a DB or RAFT member uses to answer for itself.
+	p := pod(func(p *corev1.Pod) {
+		p.Spec.Containers[0].LivenessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				Exec: &corev1.ExecAction{Command: []string{"etcdctl", "endpoint", "health"}},
+			},
+		}
+	})
+	raw, err := BuildTemplate(p, TemplateOptions{})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	c := decode(t, raw)["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)
+	cmd := c["livenessProbe"].(map[string]any)["exec"].(map[string]any)["command"].([]any)
+	if len(cmd) != 3 || cmd[0] != "etcdctl" {
+		t.Errorf("exec probe was altered: %v", cmd)
 	}
 }
 
