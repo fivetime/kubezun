@@ -3,6 +3,7 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -348,8 +349,57 @@ func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, con
 	if err := p.authorize(namespace); err != nil {
 		return nil, err
 	}
-	return nil, errNotImplemented(
-		"container logs need the capsule log endpoint, which this Zun build does not serve yet")
+	p.mu.RLock()
+	pod, tracked := p.pods[zun.PodKey(namespace, podName)]
+	p.mu.RUnlock()
+	if !tracked {
+		return nil, errdefs.NotFoundf("pod %s/%s is not running on this node", namespace, podName)
+	}
+	if opts.Follow {
+		// Zun returns the whole log at once rather than a stream. Polling for
+		// more would repeat lines at every boundary, so this says what it
+		// cannot do instead of appearing to follow.
+		return nil, errNotImplemented("following logs needs a streaming endpoint Zun does not serve")
+	}
+
+	logOpts := zun.LogOptions{
+		Tail:       opts.Tail,
+		Timestamps: opts.Timestamps,
+	}
+	if opts.SinceSeconds > 0 {
+		logOpts.Since = time.Now().Add(-time.Duration(opts.SinceSeconds) * time.Second)
+	}
+	if !opts.SinceTime.IsZero() {
+		logOpts.Since = opts.SinceTime
+	}
+
+	index := containerIndex(pod, containerName)
+	if index < 0 {
+		return nil, errdefs.NotFoundf(
+			"pod %s/%s has no container named %s", namespace, podName, containerName)
+	}
+
+	data, err := p.capsules.LogsForPod(ctx, string(pod.UID), index, logOpts)
+	if err != nil {
+		return nil, err
+	}
+	if opts.LimitBytes > 0 && len(data) > opts.LimitBytes {
+		// Kubernetes truncates from the start, keeping the most recent output,
+		// which is what a caller asking for a limit is looking for.
+		data = data[len(data)-opts.LimitBytes:]
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// containerIndex reports where a container sits in the pod's spec, which is
+// how it is identified on the Zun side.
+func containerIndex(pod *corev1.Pod, name string) int {
+	for i, c := range pod.Spec.Containers {
+		if c.Name == name {
+			return i
+		}
+	}
+	return -1
 }
 
 func (p *Provider) RunInContainer(ctx context.Context, namespace, podName, containerName string, cmd []string, attach api.AttachIO) error {
