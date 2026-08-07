@@ -152,8 +152,8 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 - [x] NotifyPods 异步状态推送（`provider.NotifyPods` + 5s `syncLoop`）；
       **状态指纹去抖**——稳态零通知（测试守卫）
 - [x] DeletePod 异步化（不等 capsule 消失，终态由状态轮询回报）
-- [ ] 状态映射三处修复的**单元测试**（Stopped→Terminated / exit code≠0 / startTime）
-      —— 代码已修，测试待补
+- [x] 状态映射三处修复 + 单元测试守卫（Stopped→Terminated / 失败 exit code≠0 /
+      startTime 保留；另加 Ready 需数据面、PodPhase 全表、PodIP/PortIDs）
 - [ ] 节点真实上报：capacity 镜像 ResourceQuota（⚠️ kaaas §2.3 教训：静态容量把失败位移到
       ContainerCreating；弃硬编码 zun.go:66-68,539-545）；conditions 真实化（弃静态恒 Ready
       + OutOfDisk，zun.go:255-299）；InternalIP=VK 实例 IP（现 nil，zun.go:303-305）（§3）

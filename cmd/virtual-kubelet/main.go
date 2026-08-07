@@ -31,6 +31,7 @@ type options struct {
 	tenant      string
 	namespaces  string
 	zone        string
+	zunAZ       string
 	networkID   string
 	kubeconfig  string
 	listenAddr  string
@@ -51,6 +52,10 @@ func main() {
 		"comma-separated namespaces this node serves; pods from any other namespace are refused")
 	flag.StringVar(&o.zone, "zone", os.Getenv("KUBEZUN_ZONE"),
 		"topology zone, mapped onto the Zun availability zone")
+	flag.StringVar(&o.zunAZ, "zun-availability-zone", os.Getenv("KUBEZUN_ZUN_AZ"),
+		"Zun availability zone capsules are placed in; defaults to letting Zun choose. "+
+			"This is not the same namespace of names as --zone, which is the Kubernetes "+
+			"topology label, so the two are configured separately")
 	flag.StringVar(&o.networkID, "network-id", os.Getenv("KUBEZUN_NETWORK_ID"),
 		"tenant Neutron network capsules attach to")
 	flag.StringVar(&o.kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"), "path to kubeconfig")
@@ -123,7 +128,7 @@ func run(o options) error {
 		p, err := provider.New(provider.Config{
 			Namespaces:       namespaces,
 			NetworkID:        o.networkID,
-			AvailabilityZone: o.zone,
+			AvailabilityZone: o.zunAZ,
 			NodeName:         o.nodeName,
 		}, zunClient)
 		if err != nil {

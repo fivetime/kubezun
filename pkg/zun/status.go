@@ -1,7 +1,6 @@
 package zun
 
 import (
-	"github.com/gophercloud/gophercloud/v2/openstack/container/v1/capsules"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -61,8 +60,8 @@ func PodConditions(status string, ready bool, t metav1.Time) []corev1.PodConditi
 }
 
 // ContainerState maps a capsule container onto a Kubernetes container state.
-func ContainerState(c *capsules.Container) corev1.ContainerState {
-	started := metav1.NewTime(c.StartedAt)
+func ContainerState(c *Container) corev1.ContainerState {
+	started := metav1.NewTime(c.StartedAt.Time)
 	switch c.Status {
 	case "Running":
 		return corev1.ContainerState{
@@ -78,7 +77,7 @@ func ContainerState(c *capsules.Container) corev1.ContainerState {
 				Reason:     "Completed",
 				Message:    c.StatusDetail,
 				StartedAt:  started,
-				FinishedAt: metav1.NewTime(c.UpdatedAt),
+				FinishedAt: metav1.NewTime(c.UpdatedAt.Time),
 			},
 		}
 	case "Error", "Dead":
@@ -88,7 +87,7 @@ func ContainerState(c *capsules.Container) corev1.ContainerState {
 				Reason:     c.Status,
 				Message:    c.StatusDetail,
 				StartedAt:  started,
-				FinishedAt: metav1.NewTime(c.UpdatedAt),
+				FinishedAt: metav1.NewTime(c.UpdatedAt.Time),
 			},
 		}
 	default:
@@ -104,7 +103,7 @@ func ContainerState(c *capsules.Container) corev1.ContainerState {
 // exitCode reports the container's exit status. Zun does not expose the real
 // code, so a failed container must not claim 0: that is the code callers read
 // as success.
-func exitCode(c *capsules.Container) int32 {
+func exitCode(c *Container) int32 {
 	switch c.Status {
 	case "Error", "Dead":
 		return 1
@@ -114,14 +113,13 @@ func exitCode(c *capsules.Container) int32 {
 }
 
 // ContainerStatuses builds the per-container statuses of a pod from a capsule.
-func ContainerStatuses(pod *corev1.Pod, cap *capsules.Capsule) []corev1.ContainerStatus {
-	byName := make(map[string]*capsules.Container, len(cap.Containers))
-	for i := range cap.Containers {
-		byName[cap.Containers[i].Name] = &cap.Containers[i]
-	}
-
+//
+// Matching is positional: Zun ignores the name given in the template and
+// invents its own ("capsule-<capsule>-<word>-<n>"), so there is nothing to
+// match on but the order, which Zun preserves from the template.
+func ContainerStatuses(pod *corev1.Pod, cap *Capsule) []corev1.ContainerStatus {
 	out := make([]corev1.ContainerStatus, 0, len(pod.Spec.Containers))
-	for _, spec := range pod.Spec.Containers {
+	for i, spec := range pod.Spec.Containers {
 		st := corev1.ContainerStatus{
 			Name:  spec.Name,
 			Image: spec.Image,
@@ -129,32 +127,21 @@ func ContainerStatuses(pod *corev1.Pod, cap *capsules.Capsule) []corev1.Containe
 				Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"},
 			},
 		}
-		// Zun prefixes container names with "capsule-<capsule name>-"; match
-		// on suffix so a rename on either side does not silently drop status.
-		for name, c := range byName {
-			if name == spec.Name || hasSuffixName(name, spec.Name) {
-				st.State = ContainerState(c)
-				st.Ready = c.Status == "Running"
-				st.ContainerID = "zun://" + c.UUID
-				break
-			}
+		if i < len(cap.Containers) {
+			c := &cap.Containers[i]
+			st.State = ContainerState(c)
+			st.Ready = c.Status == "Running"
+			st.ContainerID = "zun://" + c.UUID
 		}
 		out = append(out, st)
 	}
 	return out
 }
 
-func hasSuffixName(full, name string) bool {
-	if len(full) <= len(name) {
-		return false
-	}
-	return full[len(full)-len(name):] == name
-}
-
 // PodIP returns the capsule's address on the tenant network. Keeping podIP
 // equal to the Neutron port's IP is what lets the platform's Service and DNS
 // controllers treat a capsule exactly like any other endpoint (DESIGN §5).
-func PodIP(cap *capsules.Capsule) string {
+func PodIP(cap *Capsule) string {
 	for _, addrs := range cap.Addresses {
 		for _, a := range addrs {
 			if a.Version == 4 && a.Addr != "" {
@@ -166,7 +153,7 @@ func PodIP(cap *capsules.Capsule) string {
 }
 
 // PortIDs lists the Neutron ports backing a capsule.
-func PortIDs(cap *capsules.Capsule) []string {
+func PortIDs(cap *Capsule) []string {
 	var ids []string
 	for _, addrs := range cap.Addresses {
 		for _, a := range addrs {

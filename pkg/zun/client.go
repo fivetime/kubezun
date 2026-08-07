@@ -85,6 +85,10 @@ func NewClient(ctx context.Context, creds Credentials) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("find the container (zun) endpoint: %w", err)
 	}
+	// gophercloud registers this endpoint as "application-container" and
+	// builds the microversion header from that name, but Zun only accepts
+	// "OpenStack-API-Version: container <v>" and answers 406 to anything else.
+	sc.Type = "container"
 	sc.Microversion = Microversion
 	return &Client{sc: sc}, nil
 }

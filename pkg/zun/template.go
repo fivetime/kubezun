@@ -57,6 +57,15 @@ func Validate(pod *corev1.Pod) error {
 			return unsupported("spec.volumes[].hostPath",
 				"there is no shared host filesystem behind a virtual node")
 		case v.Projected != nil:
+			// The service account token volume is injected into every pod that
+			// does not opt out, so name the opt-out here: without it the
+			// message reads as a defect in the workload rather than a setting
+			// the tenant has to make.
+			if strings.HasPrefix(v.Name, "kube-api-access-") {
+				return unsupported("the service account token volume",
+					"a capsule cannot refresh a bound token; set "+
+						"automountServiceAccountToken: false on the pod")
+			}
 			return unsupported("spec.volumes[].projected",
 				"projected volumes need a kubelet to refresh their contents")
 		}
@@ -84,6 +93,10 @@ func Validate(pod *corev1.Pod) error {
 
 // container is one entry of the capsule template's spec.containers.
 type container struct {
+	// Named after the pod's container so status can be matched back to it;
+	// without a name Zun invents one and the pod's container statuses stay
+	// stuck at ContainerCreating however healthy the capsule is.
+	Name      string            `json:"name"`
 	Image     string            `json:"image"`
 	Command   []string          `json:"command,omitempty"`
 	Args      []string          `json:"args,omitempty"`
@@ -193,6 +206,7 @@ func BuildTemplate(pod *corev1.Pod, opts TemplateOptions) ([]byte, error) {
 
 func buildContainer(c corev1.Container) container {
 	out := container{
+		Name:    c.Name,
 		Image:   c.Image,
 		Command: c.Command,
 		Args:    c.Args,
@@ -239,14 +253,17 @@ func buildResources(r corev1.ResourceRequirements) *resources {
 	return out
 }
 
+// restartPolicy returns the value the capsule template schema accepts. The
+// capsule spec uses the Kubernetes spelling ("Always"), unlike the container
+// API's own lowercase form, and the schema rejects anything else.
 func restartPolicy(pod *corev1.Pod) string {
 	switch pod.Spec.RestartPolicy {
 	case corev1.RestartPolicyNever:
-		return "no"
+		return "Never"
 	case corev1.RestartPolicyOnFailure:
-		return "on-failure"
+		return "OnFailure"
 	default:
-		return "always"
+		return "Always"
 	}
 }
 

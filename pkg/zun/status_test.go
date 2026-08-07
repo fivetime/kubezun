@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gophercloud/gophercloud/v2/openstack/container/v1/capsules"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -12,7 +11,7 @@ import (
 func TestStoppedContainerIsTerminatedNotRunning(t *testing.T) {
 	// Reporting a stopped container as Running leaves a Job forever
 	// incomplete and hides a crash from a Deployment.
-	st := ContainerState(&capsules.Container{Status: "Stopped"})
+	st := ContainerState(&Container{Status: "Stopped"})
 	if st.Running != nil {
 		t.Fatal("a stopped container was reported as running")
 	}
@@ -28,7 +27,7 @@ func TestFailedContainerDoesNotReportSuccess(t *testing.T) {
 	// Exit code 0 is what every caller reads as success, so a failed
 	// container must not report it.
 	for _, status := range []string{"Error", "Dead"} {
-		st := ContainerState(&capsules.Container{Status: status})
+		st := ContainerState(&Container{Status: status})
 		if st.Terminated == nil {
 			t.Fatalf("%s: no terminated state", status)
 		}
@@ -40,7 +39,7 @@ func TestFailedContainerDoesNotReportSuccess(t *testing.T) {
 
 func TestStartTimeIsPreserved(t *testing.T) {
 	started := time.Date(2026, 8, 7, 10, 0, 0, 0, time.UTC)
-	st := ContainerState(&capsules.Container{Status: "Running", StartedAt: started})
+	st := ContainerState(&Container{Status: "Running", StartedAt: Time{started}})
 	if st.Running == nil {
 		t.Fatal("running container has no running state")
 	}
@@ -83,7 +82,7 @@ func TestPodPhaseMapping(t *testing.T) {
 }
 
 func TestPodIPPrefersIPv4Address(t *testing.T) {
-	cap := &capsules.Capsule{Addresses: map[string][]capsules.Address{
+	cap := &Capsule{Addresses: map[string][]Address{
 		"net": {{Version: 4, Addr: "192.168.100.10", Port: "port-1"}},
 	}}
 	if got := PodIP(cap); got != "192.168.100.10" {
@@ -92,7 +91,7 @@ func TestPodIPPrefersIPv4Address(t *testing.T) {
 	if ports := PortIDs(cap); len(ports) != 1 || ports[0] != "port-1" {
 		t.Errorf("PortIDs = %v, want [port-1]", ports)
 	}
-	if got := PodIP(&capsules.Capsule{}); got != "" {
+	if got := PodIP(&Capsule{}); got != "" {
 		t.Errorf("PodIP of an address-less capsule = %q, want empty", got)
 	}
 }

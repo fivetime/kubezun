@@ -16,6 +16,10 @@ import (
 // NotifyPods so the node controller itself never has to poll.
 const syncInterval = 5 * time.Second
 
+// capsuleAppearGrace is how long a pod may exist before a capsule that cannot
+// be read by name is treated as lost rather than as not yet recorded.
+const capsuleAppearGrace = 30 * time.Second
+
 func (p *Provider) syncLoop(ctx context.Context) {
 	t := time.NewTicker(syncInterval)
 	defer t.Stop()
@@ -32,11 +36,6 @@ func (p *Provider) syncLoop(ctx context.Context) {
 }
 
 func (p *Provider) syncOnce(ctx context.Context) error {
-	managed, err := p.capsules.ListManaged(ctx)
-	if err != nil {
-		return err
-	}
-
 	p.mu.RLock()
 	tracked := make([]*corev1.Pod, 0, len(p.pods))
 	for _, pod := range p.pods {
@@ -44,11 +43,24 @@ func (p *Provider) syncOnce(ctx context.Context) error {
 	}
 	p.mu.RUnlock()
 
+	// One list per cycle rather than one read per pod: capsules carry the pod
+	// they belong to in their labels, so a single call covers the whole node.
+	managed, err := p.capsules.ListManaged(ctx)
+	if err != nil {
+		return err
+	}
+
 	now := metav1.NewTime(time.Now())
 	for _, pod := range tracked {
-		key := zun.PodKey(pod.Namespace, pod.Name)
-		cap, ok := managed[key]
-		if !ok {
+		cap, found := managed[zun.PodKey(pod.Namespace, pod.Name)]
+		if !found {
+			// Zun records a capsule before it is readable by name, so a pod
+			// created moments ago is not yet evidence of a lost capsule;
+			// failing it here would make the ReplicaSet churn through pods.
+			if pod.Status.StartTime != nil &&
+				time.Since(pod.Status.StartTime.Time) < capsuleAppearGrace {
+				continue
+			}
 			// The capsule is gone while the pod is still expected to run.
 			if pod.Status.Phase == corev1.PodPending || pod.Status.Phase == corev1.PodRunning {
 				p.updateStatus(pod, func(pod *corev1.Pod) {
