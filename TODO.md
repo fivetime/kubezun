@@ -369,7 +369,17 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       `pkg/zun/capsule.go:59`）：LB/listener/pool 生命周期、**幂等全量 PUT**
       （`BatchUpdatePoolMembers` 全集合语义，少放一个就清空 pool）、LB GC、
       双栈（一 pool 一族）、Ingress
-- [ ] kubezun 自建租户 DNS 编排（同上定调；kubetron `dns_controller.go` 可作蓝本）
+- [ ] **租户 DNS —— 需平台决策后才能实现**（勘察完成 2026-08-07，DESIGN §7.6）。
+      §7.5 定案后它是**必需项**：ClusterIP Service 的可用地址只在注解里，应用用名字。
+      ⚠️ 结构约束：VK 不得接入租户网络 → 应答者只能是**数据面**或**租户网内的 capsule**；
+      kubetron 的 ConfigMap+kubelet 挂载路径我们没有 kubelet。
+      **首选 A（OVN 内建 DNS）当前被阻塞**：实测 ML2 `extension_drivers` 只有
+      `port_security,qos`，DNS 驱动未加载，`dns_domain`/`dns_name` 静默失效。
+      需改 ML2 配置 + 重启 neutron-server（部署级变更）。
+      退路 C = 平台级 resolver + kubezun 推记录。B（CoreDNS capsule）因 capsule 不可变、
+      zone 变更即中断，不推荐。
+      ⚠️ 另需处理：capsule 的 resolv.conf 来自子网 `dns_nameservers`（实测 8.8.8.8），
+      要指向所选 resolver 且保留外部转发
 - [ ] Octavia health monitor 作为**第二层**（LB 侧自检）是否需要：EndpointSlice 已能
       按 readiness 摘除 member，HM 是冗余保护而非必需；若启用需查 OVN provider 的
       `SUPPORTED_HEALTH_MONITOR_TYPES` 白名单（DESIGN §6）
