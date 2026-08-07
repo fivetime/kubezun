@@ -128,6 +128,7 @@ type Node struct {
 	pods     corev1listers.PodLister
 
 	handler               http.Handler
+	auth                  nodeutil.Auth
 	tlsConfig             *tls.Config
 	listenAddr            string
 	streamIdleTimeout     time.Duration
@@ -156,6 +157,11 @@ type NodeOptions struct {
 	// Handler serves the kubelet API. When nil and TLSConfig is set, the
 	// standard pod routes are attached.
 	Handler http.Handler
+	// Auth authenticates and authorizes kubelet API requests. Its authorizer
+	// names this node, so each node needs its own — which is why each also
+	// needs its own listen address. Without it the endpoint would serve any
+	// caller that completes the TLS handshake.
+	Auth nodeutil.Auth
 	// StreamIdleTimeout and StreamCreationTimeout bound exec and attach streams.
 	StreamIdleTimeout     time.Duration
 	StreamCreationTimeout time.Duration
@@ -221,6 +227,7 @@ func (s *Set) AddNode(opts NodeOptions) (*Node, error) {
 		nc:                    nc,
 		pc:                    pc,
 		handler:               opts.Handler,
+		auth:                  opts.Auth,
 		tlsConfig:             opts.TLSConfig,
 		listenAddr:            opts.ListenAddr,
 		workers:               s.workers,
@@ -368,6 +375,15 @@ func (n *Node) runHTTP(ctx context.Context) (func(), error) {
 			PortForward:           n.provider.PortForward,
 		}, true))
 		handler = mux
+	}
+	if n.auth != nil {
+		handler = nodeutil.WithAuth(n.auth, handler)
+	} else {
+		// Logs and exec reach into a tenant's containers, so an endpoint that
+		// authorizes nobody is worth refusing rather than running.
+		return nil, fmt.Errorf(
+			"node %s: TLS is configured but no authorizer; refusing to serve the "+
+				"kubelet API, which would expose logs and exec to any caller", n.name)
 	}
 
 	l, err := tls.Listen("tcp", n.listenAddr, n.tlsConfig)

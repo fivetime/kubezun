@@ -1,0 +1,82 @@
+# One tenant's virtual-kubelet process: its identity, its permissions, and its
+# serving certificate.
+#
+# Substitute <TENANT> throughout. Every tenant gets its own ServiceAccount:
+# a shared one would let a compromised tenant's process act as any other, and
+# the OpenStack side already insists on a per-tenant application credential for
+# the same reason (DESIGN §4).
+#
+# One process serves all of a tenant's virtual nodes (per architecture, per
+# availability zone), so everything here is per tenant, not per node — including
+# the certificate, which covers an address rather than a node name.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubezun-<TENANT>
+  namespace: kube-system
+---
+# Cluster-scoped because nodes and leases are cluster-scoped objects. The
+# namespace boundary this role cannot express is enforced in the provider
+# instead: every entry point checks the pod's namespace against the list the
+# node serves, which is what actually keeps one tenant off another's node
+# (DESIGN §4). RBAC here is the second layer, not the boundary.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubezun
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["nodes/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["update", "patch"]
+  # Read to resolve a pod's environment. The informers are scoped to the served
+  # namespace when a process serves exactly one, so in practice this reads only
+  # the tenant's own objects even though the role cannot say so.
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps", "services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubezun-<TENANT>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubezun
+subjects:
+  - kind: ServiceAccount
+    name: kubezun-<TENANT>
+    namespace: kube-system
+---
+# The kubelet API authenticates its caller by asking the API server, which needs
+# TokenReview and SubjectAccessReview. Without this the endpoint answers every
+# request with a 500 and logs and exec never work — the failure names
+# subjectaccessreviews, which is easy to mistake for a policy problem.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubezun-<TENANT>-auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: kubezun-<TENANT>
+    namespace: kube-system

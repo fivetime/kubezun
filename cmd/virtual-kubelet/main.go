@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"os"
@@ -17,6 +18,7 @@ import (
 	logruslogger "github.com/virtual-kubelet/virtual-kubelet/log/logrus"
 	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apiserver/pkg/server/dynamiccertificates"
 
 	knode "github.com/fivetime/kubezun/pkg/node"
 	"github.com/fivetime/kubezun/pkg/provider"
@@ -43,6 +45,9 @@ type options struct {
 	capacityPod string
 	logLevel    string
 	nodes       nodeSpecList
+	tlsCert     string
+	tlsKey      string
+	clientCA    string
 }
 
 func main() {
@@ -77,6 +82,15 @@ func main() {
 		"node memory capacity; mirror the tenant's quota")
 	flag.StringVar(&o.capacityPod, "capacity-pods", envOr("KUBEZUN_CAPACITY_PODS", "0"),
 		"maximum pods; mirror the tenant's quota")
+	flag.StringVar(&o.tlsCert, "tls-cert-file", os.Getenv("KUBEZUN_TLS_CERT_FILE"),
+		"certificate the kubelet API serves. Its SANs must cover --internal-ip, which "+
+			"is the address the API server dials; node names never appear in the "+
+			"certificate, so one covers every node in this process")
+	flag.StringVar(&o.tlsKey, "tls-private-key-file", os.Getenv("KUBEZUN_TLS_KEY_FILE"),
+		"private key for --tls-cert-file")
+	flag.StringVar(&o.clientCA, "client-ca-file", os.Getenv("KUBEZUN_CLIENT_CA_FILE"),
+		"CA that signs the API server's client certificate. Without it the kubelet "+
+			"API cannot tell the API server from any other caller")
 	flag.Var(&o.nodes, "node",
 		"an extra virtual node to run in this process, as "+
 			"name=<n>[,arch=<a>][,zone=<z>][,zun-az=<az>][,listen=<addr>]; repeatable. "+
@@ -140,6 +154,11 @@ func run(o options) error {
 		return err
 	}
 
+	tlsConfig, err := serverTLS(o)
+	if err != nil {
+		return err
+	}
+
 	for _, spec := range specs {
 		nodeObj := knode.Build(knode.Options{
 			Name:       spec.name,
@@ -167,15 +186,28 @@ func run(o options) error {
 			return err
 		}
 
+		var auth nodeutil.Auth
+		if tlsConfig != nil {
+			// The authorizer names this node, so the API server's permission to
+			// read one node's logs does not extend to another's. That is why
+			// each node needs its own listen address rather than sharing one.
+			auth, err = nodeutil.WebhookAuth(client, spec.name, withClientCA(o.clientCA))
+			if err != nil {
+				return fmt.Errorf("node %s: kubelet API auth: %w", spec.name, err)
+			}
+		}
+
 		if _, err := set.AddNode(vkset.NodeOptions{
 			Spec:     nodeObj,
 			Provider: p,
+			Auth:     auth,
 			// A node provider of our own, so the node's Ready condition tracks
 			// whether Zun can be reached: with the default one the node stays
 			// Ready no matter what and the scheduler keeps sending pods to a
 			// node that cannot create a capsule.
 			NodeProvider: provider.NewNodeHealth(zunClient, nodeObj),
 			ListenAddr:   spec.listen,
+			TLSConfig:    tlsConfig,
 		}); err != nil {
 			return err
 		}
@@ -200,6 +232,59 @@ func run(o options) error {
 
 	<-ctx.Done()
 	return nil
+}
+
+// serverTLS builds the kubelet API's TLS config, or nil when no certificate was
+// given.
+//
+// The certificate covers an address, not a node: the API server dials whatever
+// is in the node's status, and node names never appear in TLS. So one
+// certificate serves every node in this process, and the per-node part is the
+// authorizer, not the key material.
+func serverTLS(o options) (*tls.Config, error) {
+	if o.tlsCert == "" && o.tlsKey == "" {
+		return nil, nil
+	}
+	if o.tlsCert == "" || o.tlsKey == "" {
+		return nil, fmt.Errorf("--tls-cert-file and --tls-private-key-file must be given together")
+	}
+	if o.clientCA == "" {
+		// Without it the server cannot tell the API server from anyone else who
+		// can reach the port, and logs and exec reach into tenant containers.
+		return nil, fmt.Errorf(
+			"--client-ca-file is required with a serving certificate: without it the " +
+				"kubelet API cannot verify who is calling")
+	}
+
+	cfg := &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		CipherSuites: nodeutil.DefaultServerCiphers(),
+	}
+	if err := nodeutil.WithKeyPairFromPath(o.tlsCert, o.tlsKey)(cfg); err != nil {
+		return nil, fmt.Errorf("load serving certificate: %w", err)
+	}
+	if err := nodeutil.WithCAFromPath(o.clientCA)(cfg); err != nil {
+		return nil, fmt.Errorf("load client CA: %w", err)
+	}
+	return cfg, nil
+}
+
+// withClientCA makes the kubelet API verify the caller's certificate against
+// the given CA.
+//
+// Without a CA provider the delegating authenticator does not do mTLS at all,
+// so the API server would be indistinguishable from any other caller that
+// reached the port — and every route behind it reads or enters a tenant's
+// containers.
+func withClientCA(path string) nodeutil.WebhookAuthOption {
+	return func(cfg *nodeutil.WebhookAuthConfig) error {
+		ca, err := dynamiccertificates.NewDynamicCAContentFromFile("client-ca", path)
+		if err != nil {
+			return fmt.Errorf("load client CA %s: %w", path, err)
+		}
+		cfg.AuthnConfig.ClientCertificateCAContentProvider = ca
+		return nil
+	}
 }
 
 // nodeSpecs resolves the nodes this process runs. The single-node flags remain
