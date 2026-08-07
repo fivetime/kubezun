@@ -384,9 +384,21 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       被 oslo.config 忽略 → 报 `EndpointNotFound`，看起来像 catalog 问题其实是配置没生效；
       ④ 子网需 `--dns-publish-fixed-ip`（capsule 用的是 fixed IP，默认只发布 FIP）。
       另：Designate 的 `[keystone_authtoken]` 需 `interface = public`（本环境只发布 public endpoint）
-- [ ] **kubezun 侧接入 DNS**：在两类 port 上设 `dns_name`/`dns_domain`——
-      Service 的 `lb.VipPortID`、pod 的 capsule 地址里的 `port`（两个 id 都已在手）。
-      每 namespace 一个 Designate zone，随 namespace 创建
+- [x] **Service DNS 端到端可达（2026-08-07 实测）**：capsule 内三种写法全通——
+      `http://rsvc/`（短名）、`http://rsvc.111111-default/`、
+      `http://rsvc.111111-default.svc.cluster.local/`；**公网域名同时正常**
+      （BIND 递归有效，解决了"指权威 DNS 会断公网"的顾虑）。
+      ⚠️ **中途发现 Zun 只设 `dns_config.servers` 不设 `searches`** → 短名 NXDOMAIN，
+      表现像 Service 不存在。已补：kubezun 按 kubelet 规则组出三条 search 域，
+      经 capsule **annotations** 传给 Zun（避免加 DB 字段）。顺序有单测保护——
+      自己 namespace 必须第一，否则别的 namespace 同名 Service 会先应答
+- [x] **LB GC（2026-08-07 实测）**：按租户前缀认自己的 LB，永不碰他人或 kubetron 的；
+      所有检查 fail-closed。**造真孤儿验证**：停进程 → 删 Service → 重启 → 扫描清理成功
+- [x] **FIP 全路径实测（2026-08-07）**：`internal=false` → 分配并回写 EXTERNAL-IP；
+      改回 `internal=true` → **归还**，地址回落私网 VIP；删 Service → **不泄漏**
+      （FIP 计数 4→3，LB 一并删除）。
+      ⚠️ 前置条件：**VIP 子网必须接在带外网网关的 router 上**，否则报
+      `ExternalGatewayForFloatingIPNotFound`（本环境原先只接了 pod 子网，已补接）
 - [ ] ⚠️ **DNS 仍有两个待决项**（DESIGN §7.6）：① capsule 的 `resolv.conf` 来自子网
       `dns_nameservers`（实测 8.8.8.8），**不能直接指 Designate 后端**——那是权威 DNS 不做递归，
       指过去公网域名全断；需要一个"持有这些 zone 为权威 + 其余递归"的 resolver；
