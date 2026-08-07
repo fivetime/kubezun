@@ -480,6 +480,19 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
       单个容器探针异常不再中断本轮其余容器的探针。
       实测：`periodSeconds:5` + `failureThreshold:2` 的 liveness 现在**约 10 秒**内
       重启容器（此前 60 秒以上）；前 40 秒不健康 + `initialDelaySeconds:60` 的容器不被杀
+- [x] **⚠️ 周期任务必须按 host 过滤（2026-08-07，zun fork `f387eb47`）**——探针提频后
+      暴露：`check_probes` 和 `sync_container_state` 都用 `objects.Capsule.list(ctx)`
+      列**全集群** capsule，而**每台计算节点都跑这两个任务**。不持有该 capsule 的节点
+      去 exec 一个本地运行时不认识的 container_id → 必失败 → 谁最后写谁说了算。
+      现象：健康容器的 ready 按任务频率来回抖动（实测 3 节点下约 2/3 概率误报失败）。
+      状态同步也一样——**节点在反复"修正"自己看不见的容器的状态**，
+      这正是当初"单次查询无响应不得判定容器消失"那条补丁在遮掩的根因。
+      两处改为 `list_by_host`（Container 路径一直是这么做的）。
+      实测：r-good 连续 19 次 ready 稳定，此前交替
+- [x] 探针 exec 截止时间 = `timeoutSeconds` + `probe_exec_overhead`（默认 2s，新配置项）：
+      租户的超时约束的是**他们的命令**，外层 exec 截止若等于内层超时则两者赛跑，
+      shell 启动没有余量。实测 kata sandbox 内一次 exec 固有开销仅约 80–105ms，
+      故本项不是抖动的成因（成因是上一条），但语义上必须分开
 - [x] **logs 全链路打通（2026-08-07，zun fork `4432216e` + kubezun `b3a0210`）**：
       sandbox 加 `log_directory`、container 加 `log_path`（此前运行时**直接丢弃**输出，
       既无流可 attach 也无文件），新增 `GET /capsules/{id}/logs` 按 CRI 日志格式解析
