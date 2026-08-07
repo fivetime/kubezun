@@ -229,6 +229,22 @@ func PodIP(cap *Capsule) string {
 	return ""
 }
 
+// PodSubnetID reports the subnet the capsule's address lives on.
+//
+// Octavia binds a load balancer member to a subnet, and the capsule is the only
+// thing that knows which one its address came from — the address alone does not
+// say, and a tenant's pods may sit on more than one.
+func PodSubnetID(cap *Capsule) string {
+	for _, addrs := range cap.Addresses {
+		for _, a := range addrs {
+			if a.Version == 4 && a.Addr != "" && a.SubnetID != "" {
+				return a.SubnetID
+			}
+		}
+	}
+	return ""
+}
+
 // PortIDs lists the Neutron ports backing a capsule.
 func PortIDs(cap *Capsule) []string {
 	var ids []string
