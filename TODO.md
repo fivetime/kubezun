@@ -355,6 +355,17 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
       累积僵死 sandbox（node-04 到 63 个），最终 containerd 卡死无法恢复
       （延长 systemd 超时、重建 devmapper 池、禁用 devmapper 均无效），**只有重启解决**。
       重启后 containerd 恢复正常，陈旧 capsule 由孤儿对账自动清理（69 → 3）
+- [x] **对照验证：readiness 正确区分健康与不健康（2026-08-07）**——同一 Service 下
+      `192.168.100.82 ready=true`（探针探 `/` 成功）与 `192.168.100.52 ready=false`
+      （探针探 `/gone` 得 404），两者同时在 EndpointSlice 中且判定相反
+- [x] **capsule 卡 Creating 的超时处理（kubezun `f0c6c9b` + `c217dc2`）**：实测发现一个
+      pod 卡 Creating **97 分钟**——capsule 记录建了但**没有任何 compute 节点见过它**
+      （创建 RPC 在 zun-compute 重启窗口丢失，Zun 侧无重试机制；同配置的新 pod
+      2 分钟即 Running，证明与探针配置无关）。provider 现按 **capsule 自身
+      `created_at`** 判定超过 10 分钟仍 Creating 即标记 pod 失败、交控制器重建。
+      ⚠️ 时间基准是关键：最初用 `pod.Status.StartTime` 无效——它由 provider 设置，
+      **进程重启即重置**，卡了 90 分钟的 pod 会被当成刚创建。
+      **实测：卡 97 分钟的 pod 被判失败并成功重建**
 - [ ] （原设计）Zun 侧 prober 执行——ExecSync + 周期执行 +
       阈值计数 + liveness 失败重启 + readiness 结果回流。
       ⚠️ **实测定案（DESIGN §6.0）：所有探针类型都必须在容器内执行**——
