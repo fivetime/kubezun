@@ -516,6 +516,25 @@ member 带 subnet）在真环境原样成立。
 哪儿也去不了的地址。VIP 需经 `status.loadBalancer.ingress` 回写 + 租户 DNS 解析，
 DNS 编排因此是必需项而非可选项。
 
+### 7.6a ⚠️ OVN provider 的 VIP **没有 Neutron port**（2026-08-07 实测，影响两个功能）
+
+三个 kubezun 建的 LB，`vip_port_id` 全部指向**不存在的 port**：按 id 查 `PortNotFound`，
+按 IP 查 0 个 port（原始 API 复核，排除 CLI 干扰）。而 LB 本身 ACTIVE、VIP 流量实测可达。
+原因是 amphora-less：地址活在 OVN northbound 规则里，不需要一张 port 承载。
+
+**这推翻了两个功能共同的隐含假设**（"`lb.VipPortID` 能解析成一个真实 Neutron port"）：
+
+| 功能 | 影响 |
+|---|---|
+| **FIP 绑定** | FIP 挂在 port 上 → 这条路在 OVN provider 下**不可用**。`type=LoadBalancer` + 要公网时需另寻机制（候选：给 VIP 所在子网做 SNAT/DNAT、或改用有 amphora 的 provider、或在 router 上做 FIP） |
+| **DNS 命名** | 记录靠 port 的 `dns_name` 发布 → 同样不可用。**Neutron 自动集成这条路对 Service VIP 失效**，但**对 capsule port 仍然成立**（capsule 有真实 port） |
+
+**已做的处理**：两处都从"静默不生效"改为**显式失败/告警**——FIP 直接报错，
+DNS 记一条 warning 说明该 Service 只能靠地址访问。⚠️ **两条替代路径尚未确定**。
+
+> 教训：FIP 与 DNS 都是先写代码后验证，两次都建立在同一个未验证的假设上。
+> 涉及外部系统对象模型的功能，应先用一次真实调用确认对象存在。
+
 ### 7.6 租户 DNS：方案空间与当前阻塞（2026-08-07 勘察）
 
 §7.5 定案后 DNS 从配套变成**必需**：ClusterIP Service 的可用地址只存在于

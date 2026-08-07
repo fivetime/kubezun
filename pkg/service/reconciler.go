@@ -72,6 +72,11 @@ type Reconciler struct {
 	// because a public address costs the platform money and exposes a service
 	// its author may have only meant to reach from inside.
 	PublicByDefault bool
+
+	// ClusterDomain is the suffix a Service's name resolves under, normally
+	// svc.cluster.local. Empty disables naming, and then a Service is reachable
+	// only at the address in its annotation.
+	ClusterDomain string
 }
 
 // Name of the load balancer backing a Service. Derived rather than random so a
@@ -132,6 +137,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, namespace, name string) erro
 			return fmt.Errorf("service %s/%s asks for a public address but this "+
 				"node has no network client to allocate one", svc.Namespace, svc.Name)
 		}
+		if lb.VipPortID == "" {
+			return fmt.Errorf(
+				"service %s/%s asks for a public address, but its load balancer "+
+					"reports no address port to attach one to",
+				svc.Namespace, svc.Name)
+		}
 		network := r.FloatingNetworkID
 		if v := svc.Annotations[FloatingNetworkAnnotation]; v != "" {
 			network = v
@@ -148,6 +159,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, namespace, name string) erro
 			return err
 		}
 	}
+	// Named after the address is settled, so the record never points at one the
+	// Service has stopped using. Neutron publishes the record and withdraws it
+	// with the port, which is why nothing here writes one itself.
+	//
+	// This depends on the load balancer's address having a Neutron port, which
+	// is not true of every provider: the OVN provider in the lab records a port
+	// id that Neutron does not have, because the address lives in northbound
+	// rules rather than on a port. Where there is no port there is no record,
+	// and saying so once is better than a Service that silently has no name.
+	if r.ClusterDomain != "" && r.Neutron != nil {
+		if err := ensurePortDNS(ctx, r.Neutron, lb.VipPortID, svc.Name,
+			ServiceDomain(svc.Namespace, r.ClusterDomain)); err != nil {
+			log.G(ctx).WithError(err).WithField("service", svc.Namespace+"/"+svc.Name).
+				Warn("could not give this Service a name; it is reachable only at its address")
+		}
+	}
+
 	return r.publishAddress(ctx, svc, address)
 }
 

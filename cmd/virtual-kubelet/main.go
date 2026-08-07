@@ -31,27 +31,28 @@ import (
 var version = "v1.36.3-knaas.1"
 
 type options struct {
-	nodeName    string
-	tenant      string
-	namespaces  string
-	zone        string
-	zunAZ       string
-	arch        string
-	networkID   string
-	kubeconfig  string
-	listenAddr  string
-	internalIP  string
-	capacityCPU string
-	capacityMem string
-	capacityPod string
-	logLevel    string
-	nodes       nodeSpecList
-	tlsCert     string
-	tlsKey      string
-	clientCA    string
-	vipSubnet   string
-	floatingNet string
-	publicSvcs  bool
+	nodeName      string
+	tenant        string
+	namespaces    string
+	zone          string
+	zunAZ         string
+	arch          string
+	networkID     string
+	kubeconfig    string
+	listenAddr    string
+	internalIP    string
+	capacityCPU   string
+	capacityMem   string
+	capacityPod   string
+	logLevel      string
+	nodes         nodeSpecList
+	tlsCert       string
+	tlsKey        string
+	clientCA      string
+	vipSubnet     string
+	floatingNet   string
+	clusterDomain string
+	publicSvcs    bool
 }
 
 func main() {
@@ -90,6 +91,10 @@ func main() {
 		"subnet a Service's load balancer address comes from. Not the pod subnet: "+
 			"an address there makes east-west traffic arrive with the wrong "+
 			"destination MAC. Without it, Services get no load balancer")
+	flag.StringVar(&o.clusterDomain, "cluster-domain", envOr("KUBEZUN_CLUSTER_DOMAIN", "svc.cluster.local"),
+		"suffix a Service's name resolves under. A Service's usable address is its "+
+			"load balancer's, not the ClusterIP, so the name is how a pod reaches "+
+			"one. Empty disables naming")
 	flag.StringVar(&o.floatingNet, "floating-network-id", os.Getenv("KUBEZUN_FLOATING_NETWORK_ID"),
 		"external network public Service addresses are allocated from")
 	flag.BoolVar(&o.publicSvcs, "public-services-by-default", false,
@@ -254,6 +259,7 @@ func run(o options) error {
 			VIPSubnetID:       o.vipSubnet,
 			FloatingNetworkID: o.floatingNet,
 			PublicByDefault:   o.publicSvcs,
+			ClusterDomain:     o.clusterDomain,
 			Tenant:            o.tenant,
 		}, set.ServiceInformer(), set.EndpointSliceInformer())
 		if err != nil {
