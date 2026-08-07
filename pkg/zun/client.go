@@ -61,6 +61,11 @@ func CredentialsFromEnv() (Credentials, error) {
 // Client is a Zun service client bound to a single tenant.
 type Client struct {
 	sc *gophercloud.ServiceClient
+	// provider is the authenticated session behind it. Other OpenStack
+	// services this tenant talks to — Octavia for its Services — are built
+	// from the same one, so a tenant authenticates once and holds one token.
+	provider *gophercloud.ProviderClient
+	region   string
 }
 
 // NewClient authenticates and returns a client for the capsule API.
@@ -90,8 +95,15 @@ func NewClient(ctx context.Context, creds Credentials) (*Client, error) {
 	// "OpenStack-API-Version: container <v>" and answers 406 to anything else.
 	sc.Type = "container"
 	sc.Microversion = Microversion
-	return &Client{sc: sc}, nil
+	return &Client{sc: sc, provider: pc, region: creds.Region}, nil
 }
+
+// Provider is the authenticated session, for building clients for the other
+// OpenStack services this tenant uses.
+func (c *Client) Provider() *gophercloud.ProviderClient { return c.provider }
+
+// Region the tenant's endpoints are resolved in.
+func (c *Client) Region() string { return c.region }
 
 // ServiceClient exposes the underlying client for the capsule calls.
 func (c *Client) ServiceClient() *gophercloud.ServiceClient { return c.sc }
