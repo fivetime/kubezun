@@ -457,7 +457,21 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
       "Command did not finish within 30 seconds"。
       实测：`kubectl exec -- echo`、带空格的 `sh -c`、非零退出码回传均正确；
       `-t`（要终端）明确拒绝——Zun 一次性返回，没有流可附着
-- [ ] **liveness 失败重启语义**（exec 通道已具备，剩重启动作本身）
+- [x] **liveness 失败重启真正生效（2026-08-07，zun fork `3f00613f` + kubezun `e7a0b6b`）**。
+      ⚠️ **此前是最坏的一类假健康**：探针正确判失败并调用了重启，但 CRI 容器**只能启动
+      一次**——`StopContainer` + `StartContainer` 返回 `container is in CONTAINER_EXITED
+      state`，而该错误被降级成 warning，于是 pod 永远 1/1 Running 而应用已死。
+      修法：重启改为**替换容器**（Remove 旧的 → 在同一 sandbox 内 Create+Start 新的）。
+      ⚠️ **Remove 必须先于 Create**：运行时会为容器名保留记录，先建会撞
+      `failed to reserve container name ... is reserved for <old>`（实测踩过）。
+      **sandbox 保留 → capsule 地址不变**（实测两次重启后 podIP 仍是 192.168.100.243，
+      守住 podIP==OVN IP 不变式；否则每次重启全部客户端都要重新发现服务）。
+      每次以递增的 attempt 号创建（crictl 里 ATTEMPT=2），重启失败改报 error 而非 warning。
+      provider 侧回传 RestartCount（此前恒 0），并**加入状态指纹**——否则两次轮询之间被
+      替换的容器回来仍是 Running+ready，指纹相同，重启永远不会写进 pod。
+      实测 `kubectl get pod` RESTARTS 0→1→2
+- [ ] ⚠️ **探针周期未按 `periodSeconds` 执行**：实测按 zun-compute 的状态同步周期
+      （约 60s）跑，`periodSeconds: 5` 被忽略 → 故障检测延迟远大于租户声明
 - [x] **logs 全链路打通（2026-08-07，zun fork `4432216e` + kubezun `b3a0210`）**：
       sandbox 加 `log_directory`、container 加 `log_path`（此前运行时**直接丢弃**输出，
       既无流可 attach 也无文件），新增 `GET /capsules/{id}/logs` 按 CRI 日志格式解析
