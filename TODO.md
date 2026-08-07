@@ -445,8 +445,19 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
       ② **建 capsule 时由 provider 推下去**：干净，但每 pod 多一次数据面往返，且
       **helper 是以租户身份注入进租户容器的可执行文件**——这条安全边界要先想清楚。
       先定②的安全模型再动手；kubetron 已解同一问题，实现可直接借鉴
-- [ ] （原）**ExecSync + liveness 重启**：stub 现成
-      （(Zun) api_pb2_grpc.py:100-103），zun-compute 落实 capsule 内执行 + restart 语义
+- [x] **exec 端点上线（2026-08-07，zun fork `181ae7ce` + kubezun `7b59f42`）**：
+      ExecSync 辅助函数探针早已在用，但**外部没有入口**——capsule 只能通过自己的探针
+      被观察。新增 `POST /capsules/{id}/execute` + `capsule:execute` policy，
+      provider 接上 `RunInContainer`。
+      与 logs 同样按 `capsule.host` 定向（容器不记录 host）。
+      ⚠️ **踩到的坑**：ExecSync 超时原用 `CONF.default_timeout`（10 分钟），
+      远大于 RPC 回复超时（60s）→ 任何长命令（`sh` 无 stdin 即可）都在 60 秒后
+      变成 messaging 层的 500，且不说明命令还在跑。新增 conf `cri_exec_timeout`
+      （默认 30s，**必须低于 rpc_response_timeout**），现在 30 秒明确报
+      "Command did not finish within 30 seconds"。
+      实测：`kubectl exec -- echo`、带空格的 `sh -c`、非零退出码回传均正确；
+      `-t`（要终端）明确拒绝——Zun 一次性返回，没有流可附着
+- [ ] **liveness 失败重启语义**（exec 通道已具备，剩重启动作本身）
 - [x] **logs 全链路打通（2026-08-07，zun fork `4432216e` + kubezun `b3a0210`）**：
       sandbox 加 `log_directory`、container 加 `log_path`（此前运行时**直接丢弃**输出，
       既无流可 attach 也无文件），新增 `GET /capsules/{id}/logs` 按 CRI 日志格式解析
