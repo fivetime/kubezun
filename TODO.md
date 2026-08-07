@@ -261,8 +261,18 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       → 改报 `CapsuleUnschedulable` + Zun 原因
 - [ ] 每租户 VK Deployment 部署物（manifest/chart）：per-tenant SA、per-node :10250 +
       证书 + WebhookAuth(nodeName)（§2）
-- [ ] 同租户单进程多节点：共享 informer（pod watch 按 nodeName fieldSelector 合并）
-      （§2/§14.7）
+- [x] **同租户单进程多节点：共享 informer（2026-08-07，`a743545`，`pkg/vknode`）**。
+      `nodeutil.NewNode` 每节点自建 informer factory 且无注入钩子，故降到 `node` 包
+      自行组装控制器。pod informer 一份带全部节点的 pod，每个节点的 PodController 用
+      **`PodEventFilterFunc`**（VK 为此场景预留）只认自己 nodeName 的 pod——单测摘掉
+      过滤器即失败（每个节点会去接管所有 pod）。
+      实测：租户 111111 两节点跑在一个进程里，apiserver 连接数与单节点进程持平；
+      arch-x86→amd64 节点 Running、arch-arm→arm64 节点 CapsuleUnschedulable，互不串台。
+      **顺带收窄了权限面**：informer 在只服务一个 namespace 时按 namespace 作用域
+      （此前 pod watch 无论如何都是全集群）；也让孤儿清理**能看见兄弟节点的 pod**了
+      （节点名标签守卫保留为主防线）。
+      CLI：`--nodename` 等仍描述单节点（存量部署不变），额外节点用可重复的
+      `--node name=<n>[,arch=][,zone=][,zun-az=][,listen=]`；同名或同端口直接拒绝
 - [ ] ⚠️ ConfigMap/Secret **按对象 GET**（不用集群级 informer——namespace 级 Role 下
       nodeutil 默认 informer 会 403，(VK) controller.go:329-346）；env/文件合成进 capsule
       （DESIGN 优先级 P2，租户真实负载需要则此阶段落地）（§8.1）
