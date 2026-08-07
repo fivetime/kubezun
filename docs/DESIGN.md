@@ -272,13 +272,47 @@ kubezoo M8 分片 + 多上游集群（M8 优先级据此重估）。空节点在
 - VK 库**零处执行探针**——真实 kubelet 的 prober 不在库里；
 - capsule API 无 exec（(Zun) capsules.py:111-113 `_custom_actions` 为空；CRI driver
   execute_* 全 NotImplementedError，cri/driver.py:397-405）；
-- kubetron 的探针改写（sh-c / static helper）依赖容器内执行器，capsule 上没有——不适用。
+- **Zun 侧现有 healthcheck 字段不可用**：仅 exec 型（`cmd`）、仅 docker driver 消费
+  （docker/driver.py:325-329），CRI 驱动完全不读；且 Docker healthcheck 只标状态不重启，
+  与 K8s liveness 语义不符。capsule 模板的 container schema 更是**零探针字段**
+  （parameter_types.py:461-480，additionalProperties:False）。
+
+### 6.0 探针执行位置：实测排除法（2026-08-07）
+
+**结论：所有探针类型最终都必须在容器内执行，唯一通道是 CRI ExecSync。**
+
+| 候选执行位置 | 实测结果 |
+|---|---|
+| provider（VK 进程，管理网） | ✗ 不在租户 OVN 网络，且挂进去违反 kubetron 双挂纪律 |
+| zun-compute 宿主机网络命名空间 | ✗ **实测 ping/curl capsule IP 全部失败**——OVN 租户隔离的正确行为 |
+| sandbox netns（`/var/run/netns/cni-*`） | ✗ **实测同样不通**：kata 的 netns 里只有 tap 设备，真正的网络栈在 VM guest 内，netns 自身没有监听 socket（与 runc 的关键区别） |
+| **容器内（CRI ExecSync）** | ✓ **实测可行**：`crictl exec` 里 `wget http://127.0.0.1/` 返回页面、`nc -z 127.0.0.1 80` 成功 |
+| Octavia HM | △ 仅 TCP/UDP-CONNECT，**探测不到应用语义** |
+
+**这条实测直接否决了 Octavia HM 作为 readiness 权威**：RAFT 脑裂或主从切换失败的节点，端口照常监听、TCP 照常连通，HM 判定健康，但它返回的是陈旧或不一致的数据。有状态应用（DB 集群、etcd/consul 这类 RAFT 系统）的健康**只有应用自己知道**，必须由它自己的探针回答。HM 由此降级为 L4 层的第二道保险，不再是 readiness 的执行者。
+
+**修订后的方案：Zun fork 实现 prober，全部探针类型统一走 ExecSync**
+
+| K8s 探针类型 | 落地方式 |
+|---|---|
+| `exec` | ExecSync 直接执行用户命令（DB/RAFT 场景最常用，如 `pg_isready`、`etcdctl endpoint health`） |
+| `httpGet` | ExecSync 执行探针 helper，在容器内请求 `127.0.0.1:<port><path>` |
+| `tcpSocket` | 同上，helper 做 TCP connect |
+| `grpc` | 同上，helper 走 gRPC health protocol |
+
+⚠️ helper 必须是**静态二进制**：distroless / scratch 镜像里没有 curl、wget、nc。
+**kubetron 已解决同一问题且可直接复用**：`cmd/probe/main.go`（get/tcp/install 自安装，
+`-probe-helper-image` 开关），注入方式为 init container 拷进共享 emptyDir。
+
+三类探针语义的归属：liveness 失败 → Zun 侧重启容器（restart 只有 Zun 能闭环）；
+readiness 结果 → 回流 container 状态 → provider 读回 → pod Ready condition →
+EndpointSlice → kubetron 的 Octavia member 上下线；startup 为前两者的启动期门控。
 
 **声明留在 K8s，执行必须下沉。方案 A（定案）：**
 
 | 探针 | 执行者 | 机制 |
 |---|---|---|
-| **readiness** | Octavia health monitor | **已 PoC 实测成立（2026-08-06）**：官方 ovn-octavia-provider（stable/2026.1，与自研 incus provider 共存，`--provider ovn`）建 LB → member = capsule OVN IP → capsule 内 curl VIP 通；HM TCP 建成后 OVN NB 生成 `Load_Balancer_Health_Check` + `ip_port_mappings`；**停掉一个后端后 15s 内 member 转 ERROR，流量全部转到健康后端（5/5 成功）**——member 上下线正是 readiness 的真实消费者（流量闸门），且绕开"VK 管理面进程路由进重叠 CIDR 租户网"的架构错位。⚠️ 能力边界（源码 `ovn_octavia_provider/common/constants.py:106-113` + 实测）：协议 TCP/UDP/SCTP、算法**仅** SOURCE_IP_PORT、**HM 仅 TCP 与 UDP-CONNECT（HTTP 型被 provider 明确拒绝）** → **httpGet readiness 必须降级为 tcp**，或走下行 Zun 侧执行 |
+| ~~**readiness**~~（已被 §6.0 修订，保留作 L4 二道保险） | Octavia health monitor | **已 PoC 实测成立（2026-08-06）**：官方 ovn-octavia-provider（stable/2026.1，与自研 incus provider 共存，`--provider ovn`）建 LB → member = capsule OVN IP → capsule 内 curl VIP 通；HM TCP 建成后 OVN NB 生成 `Load_Balancer_Health_Check` + `ip_port_mappings`；**停掉一个后端后 15s 内 member 转 ERROR，流量全部转到健康后端（5/5 成功）**——member 上下线正是 readiness 的真实消费者（流量闸门），且绕开"VK 管理面进程路由进重叠 CIDR 租户网"的架构错位。⚠️ 能力边界（源码 `ovn_octavia_provider/common/constants.py:106-113` + 实测）：协议 TCP/UDP/SCTP、算法**仅** SOURCE_IP_PORT、**HM 仅 TCP 与 UDP-CONNECT（HTTP 型被 provider 明确拒绝）** → **httpGet readiness 必须降级为 tcp**，或走下行 Zun 侧执行 |
 | **liveness** | Zun fork：zun-compute 补 ExecSync（stub 现成，(Zun) api_pb2_grpc.py:100-103）+ capsule 内探针 + 失败重启 | restart 语义只有 Zun 侧能闭环——这就是 kubelet prober 的位置 |
 
 MVP 阶段 pod Ready = Running ∧ port ACTIVE（§5）；fork 探针落地后，Zun 侧探针结果回流

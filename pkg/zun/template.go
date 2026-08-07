@@ -78,17 +78,46 @@ func Validate(pod *corev1.Pod) error {
 						"the capsule API cannot express privileged containers")
 				}
 			}
-			if c.LivenessProbe != nil || c.ReadinessProbe != nil || c.StartupProbe != nil {
-				// Probes are declared in Kubernetes but executed elsewhere;
-				// see DESIGN §6. Accepting them silently would promise
-				// restart-on-failure semantics nothing implements yet.
-				return unsupported("container probes",
-					"liveness/readiness are executed by the platform, not the capsule; "+
-						"remove them until probe support lands")
+			for _, p := range []*corev1.Probe{
+				c.LivenessProbe, c.ReadinessProbe, c.StartupProbe,
+			} {
+				if err := validateProbe(p); err != nil {
+					return err
+				}
 			}
 		}
 	}
 	return nil
+}
+
+// validateProbe rejects probe forms a capsule cannot execute. Everything runs
+// inside the container through ExecSync, so a probe aimed at another address
+// than the container's own would silently test the wrong thing.
+func validateProbe(p *corev1.Probe) error {
+	if p == nil {
+		return nil
+	}
+	switch {
+	case p.Exec != nil:
+		return nil
+	case p.HTTPGet != nil:
+		if h := p.HTTPGet.Host; h != "" && h != "localhost" && h != "127.0.0.1" {
+			return unsupported("probe httpGet.host",
+				"a probe runs inside the container and can only reach the "+
+					"container itself; leave host empty")
+		}
+		return nil
+	case p.TCPSocket != nil:
+		if h := p.TCPSocket.Host; h != "" && h != "localhost" && h != "127.0.0.1" {
+			return unsupported("probe tcpSocket.host",
+				"a probe runs inside the container and can only reach the "+
+					"container itself; leave host empty")
+		}
+		return nil
+	case p.GRPC != nil:
+		return nil
+	}
+	return unsupported("probe", "no handler is set on the probe")
 }
 
 // container is one entry of the capsule template's spec.containers.
@@ -104,6 +133,15 @@ type container struct {
 	Env       map[string]string `json:"env,omitempty"`
 	Resources *resources        `json:"resources,omitempty"`
 	Ports     []port            `json:"ports,omitempty"`
+
+	// Probes are passed through as Kubernetes declares them. What a capsule
+	// can execute is decided on the Zun side, which is the only place with a
+	// path into the container: neither this process nor the compute host can
+	// reach a capsule's address, and a kata sandbox's network namespace holds
+	// only a tap device, so every probe ultimately runs through ExecSync.
+	LivenessProbe  *corev1.Probe `json:"livenessProbe,omitempty"`
+	ReadinessProbe *corev1.Probe `json:"readinessProbe,omitempty"`
+	StartupProbe   *corev1.Probe `json:"startupProbe,omitempty"`
 }
 
 type resources struct {
@@ -232,6 +270,9 @@ func buildContainer(c corev1.Container) container {
 	if r := buildResources(c.Resources); r != nil {
 		out.Resources = r
 	}
+	out.LivenessProbe = c.LivenessProbe
+	out.ReadinessProbe = c.ReadinessProbe
+	out.StartupProbe = c.StartupProbe
 	return out
 }
 

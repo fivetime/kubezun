@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 func pod(mutate ...func(*corev1.Pod)) *corev1.Pod {
@@ -144,8 +145,15 @@ func TestValidateRejectsUnrepresentableFields(t *testing.T) {
 			yes := true
 			p.Spec.Containers[0].SecurityContext = &corev1.SecurityContext{Privileged: &yes}
 		},
-		"livenessProbe": func(p *corev1.Pod) {
+		"probe with no handler": func(p *corev1.Pod) {
 			p.Spec.Containers[0].LivenessProbe = &corev1.Probe{}
+		},
+		"probe aimed at another host": func(p *corev1.Pod) {
+			p.Spec.Containers[0].ReadinessProbe = &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{Host: "db.example.com", Port: intstr.FromInt32(80)},
+				},
+			}
 		},
 	}
 	for name, mutate := range cases {
@@ -154,6 +162,68 @@ func TestValidateRejectsUnrepresentableFields(t *testing.T) {
 				t.Fatalf("%s was accepted; it must be refused with a message naming the field", name)
 			}
 		})
+	}
+}
+
+func TestBuildTemplateCarriesProbes(t *testing.T) {
+	// A workload whose health only it can answer — a DB cluster, a RAFT member
+	// that may be on the wrong side of a split — is unusable without its own
+	// probes, so they have to reach the runtime rather than be refused here.
+	p := pod(func(p *corev1.Pod) {
+		p.Spec.Containers[0].LivenessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				Exec: &corev1.ExecAction{Command: []string{"etcdctl", "endpoint", "health"}},
+			},
+			PeriodSeconds: 10,
+		}
+		p.Spec.Containers[0].ReadinessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{Path: "/ready", Port: intstr.FromInt32(8080)},
+			},
+			FailureThreshold: 3,
+		}
+	})
+	raw, err := BuildTemplate(p, TemplateOptions{})
+	if err != nil {
+		t.Fatalf("probes were refused: %v", err)
+	}
+	c := decode(t, raw)["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)
+
+	live, ok := c["livenessProbe"].(map[string]any)
+	if !ok {
+		t.Fatal("livenessProbe did not reach the template")
+	}
+	cmd := live["exec"].(map[string]any)["command"].([]any)
+	if len(cmd) != 3 || cmd[0] != "etcdctl" {
+		t.Errorf("exec command was not carried through: %v", cmd)
+	}
+	if live["periodSeconds"].(float64) != 10 {
+		t.Errorf("periodSeconds = %v, want 10", live["periodSeconds"])
+	}
+
+	ready, ok := c["readinessProbe"].(map[string]any)
+	if !ok {
+		t.Fatal("readinessProbe did not reach the template")
+	}
+	if ready["httpGet"].(map[string]any)["path"] != "/ready" {
+		t.Errorf("httpGet path was not carried through: %v", ready["httpGet"])
+	}
+}
+
+func TestProbeOnTheContainerItselfIsAccepted(t *testing.T) {
+	// An explicit localhost is the same target as the default and must not be
+	// mistaken for a probe aimed elsewhere.
+	for _, host := range []string{"", "localhost", "127.0.0.1"} {
+		p := pod(func(p *corev1.Pod) {
+			p.Spec.Containers[0].LivenessProbe = &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					TCPSocket: &corev1.TCPSocketAction{Host: host, Port: intstr.FromInt32(5432)},
+				},
+			}
+		})
+		if _, err := BuildTemplate(p, TemplateOptions{}); err != nil {
+			t.Errorf("probe with host %q was refused: %v", host, err)
+		}
 	}
 }
 
