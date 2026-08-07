@@ -406,7 +406,14 @@ DESIGN §4.3，仅可作过渡）；C（capsule 内自报 sidecar——注入/�
   与 ovs-cni 设同一字段、插同一 br-int。**OVN 看不出 capsule port 和 kubetron pod port
   的区别**：安全组、逻辑交换机隔离、FIP、Octavia member、租户 DNS 全部无差别生效。
 - **kubetron 复用切面在 port 之上**（B1 照旧全量部署，B2' 流量汇入其编排层）：
-  - `pkg/service/`：Service→Octavia OVN LB reconciler——EndpointSlice 驱动，零改动复用；
+  - `pkg/service/`：Service→Octavia OVN LB reconciler——EndpointSlice 驱动，
+    ⚠️ **不是零改动复用（2026-08-07 查证纠正）**：`members.go:100-147` 的
+    `memberEndpoint` 强制要求 member pod 带 kubetron claim 注解，并从
+    `NetworkPortClaim.Status.Subnet.ID` 取 member 子网。capsule 走 Zun 原生 port、
+    无 claim 无注解 → **每个 kubezun pod 都会在此报错**。
+    缺的**只有 subnet 这一个字段**（其余：读 EndpointSlice、readiness 过滤、
+    BatchUpdate 全量 PUT、LB GC、双栈、Ingress 复用，全部后端无关）。
+    capsule 地址记录本就带 `subnet_id`。三条路见 §14.6；
   - `pkg/controller/dns_controller.go`：租户 DNS zone 渲染——逻辑复用，分发通道要改
     （无 kubelet 挂 ConfigMap；DNS 跑成租户网内 capsule，控制器直推 zone）。
     **resolver 下发已实测打通（2026-08-06，PoC-4）**：原先 capsule 继承宿主
@@ -621,9 +628,23 @@ kubetron DNS 分发通道改造、M8 编排层独立部署形态。
    两者都不难，但差别足够大，值得**明确选一个而不是默认滑进去**。
    在此之前，已验证并支持的形态是宿主机 systemd（`deploy/kubezun@.service`）。
    ⚠️ 若走 hostNetwork 规避地址问题：计算节点的 kubelet 已占 10250，需换端口。
-4. **kube-system 控制器 pod 过 Kyverno**：resourceFilters/excludeGroups 核查——决定
+4. **Service→Octavia 由谁编排**（2026-08-07 提出，**需产品决策**）。
+   kubetron 的 Service reconciler 只差 member 的 subnet 一个字段就能收编 capsule
+   （§11 已纠正）。三条路：
+   - **A. kubetron 改为按 member IP 查 Neutron 取 subnet**（约 20 行 + 一次可缓存调用）。
+     ⭐ 推荐：改完 kubetron **不需要理解 VK/Zun**，只认 IP，对任何后端都成立——
+     等于**解除**耦合而不是新增。一份 Octavia 编排同时服务 B1 与 B2'。
+   - B. kubezun 在 Node 对象上打租户子网标签，kubetron 经 `pod.Spec.NodeName` 读取。
+     两侧小改，但建立了一条 kubetron→kubezun 的认知。
+   - C. kubezun 自建 Service reconciler。**代价被低估**：kubetron 那半边不是薄封装，
+     含 LB GC、幂等全量 PUT（BatchUpdate 是全集合 PUT，漏一个就清空 pool）、
+     双栈规则、Ingress 复用；重写意味着两套 Octavia 语义长期对齐。
+     仅当产品上要求 kubezun 完全自包含（独立发布节奏、不共享部署）才选它。
+   ⚠️ 无论选哪条，**DNS 编排（`dns_controller.go`）有同类问题待查**——它是否也依赖
+   claim 尚未查证。
+5. **kube-system 控制器 pod 过 Kyverno**：resourceFilters/excludeGroups 核查——决定
    validate 边界的实际覆盖。
-5. **租户业务标签写自己节点**：MVP 禁；有 pinning 需求再经 VAP 白名单放开。
+6. **租户业务标签写自己节点**：MVP 禁；有 pinning 需求再经 VAP 白名单放开。
 5. **InternalIP 展示值**：是否在 kubezoo 层改写为中性值。
 6. **SA token 长期轮换通道**：fork ExecSync 落地后评估文件刷新机制。
 7. **单进程多节点 informer 共享**的具体实现形态（pod watch fieldSelector 合并粒度）。

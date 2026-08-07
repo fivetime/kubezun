@@ -357,11 +357,14 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       **动态转换实测**：用 `kubectl exec` 在容器内补上探针要的路径 → **5 秒内**
       `ready` 翻成 True 进入 EndpointSlice（探针 periodSeconds=5，
       得益于本轮的探针周期修复；此前光探针一项就要 60s+）
-- [ ] ⚠️ **最后一跳（EndpointSlice → Octavia LB member）本轮未验证**：kubetron 在本集群
-      有跑（kubetron-system，2/2），但其 Service reconciler 未纳管 `111111-default`
-      （现有 LB 均为 `t1-*`，是另一套租户网络配置），`type=LoadBalancer` 的 Service
-      建出来 EXTERNAL-IP 一直 pending。属 kubetron 侧接线，非 kubezun 缺陷。
-      要验证需在 kubetron 侧为该租户配好网络
+- [ ] ⚠️ **最后一跳（EndpointSlice → Octavia LB member）：kubetron 现状收编不了 capsule**
+      （2026-08-07 查证）。`members.go:100-147` 的 `memberEndpoint` 强制 member pod 带
+      kubetron claim 注解，并从 `NetworkPortClaim.Status.Subnet.ID` 取 member 子网；
+      capsule 走 Zun 原生 port、无 claim → **每个 kubezun pod 必在此报错**。
+      （本轮 LB 未生效的**表面**原因是 kubetron 未纳管该 namespace，但即便纳管也会卡在这里。）
+      缺口**只有 subnet 一个字段**，其余全后端无关；capsule 地址本就带 `subnet_id`。
+      **三条路 + 推荐见 DESIGN §14.4，需产品决策后再实现**
+- [ ] ⚠️ 同类问题待查：kubetron 的 `dns_controller.go` 是否也依赖 claim
 - [ ] Octavia health monitor 作为**第二层**（LB 侧自检）是否需要：EndpointSlice 已能
       按 readiness 摘除 member，HM 是冗余保护而非必需；若启用需查 OVN provider 的
       `SUPPORTED_HEALTH_MONITOR_TYPES` 白名单（DESIGN §6）
