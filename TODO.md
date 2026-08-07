@@ -192,8 +192,17 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       ⚠️ 租户 pod 需 `automountServiceAccountToken: false`（否则被 SA token
       projected volume 拒绝，错误信息已点名该设置）——应由 Kyverno 默认注入
       ⚠️ 计算节点需装 `numactl`（缺失则 Zun 报 cpus=0，一切调度失败）
-- [ ] 孤儿 capsule 治理：provider 停机期间删除的 pod 会留下 capsule（实测残留 6 个）
-      → ListManaged 已能按 owner label 识别，补一个启动时对账即可（§5）
+- [x] **孤儿 capsule 对账完成并实测（2026-08-07，`pkg/provider/orphans.go`）**：
+      2 分钟周期扫描，实测 8 个 capsule → 精确剩 2 个（对应 2 个存活 pod），
+      期间 pod 始终 1/1 Running 未受影响。
+      清理两类：① provider 停机期间删除的 pod 留下的 capsule；
+      ② ⚠️ **重复 capsule**——实测发现 **Zun 不强制 capsule 名唯一**，VK 重试
+      CreatePod 时会重复创建（同名 capsule 出现 3 份，各自计费占资源）。
+      已双向修复：CreatePod 先查已存在（幂等）+ 对账保留最新、删除其余。
+      **权威模型**：K8s 决定"该不该存在"（声明式意图），Zun 决定"实际状态"
+      （运行时事实）；判定不确定时一律不删（误删=毁掉运行中负载不可恢复，
+      漏删=多占一个周期配额）——四重保护（无 pod cache 不跑 / lister 报错跳过 /
+      capsule 年龄 <5min 不动 / UID 匹配即保留）各有测试守卫
 
 ---
 
