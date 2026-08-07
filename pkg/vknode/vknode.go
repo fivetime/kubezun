@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	corev1informers "k8s.io/client-go/informers/core/v1"
+	discoveryv1informers "k8s.io/client-go/informers/discovery/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -43,6 +44,7 @@ type Set struct {
 	secrets    corev1informers.SecretInformer
 	configMaps corev1informers.ConfigMapInformer
 	services   corev1informers.ServiceInformer
+	slices     discoveryv1informers.EndpointSliceInformer
 
 	broadcaster record.EventBroadcaster
 	workers     int
@@ -108,6 +110,7 @@ func NewSet(opts SetOptions) (*Set, error) {
 		secrets:    scmFactory.Core().V1().Secrets(),
 		configMaps: scmFactory.Core().V1().ConfigMaps(),
 		services:   scmFactory.Core().V1().Services(),
+		slices:     scmFactory.Discovery().V1().EndpointSlices(),
 		workers:    opts.Workers,
 	}, nil
 }
@@ -120,6 +123,14 @@ func (s *Set) Pods() corev1listers.PodLister { return s.pods.Lister() }
 // volumes from.
 func (s *Set) ConfigMaps() corev1listers.ConfigMapLister { return s.configMaps.Lister() }
 func (s *Set) Secrets() corev1listers.SecretLister       { return s.secrets.Lister() }
+
+// ServiceInformer and EndpointSliceInformer back the Service controller, which
+// runs once per process rather than once per node: load balancers belong to the
+// tenant, not to any one of its virtual nodes.
+func (s *Set) ServiceInformer() corev1informers.ServiceInformer { return s.services }
+func (s *Set) EndpointSliceInformer() discoveryv1informers.EndpointSliceInformer {
+	return s.slices
+}
 
 // Node is one virtual node: its node controller, its pod controller, and its
 // kubelet API endpoint.

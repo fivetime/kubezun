@@ -13,6 +13,7 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -29,6 +30,15 @@ const (
 	// lbIDAnnotation remembers which load balancer belongs to a Service, so a
 	// rename or a lookup failure cannot orphan one.
 	lbIDAnnotation = "knaas.io/loadbalancer-id"
+
+	// AddressAnnotation carries the address a Service is actually reachable on.
+	//
+	// The status field would be the natural place, but the API server allows it
+	// only on a Service typed LoadBalancer, and here every Service has an
+	// address — the ClusterIP it was assigned is not reachable from a pod. So
+	// the annotation is where it always is, and the status is filled in as well
+	// when the type permits.
+	AddressAnnotation = "knaas.io/address"
 )
 
 // Reconciler turns a tenant's Services into Octavia load balancers.
@@ -73,6 +83,12 @@ func (r *Reconciler) lbName(namespace, name string) string {
 // Reconcile brings one Service's load balancer into line with its endpoints.
 func (r *Reconciler) Reconcile(ctx context.Context, namespace, name string) error {
 	svc, err := r.Services.Services(namespace).Get(name)
+	if apierrors.IsNotFound(err) {
+		// The Service is gone. Its load balancer is found by the name derived
+		// from the namespace and name, which is why that name is derived and
+		// not random: there is no object left to read an id off.
+		return r.deleteByName(ctx, namespace, name)
+	}
 	if err != nil {
 		return err
 	}
@@ -307,6 +323,26 @@ func (r *Reconciler) slicesFor(svc *corev1.Service) ([]discoveryv1.EndpointSlice
 // capsule, so a tenant reading it gets an address that goes nowhere. Publishing
 // here is what lets them, and the tenant's DNS, find the one that does.
 func (r *Reconciler) publishAddress(ctx context.Context, svc *corev1.Service, address string) error {
+	if svc.Annotations[AddressAnnotation] != address {
+		updated := svc.DeepCopy()
+		if updated.Annotations == nil {
+			updated.Annotations = map[string]string{}
+		}
+		updated.Annotations[AddressAnnotation] = address
+		fresh, err := r.ServiceClient.Services(svc.Namespace).Update(ctx, updated, metav1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+		svc = fresh
+	}
+
+	// The status field is rejected on anything but a LoadBalancer Service, so a
+	// ClusterIP one carries its address in the annotation alone. That is what
+	// makes the tenant's DNS the way a Service is reached by name rather than a
+	// convenience on top of one.
+	if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
+		return nil
+	}
 	current := svc.Status.LoadBalancer.Ingress
 	if len(current) == 1 && current[0].IP == address {
 		return nil
@@ -315,6 +351,18 @@ func (r *Reconciler) publishAddress(ctx context.Context, svc *corev1.Service, ad
 	updated.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: address}}
 	_, err := r.ServiceClient.Services(svc.Namespace).UpdateStatus(ctx, updated, metav1.UpdateOptions{})
 	return err
+}
+
+// deleteByName removes the load balancer of a Service that no longer exists.
+func (r *Reconciler) deleteByName(ctx context.Context, namespace, name string) error {
+	lb, err := GetLoadBalancerByName(ctx, r.Octavia, r.lbName(namespace, name))
+	if err == ErrNotFound {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return r.tearDown(ctx, namespace+"/"+name, lb.ID)
 }
 
 func (r *Reconciler) deleteLoadBalancer(ctx context.Context, svc *corev1.Service) error {
@@ -329,6 +377,10 @@ func (r *Reconciler) deleteLoadBalancer(ctx context.Context, svc *corev1.Service
 		}
 		id = lb.ID
 	}
+	return r.tearDown(ctx, svc.Namespace+"/"+svc.Name, id)
+}
+
+func (r *Reconciler) tearDown(ctx context.Context, service, id string) error {
 	// The public address goes back first, while it can still be found by the
 	// port it is attached to. Deleting the load balancer takes that port with
 	// it, and Neutron leaves the address allocated to the project — still
@@ -350,7 +402,7 @@ func (r *Reconciler) deleteLoadBalancer(ctx context.Context, svc *corev1.Service
 		}
 	}
 
-	log.G(ctx).WithField("service", svc.Namespace+"/"+svc.Name).
+	log.G(ctx).WithField("service", service).
 		WithField("loadbalancer", id).Info("deleting load balancer")
 	return DeleteLoadBalancer(ctx, r.Octavia, id)
 }

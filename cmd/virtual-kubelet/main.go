@@ -22,6 +22,7 @@ import (
 
 	knode "github.com/fivetime/kubezun/pkg/node"
 	"github.com/fivetime/kubezun/pkg/provider"
+	kservice "github.com/fivetime/kubezun/pkg/service"
 	vkset "github.com/fivetime/kubezun/pkg/vknode"
 	"github.com/fivetime/kubezun/pkg/zun"
 )
@@ -48,6 +49,9 @@ type options struct {
 	tlsCert     string
 	tlsKey      string
 	clientCA    string
+	vipSubnet   string
+	floatingNet string
+	publicSvcs  bool
 }
 
 func main() {
@@ -82,6 +86,17 @@ func main() {
 		"node memory capacity; mirror the tenant's quota")
 	flag.StringVar(&o.capacityPod, "capacity-pods", envOr("KUBEZUN_CAPACITY_PODS", "0"),
 		"maximum pods; mirror the tenant's quota")
+	flag.StringVar(&o.vipSubnet, "vip-subnet-id", os.Getenv("KUBEZUN_VIP_SUBNET_ID"),
+		"subnet a Service's load balancer address comes from. Not the pod subnet: "+
+			"an address there makes east-west traffic arrive with the wrong "+
+			"destination MAC. Without it, Services get no load balancer")
+	flag.StringVar(&o.floatingNet, "floating-network-id", os.Getenv("KUBEZUN_FLOATING_NETWORK_ID"),
+		"external network public Service addresses are allocated from")
+	flag.BoolVar(&o.publicSvcs, "public-services-by-default", false,
+		"give a LoadBalancer Service a public address when it does not say. Off: a "+
+			"public address is billed, and a chart copied from elsewhere saying "+
+			"type: LoadBalancer has not asked to spend one. A Service overrides "+
+			"this either way with "+kservice.InternalAnnotation)
 	flag.StringVar(&o.tlsCert, "tls-cert-file", os.Getenv("KUBEZUN_TLS_CERT_FILE"),
 		"certificate the kubelet API serves. Its SANs must cover --internal-ip, which "+
 			"is the address the API server dials; node names never appear in the "+
@@ -215,6 +230,39 @@ func run(o options) error {
 		}); err != nil {
 			return err
 		}
+	}
+
+	if o.vipSubnet != "" {
+		// One controller per process, not per node: a load balancer belongs to
+		// the tenant, and every one of their virtual nodes serves the same
+		// Services.
+		octavia, err := kservice.NewOctaviaClient(zunClient)
+		if err != nil {
+			return fmt.Errorf("build the load balancer client: %w", err)
+		}
+		neutron, err := kservice.NewNetworkClient(zunClient)
+		if err != nil {
+			return fmt.Errorf("build the network client: %w", err)
+		}
+		controller, err := kservice.NewController(&kservice.Reconciler{
+			Octavia:           octavia,
+			Neutron:           neutron,
+			Subnets:           kservice.NewCapsuleSubnets(zun.NewCapsuleAPI(zunClient)),
+			Services:          set.ServiceInformer().Lister(),
+			Slices:            set.EndpointSliceInformer().Lister(),
+			ServiceClient:     client.CoreV1(),
+			VIPSubnetID:       o.vipSubnet,
+			FloatingNetworkID: o.floatingNet,
+			PublicByDefault:   o.publicSvcs,
+			Tenant:            o.tenant,
+		}, set.ServiceInformer(), set.EndpointSliceInformer())
+		if err != nil {
+			return err
+		}
+		go controller.Run(ctx)
+	} else {
+		vklog.G(ctx).Warn("no --vip-subnet-id; Services get no load balancer, " +
+			"and a pod cannot reach a Service by its cluster address")
 	}
 
 	go func() {
