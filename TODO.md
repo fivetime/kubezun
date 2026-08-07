@@ -208,6 +208,19 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 
 ## 阶段 2：多租户（§12）
 
+- [x] **第二租户上线，双虚拟节点并存（2026-08-07）**：租户 222222 的 Keystone
+      project/appcred、OVN 网络（192.168.110.0/24 + VIP 210.0/24 + router 上联）、
+      K8s SA/ClusterRoleBinding、systemd `kubezun@222222`；
+      `111111-node-az1` 与 `222222-node-az1` 同时 Ready
+- [x] **跨租户渗透验收通过（2026-08-07）**：租户 A 尝试三条路径打到 B 的节点——
+      ① `spec.nodeName` 直写 ② `pods/binding` ③ `nodeSelector`+B 的 toleration。
+      结果：**①③ 在 K8s 层都成功绑到了 B 的节点**（调度层挡不住，符合预期），
+      但 provider 白名单让其停在 ProviderFailed，**B 的 OpenStack project 零 capsule**；
+      ② 被 apiserver 直接拒（Conflict）。执行面隔离成立
+- [ ] ⚠️ **发现真实 DoS 向量（需 Kyverno 补齐）**：被 provider 拒绝的 pod **仍计入
+      受害节点 Allocated resources**（实测 limits=4CPU/8Gi 的攻击 pod 占掉对方节点 12%）
+      → 租户 A 可用大 limits 垃圾 pod 耗尽 B 的可调度容量。
+      **执行面靠 provider 白名单，容量面必须靠准入层**（DESIGN §4.2 已回写）
 - [ ] 每租户 VK Deployment 部署物（manifest/chart）：per-tenant SA、per-node :10250 +
       证书 + WebhookAuth(nodeName)（§2）
 - [ ] 同租户单进程多节点：共享 informer（pod watch 按 nodeName fieldSelector 合并）

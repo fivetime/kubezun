@@ -202,10 +202,17 @@ kubezoo M8 分片 + 多上游集群（M8 优先级据此重估）。空节点在
    spec.nodeName 过滤（node/nodeutil/client.go:53-58），该字段创建者可直接写死绕过调度器。
    因此 CreatePod/GetPod/GetPodStatus/GetContainerLogs 等所有入口先校验
    `pod.Namespace ∈ 本租户命名空间集`，不匹配返回 errdefs.NotFound。
-2. **Kyverno validate（deny，failurePolicy=Fail）**：禁租户写 spec.nodeName；禁
-   nodeSelector/toleration 指向非本租户节点；RBAC 收回租户对 pods/binding 子资源的 create
-   （第二条逃逸路径）。上线前实测 kube-system 控制器 SA 创建的 pod 确实经过策略
-   （核查 resourceFilters/excludeGroups）。
+2. **Kyverno validate（deny，failurePolicy=Fail）—— 不是兜底，是防 DoS 的必需层**：
+   禁租户写 spec.nodeName；禁 nodeSelector/toleration 指向非本租户节点；RBAC 收回租户
+   对 pods/binding 子资源的 create（第二条逃逸路径）。上线前实测 kube-system 控制器 SA
+   创建的 pod 确实经过策略（核查 resourceFilters/excludeGroups）。
+   **实测依据（2026-08-07 阶段 2 渗透）**：租户 A 用 `spec.nodeName` 直写或用
+   `nodeSelector: kubezoo.io/pool=B` + B 的 toleration，**K8s 调度层都挡不住——pod
+   确实被绑到 B 的节点上**；provider 白名单让它停在 ProviderFailed，B 的 OpenStack
+   project 里零 capsule（执行面安全）。但 **被拒的 pod 仍计入 B 节点的 Allocated
+   resources**（实测一个 limits=4CPU/8Gi 的攻击 pod 占掉 B 节点 12%），因此 A 可以用
+   大 limits 的垃圾 pod 耗尽 B 的可调度容量，让 B 自己的 pod 报 Insufficient cpu。
+   → **执行面靠 provider 白名单，容量面必须靠准入层拦截**，两层缺一不可。
 3. **VAP 保护 Node 写面**：nodes/status 只许 VK 自己的凭据写（前缀归属使租户"拥有"自己的
    虚拟节点名，必须闸住）；受保护标签/污点前缀（kubezoo.io/、knaas.io/、node-role、
    topology.*）只许平台写。租户业务标签写入 MVP 先禁、按需求开（待定项）。
