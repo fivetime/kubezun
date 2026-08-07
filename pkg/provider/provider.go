@@ -55,6 +55,11 @@ type Provider struct {
 	// pod is gone from one whose pod this process simply has not seen yet.
 	podLister corev1listers.PodLister
 
+	// configMaps and secrets back the pod's file volumes. A capsule has no
+	// kubelet to project them, so their content is read here and sent with it.
+	configMaps corev1listers.ConfigMapLister
+	secrets    corev1listers.SecretLister
+
 	mu   sync.RWMutex
 	pods map[string]*corev1.Pod // key: namespace/name
 	// deleted holds pods kept only so their terminal status can be reported.
@@ -67,9 +72,17 @@ type Provider struct {
 	notify func(*corev1.Pod)
 }
 
-// New builds a provider for one tenant. podLister may be nil, which disables
-// orphan cleanup; everything else works without it.
-func New(cfg Config, client *zun.Client, podLister corev1listers.PodLister) (*Provider, error) {
+// Caches are the informer-backed views a provider reads. Pods may be nil, which
+// disables orphan cleanup; without ConfigMaps and Secrets a pod with a file
+// volume is refused rather than started without its files.
+type Caches struct {
+	Pods       corev1listers.PodLister
+	ConfigMaps corev1listers.ConfigMapLister
+	Secrets    corev1listers.SecretLister
+}
+
+// New builds a provider for one tenant.
+func New(cfg Config, client *zun.Client, caches Caches) (*Provider, error) {
 	if len(cfg.Namespaces) == 0 {
 		return nil, fmt.Errorf("at least one namespace must be served")
 	}
@@ -80,7 +93,9 @@ func New(cfg Config, client *zun.Client, podLister corev1listers.PodLister) (*Pr
 	return &Provider{
 		cfg:        cfg,
 		namespaces: ns,
-		podLister:  podLister,
+		podLister:  caches.Pods,
+		configMaps: caches.ConfigMaps,
+		secrets:    caches.Secrets,
 		capsules:   zun.NewCapsuleAPI(client),
 		pods:       make(map[string]*corev1.Pod),
 		deleted:    make(map[string]types.UID),
@@ -121,11 +136,17 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 		}
 	}
 
+	files, err := p.resolveFiles(pod)
+	if err != nil {
+		return err
+	}
+
 	tpl, err := zun.BuildTemplate(pod, zun.TemplateOptions{
 		NetworkID:        p.cfg.NetworkID,
 		AvailabilityZone: p.cfg.AvailabilityZone,
 		Architecture:     p.cfg.Architecture,
 		NodeName:         p.cfg.NodeName,
+		Files:            files,
 	})
 	if err != nil {
 		return err

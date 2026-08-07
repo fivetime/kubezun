@@ -116,6 +116,11 @@ func NewSet(opts SetOptions) (*Set, error) {
 // only one node's pods.
 func (s *Set) Pods() corev1listers.PodLister { return s.pods.Lister() }
 
+// ConfigMaps and Secrets are the shared listers a provider reads a pod's file
+// volumes from.
+func (s *Set) ConfigMaps() corev1listers.ConfigMapLister { return s.configMaps.Lister() }
+func (s *Set) Secrets() corev1listers.SecretLister       { return s.secrets.Lister() }
+
 // Node is one virtual node: its node controller, its pod controller, and its
 // kubelet API endpoint.
 type Node struct {

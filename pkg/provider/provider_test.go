@@ -16,7 +16,7 @@ import (
 
 func newTestProvider(t *testing.T, namespaces ...string) *Provider {
 	t.Helper()
-	p, err := New(Config{Namespaces: namespaces, NodeName: "111111-node-az1"}, nil, nil)
+	p, err := New(Config{Namespaces: namespaces, NodeName: "111111-node-az1"}, nil, Caches{})
 	if err != nil {
 		t.Fatalf("new provider: %v", err)
 	}
@@ -35,7 +35,7 @@ func testPod(namespace, name string) *corev1.Pod {
 func TestNewRequiresNamespaces(t *testing.T) {
 	// A node serving every namespace could be reached by any pod that names it
 	// in spec.nodeName, which is the escape this list exists to close.
-	if _, err := New(Config{NodeName: "n"}, nil, nil); err == nil {
+	if _, err := New(Config{NodeName: "n"}, nil, Caches{}); err == nil {
 		t.Fatal("a provider without a namespace list was accepted")
 	}
 }

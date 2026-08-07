@@ -181,7 +181,11 @@ func run(o options) error {
 			AvailabilityZone: spec.zunAZ,
 			Architecture:     spec.arch,
 			NodeName:         spec.name,
-		}, zunClient, set.Pods())
+		}, zunClient, provider.Caches{
+			Pods:       set.Pods(),
+			ConfigMaps: set.ConfigMaps(),
+			Secrets:    set.Secrets(),
+		})
 		if err != nil {
 			return err
 		}

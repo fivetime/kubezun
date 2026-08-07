@@ -63,6 +63,8 @@ func Validate(pod *corev1.Pod) error {
 		case v.HostPath != nil:
 			return unsupported("spec.volumes[].hostPath",
 				"there is no shared host filesystem behind a virtual node")
+		case v.ConfigMap != nil, v.Secret != nil:
+			// Rendered into the capsule as files; see TemplateOptions.Files.
 		case v.Projected != nil:
 			if strings.HasPrefix(v.Name, "kube-api-access-") {
 				// Kubernetes' own ServiceAccount admission injects this volume
@@ -81,6 +83,12 @@ func Validate(pod *corev1.Pod) error {
 			}
 			return unsupported("spec.volumes[].projected",
 				"projected volumes need a kubelet to refresh their contents")
+		default:
+			// Refused rather than ignored. A dropped volume leaves the pod
+			// Running and Ready while the file its application reads is simply
+			// absent, which is the hardest kind of failure to trace back here.
+			return unsupported("volume "+v.Name,
+				"only configMap and secret volumes can be carried into a capsule")
 		}
 	}
 	for _, cs := range [][]corev1.Container{pod.Spec.Containers, pod.Spec.InitContainers} {
@@ -146,6 +154,7 @@ type container struct {
 	Env       map[string]string `json:"env,omitempty"`
 	Resources *resources        `json:"resources,omitempty"`
 	Ports     []port            `json:"ports,omitempty"`
+	Mounts    []volumeMount     `json:"volumeMounts,omitempty"`
 
 	// Probes are passed through as Kubernetes declares them. What a capsule
 	// can execute is decided on the Zun side, which is the only place with a
@@ -186,9 +195,29 @@ type metadata struct {
 }
 
 type spec struct {
-	Containers     []container `json:"containers"`
-	InitContainers []container `json:"initContainers,omitempty"`
-	RestartPolicy  string      `json:"restartPolicy,omitempty"`
+	Containers     []container     `json:"containers"`
+	InitContainers []container     `json:"initContainers,omitempty"`
+	RestartPolicy  string          `json:"restartPolicy,omitempty"`
+	Volumes        []capsuleVolume `json:"volumes,omitempty"`
+}
+
+// capsuleVolume carries one file's content with the capsule. Zun's local volume
+// driver writes a single file per volume, so a configMap with three keys
+// becomes three of these.
+type capsuleVolume struct {
+	Name string    `json:"name"`
+	File *fileData `json:"file,omitempty"`
+}
+
+type fileData struct {
+	// Base64 so a value with newlines, or one that is not text at all, arrives
+	// as it was stored.
+	Contents string `json:"contents"`
+}
+
+type volumeMount struct {
+	Name      string `json:"name"`
+	MountPath string `json:"mountPath"`
 }
 
 type template struct {
@@ -236,6 +265,10 @@ type TemplateOptions struct {
 	// NodeName is the virtual node creating the capsule; it is stamped on the
 	// capsule so another node serving the same namespace can tell whose it is.
 	NodeName string
+	// Files is the resolved content of the pod's configMap and secret volumes,
+	// keyed by volume name and then by file name within the volume. A capsule
+	// has no kubelet to project them, so their content travels with it.
+	Files map[string]map[string][]byte
 	// Architecture is the machine this node's capsules must run on. A node
 	// serves one architecture: its kubernetes.io/arch label is what got the
 	// pod scheduled here, and the capsule has to land on a host that matches
@@ -295,6 +328,18 @@ func BuildTemplate(pod *corev1.Pod, opts TemplateOptions) ([]byte, error) {
 	}
 	if len(t.Spec.Containers) == 0 {
 		return nil, errdefs.InvalidInput("pod has no containers")
+	}
+
+	volumes, mounts, err := buildFileVolumes(pod, opts.Files)
+	if err != nil {
+		return nil, err
+	}
+	t.Spec.Volumes = volumes
+	for i := range t.Spec.InitContainers {
+		t.Spec.InitContainers[i].Mounts = mounts[t.Spec.InitContainers[i].Name]
+	}
+	for i := range t.Spec.Containers {
+		t.Spec.Containers[i].Mounts = mounts[t.Spec.Containers[i].Name]
 	}
 
 	return json.Marshal(t)
