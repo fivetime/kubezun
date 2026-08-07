@@ -178,13 +178,17 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       capsule 模板 restartPolicy 用 K8s 拼写、K8s zone ≠ Zun AZ（AZ filter 滤掉全部
       主机）、Zun 忽略容器名需按序匹配、删除需 force=True（否则 409）、
       终态须先回写 K8s 才能删 pod 对象
-- [ ] 平台侧待办（阻塞项，非 provider bug）：
-      ⚠️ **系统 DS 落到虚拟节点**——cilium DS 容忍一切（`[{"operator":"Exists"}]`），
-      DS controller 为虚拟节点也建 pod → provider 按 namespace 白名单拒绝
-      （ProviderFailed，边界生效）→ 但 cilium 因此给节点打
-      `node.cilium.io/agent-not-ready` 污点，反过来挡住租户 pod。
-      正解见 DESIGN §4.5（给系统 DS 注入 `type NotIn (virtual-kubelet)` nodeAffinity），
-      验收时临时用 toleration 绕过
+- [x] **系统 DS 排除已落地并验证（2026-08-07，DESIGN §4.5）**：给 cilium /
+      cilium-envoy / cilium-node-init 注入 `type NotIn (virtual-kubelet)`
+      nodeAffinity（虚拟节点自带该标签）。⚠️ cilium-envoy 已有 nodeAffinity
+      （排除 cilium.io/no-schedule），必须**追加到同一 matchExpressions**
+      而非 merge 覆盖。结果：DS DESIRED 4→3、虚拟节点上零 pod、
+      **租户 pod 只带自身 toleration 即可调度并 1/1 Running**。
+      ⚠️ 残留的 `node.cilium.io/agent-not-ready` 污点需手工清一次
+      （nodeAffinity 只挡新 pod，而能清除该污点的 agent 已不再被调度上去）。
+      步骤与判据见 `deploy/exclude-virtual-nodes.md`；托管/operator 管理的集群
+      需改从 operator 配置或用 mutating 策略下发，否则会被 reconcile 回滚
+- [ ] 平台侧其余待办：
       ⚠️ 租户 pod 需 `automountServiceAccountToken: false`（否则被 SA token
       projected volume 拒绝，错误信息已点名该设置）——应由 Kyverno 默认注入
       ⚠️ 计算节点需装 `numactl`（缺失则 Zun 报 cpus=0，一切调度失败）
