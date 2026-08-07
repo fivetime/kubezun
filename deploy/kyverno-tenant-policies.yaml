@@ -1,0 +1,168 @@
+# Admission policy for KNaaS tenant namespaces.
+#
+# The provider's namespace check already stops another tenant's pod from
+# executing on this node. What it cannot stop is the accounting: a pod bound to
+# a node counts against that node's allocatable resources even when the
+# provider refuses it, so a tenant can exhaust a neighbour's schedulable
+# capacity with pods that never run. That is what these policies are for —
+# they are the only layer that can refuse the pod before it is bound.
+#
+# Tenant namespaces are named "<tenant>-<name>" (111111-default), which is what
+# the tenant id is taken from.
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: knaas-tenant-placement
+  annotations:
+    policies.kyverno.io/title: Confine tenant workloads to their own node
+    policies.kyverno.io/description: >-
+      Refuses a pod that names a node directly and injects the tenant's own
+      pool selector and toleration, so a tenant cannot aim a workload at
+      another tenant's virtual node.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    # A pod carrying spec.nodeName never went through the scheduler: it is
+    # bound on arrival, to whatever node the author named. This is the shortest
+    # path to another tenant's node and the only one that also skips every
+    # placement rule below.
+    - name: refuse-explicit-node
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaceSelector:
+                matchExpressions:
+                  - {key: knaas.io/tenant, operator: Exists}
+      preconditions:
+        all:
+          - key: "{{ request.operation || 'BACKGROUND' }}"
+            operator: Equals
+            value: CREATE
+      validate:
+        message: >-
+          spec.nodeName may not be set: pods are placed by the scheduler onto
+          the tenant's own virtual node.
+        pattern:
+          spec:
+            X(nodeName): "null"
+
+    # Placement is injected rather than trusted, so a workload does not have to
+    # know about pools or taints, and one that tries to name someone else's is
+    # overwritten rather than merely rejected.
+    - name: inject-tenant-placement
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaceSelector:
+                matchExpressions:
+                  - {key: knaas.io/tenant, operator: Exists}
+      mutate:
+        patchStrategicMerge:
+          spec:
+            nodeSelector:
+              kubezoo.io/pool: "{{ request.namespace | split(@, '-') | [0] }}"
+            tolerations:
+              - key: knaas.io/tenant
+                operator: Equal
+                value: "{{ request.namespace | split(@, '-') | [0] }}"
+                effect: NoSchedule
+
+    # Kyverno mutates before it validates, so a pod naming another tenant's
+    # pool has already been rewritten to its own by the rule above and this
+    # never fires in practice — which is the better outcome, since a workload
+    # that guessed wrong is corrected rather than rejected. It stays as the
+    # check that would catch a foreign pool if that mutation ever stopped
+    # applying.
+    - name: refuse-foreign-pool
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaceSelector:
+                matchExpressions:
+                  - {key: knaas.io/tenant, operator: Exists}
+      validate:
+        message: >-
+          nodeSelector kubezoo.io/pool must name this tenant's own pool.
+        deny:
+          conditions:
+            all:
+              - key: "{{ request.object.spec.nodeSelector.\"kubezoo.io/pool\" || '' }}"
+                operator: NotEquals
+                value: ""
+              - key: "{{ request.object.spec.nodeSelector.\"kubezoo.io/pool\" || '' }}"
+                operator: NotEquals
+                value: "{{ request.namespace | split(@, '-') | [0] }}"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: knaas-tenant-pod-capabilities
+  annotations:
+    policies.kyverno.io/title: Drop what a capsule cannot honour
+    policies.kyverno.io/description: >-
+      Turns off the service account token, which a capsule cannot refresh, so
+      workloads are not rejected by the provider for a volume Kubernetes
+      injected on their behalf.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    # Every pod that does not opt out gets a projected service account token,
+    # and a capsule has no kubelet to refresh a bound token. Left alone, the
+    # provider refuses the pod for a volume the tenant never asked for.
+    - name: disable-service-account-token
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaceSelector:
+                matchExpressions:
+                  - {key: knaas.io/tenant, operator: Exists}
+      mutate:
+        patchStrategicMerge:
+          spec:
+            +(automountServiceAccountToken): false
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: knaas-tenant-daemonset-placement
+  annotations:
+    policies.kyverno.io/title: Place tenant DaemonSets on their virtual nodes
+    policies.kyverno.io/description: >-
+      Injects placement into a DaemonSet's pod template rather than its pods.
+      The DaemonSet controller decides which nodes are eligible from the
+      template before any pod exists, so a template without the toleration
+      yields no pod for the virtual node at all, and placement added at the pod
+      level contradicts the node affinity the controller writes, leaving pods
+      pending on real nodes forever.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: inject-placement-into-template
+      match:
+        any:
+          - resources:
+              kinds: [DaemonSet]
+              namespaceSelector:
+                matchExpressions:
+                  - {key: knaas.io/tenant, operator: Exists}
+      mutate:
+        patchStrategicMerge:
+          spec:
+            template:
+              spec:
+                automountServiceAccountToken: false
+                nodeSelector:
+                  kubezoo.io/pool: "{{ request.namespace | split(@, '-') | [0] }}"
+                tolerations:
+                  - key: knaas.io/tenant
+                    operator: Equal
+                    value: "{{ request.namespace | split(@, '-') | [0] }}"
+                    effect: NoSchedule
