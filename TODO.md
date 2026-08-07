@@ -357,14 +357,19 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       **动态转换实测**：用 `kubectl exec` 在容器内补上探针要的路径 → **5 秒内**
       `ready` 翻成 True 进入 EndpointSlice（探针 periodSeconds=5，
       得益于本轮的探针周期修复；此前光探针一项就要 60s+）
-- [ ] ⚠️ **最后一跳（EndpointSlice → Octavia LB member）：kubetron 现状收编不了 capsule**
-      （2026-08-07 查证）。`members.go:100-147` 的 `memberEndpoint` 强制 member pod 带
-      kubetron claim 注解，并从 `NetworkPortClaim.Status.Subnet.ID` 取 member 子网；
-      capsule 走 Zun 原生 port、无 claim → **每个 kubezun pod 必在此报错**。
-      （本轮 LB 未生效的**表面**原因是 kubetron 未纳管该 namespace，但即便纳管也会卡在这里。）
-      缺口**只有 subnet 一个字段**，其余全后端无关；capsule 地址本就带 `subnet_id`。
-      **三条路 + 推荐见 DESIGN §14.4，需产品决策后再实现**
-- [ ] ⚠️ 同类问题待查：kubetron 的 `dns_controller.go` 是否也依赖 claim
+- [ ] **kubezun 自建 Service→Octavia reconciler**（定案 2026-08-07，DESIGN §14.4：
+      与 kubetron 共存各管各的，不复用其 Service 半边）。
+      **共存安全性已查证**：kubetron 孤儿 GC 按 `device_owner` tag 过滤
+      （`kubetron`/`kubetron:<clusterid>`），Zun port 是 `compute:zun`（consts.py:80），
+      不会误清；无 kubetron 注解的 pod 不进其处理路径。
+      ⚠️ 边界：`memberEndpoint` 对无注解 pod 是 **error 非 skip**（`members.go:54-57`），
+      **同一 Service 混选两种 pod** 会让 kubetron 对该 Service 整体 reconcile 失败
+      （pool 冻结不清空）——迁移场景会撞上，记录备查
+      实现要点（照抄 kubetron 同名实现，subnet 改取 capsule 地址的 `subnet_id`，
+      `pkg/zun/capsule.go:59`）：LB/listener/pool 生命周期、**幂等全量 PUT**
+      （`BatchUpdatePoolMembers` 全集合语义，少放一个就清空 pool）、LB GC、
+      双栈（一 pool 一族）、Ingress
+- [ ] kubezun 自建租户 DNS 编排（同上定调；kubetron `dns_controller.go` 可作蓝本）
 - [ ] Octavia health monitor 作为**第二层**（LB 侧自检）是否需要：EndpointSlice 已能
       按 readiness 摘除 member，HM 是冗余保护而非必需；若启用需查 OVN provider 的
       `SUPPORTED_HEALTH_MONITOR_TYPES` 白名单（DESIGN §6）

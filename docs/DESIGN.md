@@ -628,20 +628,35 @@ kubetron DNS 分发通道改造、M8 编排层独立部署形态。
    两者都不难，但差别足够大，值得**明确选一个而不是默认滑进去**。
    在此之前，已验证并支持的形态是宿主机 systemd（`deploy/kubezun@.service`）。
    ⚠️ 若走 hostNetwork 规避地址问题：计算节点的 kubelet 已占 10250，需换端口。
-4. **Service→Octavia 由谁编排**（2026-08-07 提出，**需产品决策**）。
-   kubetron 的 Service reconciler 只差 member 的 subnet 一个字段就能收编 capsule
-   （§11 已纠正）。三条路：
-   - **A. kubetron 改为按 member IP 查 Neutron 取 subnet**（约 20 行 + 一次可缓存调用）。
-     ⭐ 推荐：改完 kubetron **不需要理解 VK/Zun**，只认 IP，对任何后端都成立——
-     等于**解除**耦合而不是新增。一份 Octavia 编排同时服务 B1 与 B2'。
-   - B. kubezun 在 Node 对象上打租户子网标签，kubetron 经 `pod.Spec.NodeName` 读取。
-     两侧小改，但建立了一条 kubetron→kubezun 的认知。
-   - C. kubezun 自建 Service reconciler。**代价被低估**：kubetron 那半边不是薄封装，
-     含 LB GC、幂等全量 PUT（BatchUpdate 是全集合 PUT，漏一个就清空 pool）、
-     双栈规则、Ingress 复用；重写意味着两套 Octavia 语义长期对齐。
-     仅当产品上要求 kubezun 完全自包含（独立发布节奏、不共享部署）才选它。
-   ⚠️ 无论选哪条，**DNS 编排（`dns_controller.go`）有同类问题待查**——它是否也依赖
-   claim 尚未查证。
+4. ~~**Service→Octavia 由谁编排**~~ —— **已定案（2026-08-07，用户决策）：kubezun 自建，
+   与 kubetron 共存，各管各的。** 理由是两者是不同形态的产品：kubetron 的数据面半边
+   （claim/pool/binding、webhook cni-args 注入）服务的是"K8s pod + Multus/ovs-cni"，
+   capsule 走 Zun 原生 port 结构性不需要；而其 Service reconciler 的
+   `memberEndpoint`（`members.go:100-147`）强制 member 带 kubetron claim 注解并从
+   `NetworkPortClaim.Status.Subnet.ID` 取子网，capsule 无 claim。
+
+   **共存安全性已查证**：
+   - **Neutron port 不会被误清**——kubetron 的孤儿 GC 按 `device_owner` tag 过滤
+     （`kubetron` / `kubetron:<clusterid>`，`pkg/neutron/clusterid_test.go` 明示这是
+     为多实例共享一个 Neutron 而设计），Zun 的 port 是 `compute:zun`（consts.py:80），
+     不同 owner，列都列不到。
+   - **kubetron 不会去动 kubezun 的 pod**——没有它认识的注解就不进它的处理路径。
+
+   ⚠️ **唯一边界条件**：`memberEndpoint` 对无注解 pod 是 **return error 而非 skip**，
+   且 `BuildMembers` 直接向上抛（`members.go:54-57`）。所以**同一个 Service 同时选中
+   两种 pod** 时，kubetron 对该 Service 的 reconcile 整体失败，连它自己的 member 也停止
+   更新（`BatchUpdatePoolMembers` 是全集合 PUT，不执行 = pool 冻结在上一状态，比清空
+   安全但不再跟随 readiness，且只在 kubetron 日志可见）。
+   按租户模型不该发生（B1/B2' 不同租户不同 namespace）；**会撞上的是迁移场景**
+   （一个租户从 B1 迁到 B2'，或同时用两档）。记录备查，不为它设计。
+
+   **自建的工作量清单**（kubetron 那半边不是薄封装，重写要连这些一起）：
+   Service→LB/listener/pool 生命周期、**幂等全量 PUT**（`BatchUpdatePoolMembers`
+   是全集合语义，少放一个 member 就清空整个 pool）、LB GC、双栈（一个 pool 绑一个族）、
+   Ingress 复用。可**照抄 kubetron 的实现**（同一作者、同一 gophercloud v2 栈），
+   subnet 改为取自 capsule 地址记录的 `subnet_id`（`pkg/zun/capsule.go:59`），
+   不再需要 claim。
+
 5. **kube-system 控制器 pod 过 Kyverno**：resourceFilters/excludeGroups 核查——决定
    validate 边界的实际覆盖。
 6. **租户业务标签写自己节点**：MVP 禁；有 pinning 需求再经 VAP 白名单放开。
