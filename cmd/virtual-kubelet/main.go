@@ -204,6 +204,7 @@ func run(o options) error {
 			AvailabilityZone: spec.zunAZ,
 			Architecture:     spec.arch,
 			NodeName:         spec.name,
+			ClusterDomain:    o.clusterDomain,
 		}, zunClient, provider.Caches{
 			Pods:       set.Pods(),
 			ConfigMaps: set.ConfigMaps(),
@@ -270,6 +271,9 @@ func run(o options) error {
 			return err
 		}
 		go controller.Run(ctx)
+		// Load balancers of Services deleted while this was not running are
+		// invisible to the queue; nothing but a sweep ever removes them.
+		go controller.RunGC(ctx)
 	} else {
 		vklog.G(ctx).Warn("no --vip-subnet-id; Services get no load balancer, " +
 			"and a pod cannot reach a Service by its cluster address")

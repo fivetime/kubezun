@@ -61,6 +61,15 @@ func GetLoadBalancerByName(ctx context.Context, c *gophercloud.ServiceClient, na
 	}
 }
 
+// listLoadBalancers returns every load balancer the credential can see.
+func listLoadBalancers(ctx context.Context, c *gophercloud.ServiceClient) ([]loadbalancers.LoadBalancer, error) {
+	pages, err := loadbalancers.List(c, loadbalancers.ListOpts{}).AllPages(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return loadbalancers.ExtractLoadBalancers(pages)
+}
+
 // WaitActive blocks until the load balancer is ACTIVE and returns it.
 func WaitActive(ctx context.Context, c *gophercloud.ServiceClient, id string) (*loadbalancers.LoadBalancer, error) {
 	deadline := time.Now().Add(activeTimeout)

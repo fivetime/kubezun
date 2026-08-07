@@ -230,6 +230,14 @@ type template struct {
 	Architecture     string   `json:"architecture,omitempty"`
 }
 
+// annotationsFor carries settings the capsule needs but has no field for.
+func annotationsFor(opts TemplateOptions) map[string]string {
+	if len(opts.DNSSearches) == 0 {
+		return nil
+	}
+	return map[string]string{"knaas.io/dns-searches": strings.Join(opts.DNSSearches, ",")}
+}
+
 // knownArchitectures are the machines Zun can place a capsule on. The
 // Kubernetes spelling is what appears here and in the node's arch label; Zun
 // normalises it to the Linux one (arm64 -> aarch64) on the way to Placement.
@@ -269,6 +277,10 @@ type TemplateOptions struct {
 	// keyed by volume name and then by file name within the volume. A capsule
 	// has no kubelet to project them, so their content travels with it.
 	Files map[string]map[string][]byte
+	// DNSSearches is the resolver search list the pod's containers get, which
+	// is what lets an application use a Service's short name. Only this side
+	// knows it: it is derived from the pod's namespace.
+	DNSSearches []string
 	// Architecture is the machine this node's capsules must run on. A node
 	// serves one architecture: its kubernetes.io/arch label is what got the
 	// pod scheduled here, and the capsule has to land on a host that matches
@@ -286,7 +298,8 @@ func BuildTemplate(pod *corev1.Pod, opts TemplateOptions) ([]byte, error) {
 		Kind:           "capsule",
 		CapsuleVersion: "beta",
 		Metadata: metadata{
-			Name: CapsuleName(pod),
+			Name:        CapsuleName(pod),
+			Annotations: annotationsFor(opts),
 			Labels: map[string]string{
 				LabelManagedBy: ManagedByValue,
 				LabelNamespace: pod.Namespace,

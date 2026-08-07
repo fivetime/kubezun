@@ -199,3 +199,28 @@ func TestGetPodHidesADeletedPodFromItsReplacement(t *testing.T) {
 		t.Errorf("GetPod returned UID %q, want uid-new", got.UID)
 	}
 }
+
+// A pod gets the same search list a kubelet would compose, because an
+// application written for Kubernetes uses a Service's short name and relies on
+// it being completed. Without this, short names fail in a way that looks like
+// the Service is missing.
+func TestDNSSearchesMatchTheKubeletShape(t *testing.T) {
+	got := dnsSearches("111111-default", "svc.cluster.local")
+	want := []string{"111111-default.svc.cluster.local", "svc.cluster.local", "cluster.local"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+	// Order matters: the namespace's own domain has to be tried first, or a
+	// Service in another namespace with the same name would answer instead.
+	if got[0] != "111111-default.svc.cluster.local" {
+		t.Error("the pod's own namespace is not searched first")
+	}
+	if dnsSearches("t1", "") != nil {
+		t.Error("no cluster domain should produce no search list rather than a broken one")
+	}
+}

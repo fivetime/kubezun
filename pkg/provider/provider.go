@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,6 +45,11 @@ type Config struct {
 
 	// NodeName is the name this provider's node registered under.
 	NodeName string
+
+	// ClusterDomain is the suffix Service names resolve under. It becomes the
+	// pods' resolver search list, which is what lets an application written for
+	// Kubernetes use a Service's short name.
+	ClusterDomain string
 }
 
 // Provider runs pods as Zun capsules for a single tenant.
@@ -148,6 +154,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 		Architecture:     p.cfg.Architecture,
 		NodeName:         p.cfg.NodeName,
 		Files:            files,
+		DNSSearches:      dnsSearches(pod.Namespace, p.cfg.ClusterDomain),
 	})
 	if err != nil {
 		return err
@@ -389,6 +396,22 @@ func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, con
 		data = data[len(data)-opts.LimitBytes:]
 	}
 	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// dnsSearches is the search list a pod in this namespace should resolve with:
+// the same three entries a kubelet would compose, so a name written for
+// Kubernetes resolves the way its author expected.
+func dnsSearches(namespace, clusterDomain string) []string {
+	base := strings.TrimSuffix(clusterDomain, ".")
+	if base == "" {
+		return nil
+	}
+	base = strings.TrimPrefix(base, "svc.")
+	return []string{
+		namespace + ".svc." + base,
+		"svc." + base,
+		base,
+	}
 }
 
 // containerIndex reports where a container sits in the pod's spec, which is
