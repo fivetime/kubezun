@@ -105,6 +105,22 @@ func (c *Container) HasReadinessProbe() bool {
 	return ok
 }
 
+// Restarts reports how many times a failing liveness or startup probe has had
+// this container replaced. Without it a pod that is being restarted in a loop
+// looks identical to one that has been up since it was created.
+func (c *Container) Restarts() int32 {
+	state, ok := c.Healthcheck["k8s_probe_state"].(map[string]any)
+	if !ok {
+		return 0
+	}
+	// JSON numbers arrive as float64.
+	n, ok := state["restarts"].(float64)
+	if !ok {
+		return 0
+	}
+	return int32(n)
+}
+
 // ProbeAnswered reports whether the prober has recorded a readiness result.
 func (c *Container) ProbeAnswered() bool {
 	state, ok := c.Healthcheck["k8s_probe_state"].(map[string]any)

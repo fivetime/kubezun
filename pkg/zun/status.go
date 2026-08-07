@@ -131,6 +131,7 @@ func ContainerStatuses(pod *corev1.Pod, cap *Capsule) []corev1.ContainerStatus {
 			c := &cap.Containers[i]
 			st.State = ContainerState(c)
 			st.Ready = ContainerReady(c)
+			st.RestartCount = c.Restarts()
 			st.ContainerID = "zun://" + c.UUID
 		}
 		if w := st.State.Waiting; w != nil {

@@ -222,3 +222,32 @@ func TestContainerStatusesLeavePlacedCapsulesAlone(t *testing.T) {
 		t.Errorf("waiting state was overwritten for a capsule that had a host: %+v", w)
 	}
 }
+
+// A pod restarting in a loop has to be distinguishable from one that has been
+// up since it was created; the count is the only thing that says so.
+func TestContainerStatusesReportRestarts(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{
+		Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+	}}
+	cap := &Capsule{
+		Status: "Running",
+		Host:   "incus-node-04",
+		Containers: []Container{{
+			UUID:   "u",
+			Status: "Running",
+			// As it arrives from JSON, where numbers are float64.
+			Healthcheck: map[string]any{
+				"k8s_probe_state": map[string]any{"restarts": float64(3)},
+			},
+		}},
+	}
+	if got := ContainerStatuses(pod, cap)[0].RestartCount; got != 3 {
+		t.Errorf("RestartCount = %d, want 3", got)
+	}
+
+	// A container that has never restarted reports zero rather than nothing.
+	cap.Containers[0].Healthcheck = nil
+	if got := ContainerStatuses(pod, cap)[0].RestartCount; got != 0 {
+		t.Errorf("RestartCount = %d for a container with no probe state, want 0", got)
+	}
+}

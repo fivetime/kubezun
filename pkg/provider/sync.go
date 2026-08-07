@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"strconv"
 	"time"
 
 	"github.com/virtual-kubelet/virtual-kubelet/log"
@@ -207,7 +208,11 @@ func (p *Provider) updateStatus(pod *corev1.Pod, mutate func(*corev1.Pod)) {
 func statusFingerprint(pod *corev1.Pod) string {
 	s := string(pod.Status.Phase) + "|" + pod.Status.Reason + "|" + pod.Status.PodIP
 	for _, c := range pod.Status.ContainerStatuses {
-		s += "|" + c.Name + ":" + containerStateKey(c.State) + ":" + boolKey(c.Ready)
+		// The restart count is part of the fingerprint: a container replaced
+		// between two polls can come back Running and ready, and without this
+		// the restart would never be written to the pod.
+		s += "|" + c.Name + ":" + containerStateKey(c.State) + ":" + boolKey(c.Ready) +
+			":" + strconv.Itoa(int(c.RestartCount))
 	}
 	for _, c := range pod.Status.Conditions {
 		s += "|" + string(c.Type) + "=" + string(c.Status)
