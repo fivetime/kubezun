@@ -277,8 +277,15 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       `kubernetes.io/kubelet-serving` 签发器（**控制面零配置**，apiserver 本来就信任），
       CSR subject 必须 `O=system:nodes,CN=system:node:<name>`（签发器硬性要求，
       但 apiserver 只校验 SAN 不看 CN，故写哪个节点名无所谓）
-- [ ] 证书轮换：`kubelet-serving` 证书短期有效，当前无轮换机制 →
-      过期即 logs/exec 中断（节点本身不受影响，证书只服务 kubelet API）
+- [x] **证书热加载（2026-08-07，实测）**：此前启动时读一次，**轮换后不重载** →
+      证书过期而替换件就躺在同一个文件里，表现是 logs/exec 中断而节点仍 Ready，
+      静默且难查。改为每次握手从内存取、每分钟重读文件；读失败保留上一张可用证书
+      （轮换写文件不是原子的，为一瞬间的半截文件拒绝所有连接更糟）。
+      实测：不重启进程换证书，序列号 `925AAE…` → `19608C…`，`kubectl exec` 仍正常。
+      ⚠️ 仍需外部机制**签发**新证书（本项只解决"签发了但不生效"）
+- [x] **心跳可调（2026-08-07）**：新增 `--lease-duration`（默认 40s 即真 kubelet 的值）。
+      DESIGN §3.5 论证可放宽到 30–60s——**虚拟节点的健康就是进程在不在**，
+      不像物理机会在两次心跳之间悄悄失联。代价是进程死后调度器还会往上放多久 pod
 - [x] **appcred 移出 unit 文件（2026-08-07）**：unit 文件是 **world-readable**（实测
       644，`nobody` 可读到 appcred）。改为 `EnvironmentFile=/etc/kubezun/<T>/openrc`，
       0600 文件 + 0700 目录，与 tls.key / client-ca / kubeconfig 同一目录。
@@ -424,7 +431,10 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 - [ ] Zun capsule 容器名 minLength=2，K8s 允许单字符容器名 → 租户写 `name: c` 得到一个
       看不懂的 400。fork 侧放宽 schema，或 provider 侧改写并在状态里映射回原名
 - [ ] kubectl logs 通路：对接 fork 的 GET /capsules/{id}/logs；exec 返回 errdefs 明确错误（§10）
-- [ ] Barbican KMS：barbican-kms-plugin（CPO 现成）做 etcd 加密后端（§8.1）
+- [ ] Barbican KMS：barbican-kms-plugin（CPO 现成）做 etcd 加密后端（§8.1）。
+      ⚠️ **与 kubetron 的 Barbican 是两回事**（2026-08-07 查证）：kubetron 的
+      `pkg/ingress/barbican.go` 是把 K8s TLS Secret 镜像成 PKCS12 供 Octavia 做
+      **Ingress L7 TLS 终止**；本项是 etcd 静态加密的 KMS provider。同名不同物
 - [ ] Barbican secret ref 注入（对接 fork，替代 Secret 明文过 Zun DB）（§8.1）
 - [ ] capsule 预热池：kubetron NetworkPortPool 水位模型作蓝本，"预绑 host_id"换"预建
       capsule"，对标 kata 冷启动数十秒 → 秒级（§11 P3）

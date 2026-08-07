@@ -45,6 +45,7 @@ type options struct {
 	capacityMem   string
 	capacityPod   string
 	logLevel      string
+	leaseSeconds  int
 	nodes         nodeSpecList
 	tlsCert       string
 	tlsKey        string
@@ -120,6 +121,13 @@ func main() {
 			"Anything unstated is taken from the flags above. A tenant needs one node "+
 			"per architecture and per availability zone, and running them here rather "+
 			"than one process each shares the pod watch and the credentials between them.")
+	flag.IntVar(&o.leaseSeconds, "lease-duration", 40,
+		"seconds a node's lease is valid, and so how often it is renewed. The "+
+			"largest single lever on what a virtual node costs the control "+
+			"plane; a longer one than a real kubelet's is defensible because a "+
+			"virtual node's health is a process being up rather than a machine "+
+			"still answering, and the cost is how long the scheduler keeps "+
+			"placing pods on one whose process has died")
 	flag.StringVar(&o.logLevel, "log-level", envOr("KUBEZUN_LOG_LEVEL", "info"), "log level")
 	flag.Parse()
 
@@ -169,17 +177,21 @@ func run(o options) error {
 	}
 
 	set, err := vkset.NewSet(vkset.SetOptions{
-		Client:     client,
-		Namespaces: namespaces,
-		Workers:    runtime.NumCPU(),
+		Client:               client,
+		Namespaces:           namespaces,
+		Workers:              runtime.NumCPU(),
+		LeaseDurationSeconds: o.leaseSeconds,
 	})
 	if err != nil {
 		return err
 	}
 
-	tlsConfig, err := serverTLS(o)
+	tlsConfig, certs, err := serverTLS(o)
 	if err != nil {
 		return err
+	}
+	if certs != nil {
+		go certs.Run(ctx)
 	}
 
 	for _, spec := range specs {
@@ -307,32 +319,38 @@ func run(o options) error {
 // is in the node's status, and node names never appear in TLS. So one
 // certificate serves every node in this process, and the per-node part is the
 // authorizer, not the key material.
-func serverTLS(o options) (*tls.Config, error) {
+func serverTLS(o options) (*tls.Config, *vkset.CertReloader, error) {
 	if o.tlsCert == "" && o.tlsKey == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if o.tlsCert == "" || o.tlsKey == "" {
-		return nil, fmt.Errorf("--tls-cert-file and --tls-private-key-file must be given together")
+		return nil, nil, fmt.Errorf("--tls-cert-file and --tls-private-key-file must be given together")
 	}
 	if o.clientCA == "" {
 		// Without it the server cannot tell the API server from anyone else who
 		// can reach the port, and logs and exec reach into tenant containers.
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"--client-ca-file is required with a serving certificate: without it the " +
 				"kubelet API cannot verify who is calling")
 	}
 
-	cfg := &tls.Config{
-		MinVersion:   tls.VersionTLS12,
-		CipherSuites: nodeutil.DefaultServerCiphers(),
+	// Read per handshake rather than once, so a renewed certificate is picked
+	// up while the process runs. A kubelet-serving certificate is short-lived,
+	// and one that expires while its replacement sits unread on disk takes
+	// logs and exec down with the node still Ready.
+	reloader, err := vkset.NewCertReloader(o.tlsCert, o.tlsKey)
+	if err != nil {
+		return nil, nil, err
 	}
-	if err := nodeutil.WithKeyPairFromPath(o.tlsCert, o.tlsKey)(cfg); err != nil {
-		return nil, fmt.Errorf("load serving certificate: %w", err)
+	cfg := &tls.Config{
+		MinVersion:     tls.VersionTLS12,
+		CipherSuites:   nodeutil.DefaultServerCiphers(),
+		GetCertificate: reloader.GetCertificate,
 	}
 	if err := nodeutil.WithCAFromPath(o.clientCA)(cfg); err != nil {
-		return nil, fmt.Errorf("load client CA: %w", err)
+		return nil, nil, fmt.Errorf("load client CA: %w", err)
 	}
-	return cfg, nil
+	return cfg, reloader, nil
 }
 
 // withClientCA makes the kubelet API verify the caller's certificate against

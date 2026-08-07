@@ -77,23 +77,23 @@ func TestNodeSpecsRequiresANode(t *testing.T) {
 func TestServerTLSRefusesAHalfConfiguredEndpoint(t *testing.T) {
 	// No certificate at all is a valid choice: the endpoint simply does not run,
 	// and logs and exec are unavailable rather than unprotected.
-	cfg, err := serverTLS(options{})
-	if cfg != nil || err != nil {
-		t.Errorf("no TLS flags should disable the endpoint, got %v %v", cfg, err)
+	cfg, reloader, err := serverTLS(options{})
+	if cfg != nil || reloader != nil || err != nil {
+		t.Errorf("no TLS flags should disable the endpoint, got %v %v %v", cfg, reloader, err)
 	}
 
 	// A key without a certificate, or the reverse, cannot serve anything.
-	if _, err := serverTLS(options{tlsCert: "cert.pem"}); err == nil {
+	if _, _, err := serverTLS(options{tlsCert: "cert.pem"}); err == nil {
 		t.Error("a certificate without a key was accepted")
 	}
-	if _, err := serverTLS(options{tlsKey: "key.pem"}); err == nil {
+	if _, _, err := serverTLS(options{tlsKey: "key.pem"}); err == nil {
 		t.Error("a key without a certificate was accepted")
 	}
 
 	// Serving without a client CA would let anyone who reaches the port read
 	// logs and exec into tenant containers, so it is refused rather than
 	// defaulted.
-	if _, err := serverTLS(options{tlsCert: "cert.pem", tlsKey: "key.pem"}); err == nil {
+	if _, _, err := serverTLS(options{tlsCert: "cert.pem", tlsKey: "key.pem"}); err == nil {
 		t.Error("a serving certificate without a client CA was accepted")
 	}
 }

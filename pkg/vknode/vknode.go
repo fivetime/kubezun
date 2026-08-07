@@ -46,8 +46,9 @@ type Set struct {
 	services   corev1informers.ServiceInformer
 	slices     discoveryv1informers.EndpointSliceInformer
 
-	broadcaster record.EventBroadcaster
-	workers     int
+	broadcaster   record.EventBroadcaster
+	workers       int
+	leaseDuration int
 
 	nodes []*Node
 }
@@ -65,6 +66,18 @@ type SetOptions struct {
 	ResyncPeriod time.Duration
 	// Workers per pod controller. Zero means one.
 	Workers int
+
+	// LeaseDurationSeconds is how long a node's lease is valid, and so how
+	// often it is renewed. Zero takes virtual-kubelet's default, which is a
+	// real kubelet's.
+	//
+	// A longer one than a real kubelet's is defensible here and is the single
+	// largest lever on what a virtual node costs the control plane: a physical
+	// machine can stop answering between one heartbeat and the next, where a
+	// virtual node's health is the health of a process that is either running
+	// or not. The cost is how long the scheduler keeps placing pods on a node
+	// whose process has died (DESIGN §3.5).
+	LeaseDurationSeconds int
 }
 
 // NewSet builds the shared informers for a process's virtual nodes.
@@ -103,15 +116,16 @@ func NewSet(opts SetOptions) (*Set, error) {
 		opts.Client, opts.ResyncPeriod, scmOpts...)
 
 	return &Set{
-		client:     opts.Client,
-		podFactory: podFactory,
-		scmFactory: scmFactory,
-		pods:       podFactory.Core().V1().Pods(),
-		secrets:    scmFactory.Core().V1().Secrets(),
-		configMaps: scmFactory.Core().V1().ConfigMaps(),
-		services:   scmFactory.Core().V1().Services(),
-		slices:     scmFactory.Discovery().V1().EndpointSlices(),
-		workers:    opts.Workers,
+		client:        opts.Client,
+		podFactory:    podFactory,
+		scmFactory:    scmFactory,
+		pods:          podFactory.Core().V1().Pods(),
+		secrets:       scmFactory.Core().V1().Secrets(),
+		configMaps:    scmFactory.Core().V1().ConfigMaps(),
+		services:      scmFactory.Core().V1().Services(),
+		slices:        scmFactory.Discovery().V1().EndpointSlices(),
+		workers:       opts.Workers,
+		leaseDuration: opts.LeaseDurationSeconds,
 	}, nil
 }
 
@@ -201,6 +215,11 @@ func (s *Set) AddNode(opts NodeOptions) (*Node, error) {
 
 	name := opts.Spec.Name
 
+	leaseSeconds := int32(s.leaseDuration)
+	if leaseSeconds <= 0 {
+		leaseSeconds = vknode.DefaultLeaseDuration
+	}
+
 	if s.broadcaster == nil {
 		s.broadcaster = record.NewBroadcaster()
 	}
@@ -213,7 +232,7 @@ func (s *Set) AddNode(opts NodeOptions) (*Node, error) {
 		s.client.CoreV1().Nodes(),
 		vknode.WithNodeEnableLeaseV1(
 			s.client.CoordinationV1().Leases(corev1.NamespaceNodeLease),
-			vknode.DefaultLeaseDuration),
+			leaseSeconds),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("node %s: node controller: %w", name, err)
