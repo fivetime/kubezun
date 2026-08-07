@@ -66,9 +66,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, namespace, name string) erro
 	if err != nil {
 		return err
 	}
-	if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
-		// Only LoadBalancer Services get one. A ClusterIP Service is served by
-		// the cluster's own proxying, which needs nothing here.
+	// Every Service gets a load balancer, not only the ones typed
+	// LoadBalancer. A capsule has one interface, on the tenant's network, so
+	// the cluster's own ClusterIP is unreachable from it — measured: a capsule
+	// reaches a peer's pod address and cannot reach the Service's ClusterIP at
+	// all. A pod on the cluster CNI can be given a second interface to bridge
+	// that; a capsule cannot. So the load balancer is not an extra for
+	// externally exposed Services, it is how a Service works here.
+	//
+	// The provider makes that affordable: it is amphora-less, so a load
+	// balancer is northbound rules rather than an appliance per Service.
+	//
+	// A headless Service asks for no address at all and gets none.
+	if svc.Spec.ClusterIP == corev1.ClusterIPNone {
 		return nil
 	}
 	if svc.DeletionTimestamp != nil {
@@ -257,8 +267,12 @@ func (r *Reconciler) slicesFor(svc *corev1.Service) ([]discoveryv1.EndpointSlice
 	return out, nil
 }
 
-// publishAddress puts the load balancer's address in the Service status, which
-// is what makes kubectl show an external address and what clients read.
+// publishAddress puts the load balancer's address in the Service status.
+//
+// This is the address that works, for every Service and not only the ones typed
+// LoadBalancer: the ClusterIP the API server assigned is unreachable from a
+// capsule, so a tenant reading it gets an address that goes nowhere. Publishing
+// here is what lets them, and the tenant's DNS, find the one that does.
 func (r *Reconciler) publishAddress(ctx context.Context, svc *corev1.Service, lb *loadbalancers.LoadBalancer) error {
 	current := svc.Status.LoadBalancer.Ingress
 	if len(current) == 1 && current[0].IP == lb.VipAddress {

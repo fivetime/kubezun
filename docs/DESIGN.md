@@ -465,6 +465,59 @@ DESIGN §4.3，仅可作过渡）；C（capsule 内自报 sidecar——注入/�
 
 ---
 
+### 7.4 规模：chassis 预算与 kubetron 的关键差异（2026-08-07 实测）
+
+kubetron 之所以要分片 + OVN-IC，是因为**每台跑租户 pod 的 K8s worker 都是一个 OVN
+chassis**，而 OVN 的 chassis 预算约 500。
+
+**B2' 不继承这个约束**：capsule 的 port 在 zun-compute 上，**只有 zun-compute 是
+chassis**；虚拟节点是纯逻辑的，在 OVN 里不存在。
+实测（3 计算节点 + 3 虚拟节点）：chassis 恰为 incus-node-04/05/06 三个，
+三个虚拟节点占用 **0**。
+
+| | kubetron（B1） | kubezun（B2'） |
+|---|---|---|
+| chassis = | 每个跑租户 pod 的 worker | 只有 zun-compute 节点 |
+| 随什么增长 | worker 数（≈ 租户负载量） | 物理计算节点数 |
+| 500 墙何时到 | 500 worker | 500 台计算节点 |
+
+**租户增长与 chassis 增长解耦**。推论：
+- **OVN 不需要装在 K8s 节点上**——租户 pod 不在那里，VK 进程也只走管理网调 API
+  （且 §7 要求它不得接入租户网络）。实验室里 node-04/05/06 兼任两角是凑合，非架构要求。
+- **zun-compute 可独立于 K8s 集群扩展**，K8s 侧可以只是不大的控制面集群。
+
+⚠️ B2' 的规模压力换到了**另一根轴：Zun API/DB 的恒定轮询负载**（每租户约 0.275 次
+list/秒，与是否活跃无关）。⚠️ **不可用 devstack 评估**（同机跑满全套 OpenStack）。
+先修轮询（复用同步结果、空闲退避、给 fork 加变更通道/ETag）再谈容量与分片；
+zun-compute 已按 host 天然分片，zun-api 无状态可扩容，真正的"分片 Zun"只指拆 DB。
+
+### 7.5 Service = Octavia，K8s Service CIDR 无关（2026-08-07 实测定案）
+
+**capsule 只有一张网卡，在租户网络上。** 实测：
+- capsule → 同租户另一 capsule 的 podIP：**可达**
+- capsule → 该 Service 的 ClusterIP（254.51.24.88）：**不可达**
+
+原因：ClusterIP 属 K8s service CIDR，OVN 不认识它；而 kube-proxy 在 worker 上编的规则，
+capsule 的流量一次也不会经过。**kubetron 靠双挂（eth0=Cilium + 第二张 OVN 网卡）开的那个
+互通口子，capsule 结构上做不到**——无法挂 Cilium 网卡。
+
+**故：每个 Service 都要有一个 Octavia LB，不只是 `type=LoadBalancer` 的。**
+ClusterIP 与 LoadBalancer 的差别只在要不要对外暴露，而不是"有没有 LB"。
+OVN provider 无 amphora（LB 即 NB 规则）使这在成本上成立。
+Headless（`ClusterIP: None`）不要地址，不建 LB。
+
+**实测 PoC（2026-08-07）**：在 t1-vip-subnet（192.168.200.0/24，独立 VIP 网 + 租户
+router 前置）建 `provider=ovn` 的 LB → VIP 192.168.200.187 → listener TCP:80 →
+pool `SOURCE_IP_PORT` → member = r-good 的 podIP + t1-subnet →
+**从另一个 capsule 访问该 VIP 成功**。reconciler 的三处具体选择（ovn / SOURCE_IP_PORT /
+member 带 subnet）在真环境原样成立。
+
+⚠️ 由此，**Service 的可用地址是 VIP 而不是 ClusterIP**：租户读 ClusterIP 得到的是个
+哪儿也去不了的地址。VIP 需经 `status.loadBalancer.ingress` 回写 + 租户 DNS 解析，
+DNS 编排因此是必需项而非可选项。
+
+---
+
 ## 8. 存储与配置
 
 ### 8.1 ConfigMap/Secret：真相源在 K8s，Barbican 不做主存储
