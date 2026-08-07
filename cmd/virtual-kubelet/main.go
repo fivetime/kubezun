@@ -143,7 +143,12 @@ func run(o options) error {
 		cfg.Node.Status.Addresses = nodeSpec.Status.Addresses
 		cfg.Node.Status.DaemonEndpoints = nodeSpec.Status.DaemonEndpoints
 		cfg.Node.Status.Conditions = []corev1.NodeCondition{knode.ReadyCondition()}
-		return p, nil, nil
+
+		// A node provider of our own, so the node's Ready condition tracks
+		// whether Zun can be reached: with the default one the node stays
+		// Ready no matter what and the scheduler keeps sending pods to a node
+		// that cannot create a capsule.
+		return p, provider.NewNodeHealth(zunClient, cfg.Node), nil
 	}
 
 	n, err := nodeutil.NewNode(o.nodeName, newProvider,
