@@ -8,18 +8,19 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 
 	"github.com/sirupsen/logrus"
 	vklog "github.com/virtual-kubelet/virtual-kubelet/log"
 	logruslogger "github.com/virtual-kubelet/virtual-kubelet/log/logrus"
-	vknode "github.com/virtual-kubelet/virtual-kubelet/node"
 	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
 	corev1 "k8s.io/api/core/v1"
 
 	knode "github.com/fivetime/kubezun/pkg/node"
 	"github.com/fivetime/kubezun/pkg/provider"
+	vkset "github.com/fivetime/kubezun/pkg/vknode"
 	"github.com/fivetime/kubezun/pkg/zun"
 )
 
@@ -41,6 +42,7 @@ type options struct {
 	capacityMem string
 	capacityPod string
 	logLevel    string
+	nodes       nodeSpecList
 }
 
 func main() {
@@ -75,6 +77,12 @@ func main() {
 		"node memory capacity; mirror the tenant's quota")
 	flag.StringVar(&o.capacityPod, "capacity-pods", envOr("KUBEZUN_CAPACITY_PODS", "0"),
 		"maximum pods; mirror the tenant's quota")
+	flag.Var(&o.nodes, "node",
+		"an extra virtual node to run in this process, as "+
+			"name=<n>[,arch=<a>][,zone=<z>][,zun-az=<az>][,listen=<addr>]; repeatable. "+
+			"Anything unstated is taken from the flags above. A tenant needs one node "+
+			"per architecture and per availability zone, and running them here rather "+
+			"than one process each shares the pod watch and the credentials between them.")
 	flag.StringVar(&o.logLevel, "log-level", envOr("KUBEZUN_LOG_LEVEL", "info"), "log level")
 	flag.Parse()
 
@@ -85,8 +93,9 @@ func main() {
 }
 
 func run(o options) error {
-	if o.nodeName == "" {
-		return fmt.Errorf("--nodename is required")
+	specs, err := nodeSpecs(o)
+	if err != nil {
+		return err
 	}
 	namespaces := splitAndTrim(o.namespaces)
 	if len(namespaces) == 0 {
@@ -117,78 +126,132 @@ func run(o options) error {
 		return err
 	}
 
-	if err := zun.ValidateArchitecture(o.arch); err != nil {
-		return err
+	client, err := nodeutil.ClientsetFromEnv(o.kubeconfig)
+	if err != nil {
+		return fmt.Errorf("build Kubernetes client: %w", err)
 	}
 
-	nodeSpec := knode.Build(knode.Options{
-		Name:       o.nodeName,
-		Tenant:     o.tenant,
-		Zone:       o.zone,
-		Arch:       o.arch,
-		Version:    version,
-		InternalIP: o.internalIP,
-		Capacity: knode.Capacity{
-			CPU:    o.capacityCPU,
-			Memory: o.capacityMem,
-			Pods:   o.capacityPod,
-		},
+	set, err := vkset.NewSet(vkset.SetOptions{
+		Client:     client,
+		Namespaces: namespaces,
+		Workers:    runtime.NumCPU(),
 	})
-
-	newProvider := func(cfg nodeutil.ProviderConfig) (nodeutil.Provider, vknode.NodeProvider, error) {
-		p, err := provider.New(provider.Config{
-			Namespaces:       namespaces,
-			NetworkID:        o.networkID,
-			AvailabilityZone: o.zunAZ,
-			Architecture:     o.arch,
-			NodeName:         o.nodeName,
-		}, zunClient, cfg.Pods)
-		if err != nil {
-			return nil, nil, err
-		}
-		// Carry the node spec built above onto the object nodeutil registers.
-		cfg.Node.Labels = nodeSpec.Labels
-		cfg.Node.Spec.Taints = nodeSpec.Spec.Taints
-		cfg.Node.Status.NodeInfo = nodeSpec.Status.NodeInfo
-		cfg.Node.Status.Capacity = nodeSpec.Status.Capacity
-		cfg.Node.Status.Allocatable = nodeSpec.Status.Allocatable
-		cfg.Node.Status.Addresses = nodeSpec.Status.Addresses
-		cfg.Node.Status.DaemonEndpoints = nodeSpec.Status.DaemonEndpoints
-		cfg.Node.Status.Conditions = []corev1.NodeCondition{knode.ReadyCondition()}
-
-		// A node provider of our own, so the node's Ready condition tracks
-		// whether Zun can be reached: with the default one the node stays
-		// Ready no matter what and the scheduler keeps sending pods to a node
-		// that cannot create a capsule.
-		return p, provider.NewNodeHealth(zunClient, cfg.Node), nil
-	}
-
-	n, err := nodeutil.NewNode(o.nodeName, newProvider,
-		func(c *nodeutil.NodeConfig) error {
-			c.KubeconfigPath = o.kubeconfig
-			c.HTTPListenAddr = o.listenAddr
-			return nil
-		},
-	)
 	if err != nil {
 		return err
 	}
 
+	for _, spec := range specs {
+		nodeObj := knode.Build(knode.Options{
+			Name:       spec.name,
+			Tenant:     o.tenant,
+			Zone:       spec.zone,
+			Arch:       spec.arch,
+			Version:    version,
+			InternalIP: o.internalIP,
+			Capacity: knode.Capacity{
+				CPU:    o.capacityCPU,
+				Memory: o.capacityMem,
+				Pods:   o.capacityPod,
+			},
+		})
+		nodeObj.Status.Conditions = []corev1.NodeCondition{knode.ReadyCondition()}
+
+		p, err := provider.New(provider.Config{
+			Namespaces:       namespaces,
+			NetworkID:        o.networkID,
+			AvailabilityZone: spec.zunAZ,
+			Architecture:     spec.arch,
+			NodeName:         spec.name,
+		}, zunClient, set.Pods())
+		if err != nil {
+			return err
+		}
+
+		if _, err := set.AddNode(vkset.NodeOptions{
+			Spec:     nodeObj,
+			Provider: p,
+			// A node provider of our own, so the node's Ready condition tracks
+			// whether Zun can be reached: with the default one the node stays
+			// Ready no matter what and the scheduler keeps sending pods to a
+			// node that cannot create a capsule.
+			NodeProvider: provider.NewNodeHealth(zunClient, nodeObj),
+			ListenAddr:   spec.listen,
+		}); err != nil {
+			return err
+		}
+	}
+
 	go func() {
-		if err := n.Run(ctx); err != nil {
-			vklog.G(ctx).WithError(err).Error("node stopped")
+		if err := set.Run(ctx); err != nil {
+			vklog.G(ctx).WithError(err).Error("node set stopped")
 			cancel()
 		}
 	}()
 
-	if err := n.WaitReady(ctx, 0); err != nil {
-		return fmt.Errorf("wait for node to become ready: %w", err)
+	if err := set.WaitReady(ctx); err != nil {
+		return fmt.Errorf("wait for nodes to become ready: %w", err)
 	}
-	vklog.G(ctx).WithField("node", o.nodeName).
-		WithField("namespaces", namespaces).Info("virtual node is ready")
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		names = append(names, spec.name+"("+spec.arch+")")
+	}
+	vklog.G(ctx).WithField("nodes", strings.Join(names, " ")).
+		WithField("namespaces", namespaces).Info("virtual nodes are ready")
 
-	<-n.Done()
-	return n.Err()
+	<-ctx.Done()
+	return nil
+}
+
+// nodeSpecs resolves the nodes this process runs. The single-node flags remain
+// the defaults for every --node, and on their own they describe one node, which
+// is what most tenants run.
+func nodeSpecs(o options) ([]nodeSpec, error) {
+	defaults := nodeSpec{
+		arch:   o.arch,
+		zone:   o.zone,
+		zunAZ:  o.zunAZ,
+		listen: o.listenAddr,
+	}
+
+	var specs []nodeSpec
+	if o.nodeName != "" {
+		defaults.name = o.nodeName
+		specs = append(specs, defaults)
+	}
+	for _, raw := range o.nodes {
+		spec, err := parseNodeSpec(raw, defaults)
+		if err != nil {
+			return nil, err
+		}
+		specs = append(specs, spec)
+	}
+	if len(specs) == 0 {
+		return nil, fmt.Errorf("no nodes: give --nodename or at least one --node")
+	}
+
+	seenName := map[string]bool{}
+	seenAddr := map[string]bool{}
+	for _, spec := range specs {
+		if err := zun.ValidateArchitecture(spec.arch); err != nil {
+			return nil, fmt.Errorf("node %s: %w", spec.name, err)
+		}
+		if seenName[spec.name] {
+			// Two controllers on one node object would fight over its status
+			// and each treat the other's pods as its own.
+			return nil, fmt.Errorf("node %s is named twice", spec.name)
+		}
+		seenName[spec.name] = true
+		if spec.listen != "" && seenAddr[spec.listen] {
+			// Only one can bind it, and which one wins is a race; the loser
+			// serves no kubelet API and its logs and exec fail with nothing
+			// saying why.
+			return nil, fmt.Errorf(
+				"node %s listens on %s, which another node already uses; "+
+					"give each node its own listen address", spec.name, spec.listen)
+		}
+		seenAddr[spec.listen] = true
+	}
+	return specs, nil
 }
 
 func splitAndTrim(s string) []string {
