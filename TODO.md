@@ -337,14 +337,26 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       DS controller 的 nodeAffinity 矛盾 → 真实节点永久 Pending）；存量 DS 需
       mutateExisting 或触发模板更新（§9）
 - [ ] 配套 Pod 级 validate 双保险（落虚拟节点的 pod 带正确 toleration/selector）（§9）
-- [ ] 系统 DS 排除：kube-proxy/CNI 等注入 `nodeAffinity: type NotIn (virtual-kubelet)`（§4.5）
+- [x] **系统 DS 排除已验证生效（2026-08-07）**：cilium/cilium-envoy/cilium-node-init/
+      konnectivity-agent/kube-multus-ds/ovs-cni/ovn-chassis **全部 3/3 只落三台真实
+      worker**，虚拟节点上零系统 pod
+- [x] **租户 DS 实测（2026-08-07）**：`DESIRED=2`（每虚拟节点一份），amd64 节点上
+      1/1 Running 拿到 OVN IP，arm64 节点上 `CapsuleUnschedulable`——扇出与失败均正确。
+      ⚠️ **由此得出一条供给规则**：**不要为没有对应宿主机的架构创建虚拟节点**。
+      DS 控制器会不停重建那个必然失败的 pod（实测约 40–60s 一轮），
+      持续消耗 API 与 Zun 调用。租户 VK 用的是租户 appcred，**看不到 Placement/host
+      清单**（且按 §4 严禁 admin 凭据），所以这条只能在平台开通侧把关，
+      provider 无法自检
 - [ ] B1/B2' 分档：tenant-deny-daemonset.yaml 对 B2' 租户放行（堵 kaaas §7.3 洞的同时放行）
 - [ ] readiness 链路：kubetron LB reconciler 的 HM 配置对 capsule member 生效
       （httpGet 降级 tcp 的策略与文档）（§6）
 - [ ] liveness 链路：对接 fork ExecSync 探针 + 重启；探针结果回流 capsule status →
       provider 映射 pod Ready（§6）
-- [ ] 红线文档交付租户：hostPath/hostNetwork/privileged 不可用、DS 观测不到邻居 pod、
-      socket 共享不可能 + 替代路径（sidecar/网络推送/headless 发现）（§8.2/§9）
+- [x] **租户红线文档 `docs/tenant-guide.md`（2026-08-07）**：不可用项（host* / privileged /
+      spec.nodeName / emptyDir 等卷 / logs -f / exec -it / attach / port-forward / top）、
+      语义差异（ConfigMap 是快照不是投影、探针在容器内跑且 distroless 无 curl 会失败、
+      SA token 默认关）、以及"该怎么写"（设 limits、需要架构就写 nodeSelector、
+      VM 冷启动慢要设 initialDelaySeconds）。每条都有本轮实测依据
 - [ ] **验收**：去特权 fluent-bit DS 在租户节点起一份 capsule；系统 DS 不落虚拟节点；
       真实节点无 Pending 残留；liveness 失败触发重启；HM 摘除未就绪 member（§12）
 
