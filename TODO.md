@@ -49,10 +49,14 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       期间产出 fork 分支 `feat/cri-only-compute`（4 commit，已 push）：capsule-only 主机
       支持（container_driver=cri 入口点 + 类型校验放宽 + 启动对账/周期状态同步分流）；
       另装 PyMySQL（Zun requirements 不含 DB 驱动）
-- [ ] ⚠️ **capsule 状态同步缺口**：CriDriver 无 `update_containers_states`，capsule 状态
-      停留在最后一次操作时的记录（fork 已留钩子，见 manager.py sync_container_state）。
-      kubezun 的 GetPodStatus 依赖 Zun 侧状态真实性 → 阶段 1 前必须补
-      （_show_container/_populate_container_state 是现成积木）→ 归入 F 工作流
+- [x] **capsule 状态同步已补齐并实测（2026-08-07，fork commit `9bdc6fe0`）**：
+      实现 `CriDriver.update_containers_states`——按 CRI 实况刷新每个容器，
+      再汇总到 capsule（**全部容器 Running 才算 Running**）。
+      故障注入实测：`crictl stop` 掉某 pod 的容器后——
+      修复前 Zun 报 Running / K8s 报 1/1 Running（**假健康，自愈链完全断裂**）；
+      修复后 Zun 报 Stopped / K8s 报 0/1 Completed / **ReplicaSet 自动重建副本
+      1/1 Running**。这是整条自愈链路（容器死→Zun 察觉→provider 回写→K8s 重建）
+      的首次贯通
 - [ ] kubelet 侧配 system-reserved 预留 capsule 资源份额
 - [x] Octavia provider 选型定案：**官方 ovn provider（amphora-less 纯 L4）承担 B2' 的
       Service 数据面**——capsule 只需 ClusterIP 的 L4 语义，不需要 L7；已与自研 incus
