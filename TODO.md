@@ -348,8 +348,23 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       清单**（且按 §4 严禁 admin 凭据），所以这条只能在平台开通侧把关，
       provider 无法自检
 - [ ] B1/B2' 分档：tenant-deny-daemonset.yaml 对 B2' 租户放行（堵 kaaas §7.3 洞的同时放行）
-- [ ] readiness 链路：kubetron LB reconciler 的 HM 配置对 capsule member 生效
-      （httpGet 降级 tcp 的策略与文档）（§6）
+- [x] **readiness → EndpointSlice 实测打通（2026-08-07）**——**这才是流量摘除的真实通道**
+      （kubetron 的 LB reconciler 是 EndpointSlice 驱动的，`pkg/service/members.go:25,107`）：
+      同一个 Service 选中 r-good/r-bad 两个 pod，EndpointSlice 里
+      `r-good ready=True serving=True`、`r-bad ready=False serving=False`，
+      **两条 address 都是 OVN IP**（192.168.100.82 / .144）——正是 kubetron 需要的输入，
+      podIP==OVN IP 不变式在此兑现。
+      **动态转换实测**：用 `kubectl exec` 在容器内补上探针要的路径 → **5 秒内**
+      `ready` 翻成 True 进入 EndpointSlice（探针 periodSeconds=5，
+      得益于本轮的探针周期修复；此前光探针一项就要 60s+）
+- [ ] ⚠️ **最后一跳（EndpointSlice → Octavia LB member）本轮未验证**：kubetron 在本集群
+      有跑（kubetron-system，2/2），但其 Service reconciler 未纳管 `111111-default`
+      （现有 LB 均为 `t1-*`，是另一套租户网络配置），`type=LoadBalancer` 的 Service
+      建出来 EXTERNAL-IP 一直 pending。属 kubetron 侧接线，非 kubezun 缺陷。
+      要验证需在 kubetron 侧为该租户配好网络
+- [ ] Octavia health monitor 作为**第二层**（LB 侧自检）是否需要：EndpointSlice 已能
+      按 readiness 摘除 member，HM 是冗余保护而非必需；若启用需查 OVN provider 的
+      `SUPPORTED_HEALTH_MONITOR_TYPES` 白名单（DESIGN §6）
 - [ ] liveness 链路：对接 fork ExecSync 探针 + 重启；探针结果回流 capsule status →
       provider 映射 pod Ready（§6）
 - [x] **租户红线文档 `docs/tenant-guide.md`（2026-08-07）**：不可用项（host* / privileged /
