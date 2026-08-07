@@ -259,8 +259,28 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       ③ 状态同步按 name 匹配，旧 capsule 的健康和 IP 会套到新 pod 上；
       ④ Placement 拒绝的 capsule 显示成 Creating（kubectl 优先显示容器 waiting reason）
       → 改报 `CapsuleUnschedulable` + Zun 原因
-- [ ] 每租户 VK Deployment 部署物（manifest/chart）：per-tenant SA、per-node :10250 +
-      证书 + WebhookAuth(nodeName)（§2）
+- [x] **kubelet API 上线：TLS + WebhookAuth（2026-08-07，`c661fbc`）**。此前端点
+      **根本没起**（nodeutil 只在有 TLS config 时才起 HTTP server），logs/exec 无路由，
+      唯一迹象是日志里一条 warning。
+      ⚠️ **证书是每进程一张，不是每节点一张**：apiserver 按 `node.Status.Addresses` +
+      `daemonEndpoints` 拨号（`kubelet_client.go:188-215`），**节点名不进 TLS，端口也不进**，
+      租户所有节点同一进程同一 IP → 一张证书全覆盖。每节点独立的是**授权器**
+      （`nodes/<nodeName>` 的 SAR），这才是每节点各自监听地址的理由。
+      **有证书但无 `--client-ca-file` 直接拒绝启动**——delegating authenticator 无 CA 时
+      根本不做 mTLS，端点后面每条路由都是读/进入租户容器。
+      实测：匿名 curl 在握手阶段就被拒；`kubectl logs` 经 apiserver 打通到 provider，
+      返回我们自己的 not-implemented（即 Zun fork 的 logs 端点，非本路径问题）。
+      **坑**：SA 缺 `system:auth-delegator` 时每个请求返回 500 且报 subjectaccessreviews
+      被拒，看起来像策略问题其实是缺绑定
+- [x] **部署物 `deploy/tenant-vk.yaml` + `deploy/serving-cert.md`（2026-08-07）**：
+      per-tenant SA、ClusterRole/Binding、auth-delegator 绑定；证书用集群自带的
+      `kubernetes.io/kubelet-serving` 签发器（**控制面零配置**，apiserver 本来就信任），
+      CSR subject 必须 `O=system:nodes,CN=system:node:<name>`（签发器硬性要求，
+      但 apiserver 只校验 SAN 不看 CN，故写哪个节点名无所谓）
+- [ ] 证书轮换：`kubelet-serving` 证书短期有效，当前无轮换机制 →
+      过期即 logs/exec 中断（节点本身不受影响，证书只服务 kubelet API）
+- [ ] 每租户 VK 部署形态从手写 systemd unit 收敛为 manifest/chart；
+      appcred 明文进 unit 文件需换成 Secret 挂载
 - [x] **同租户单进程多节点：共享 informer（2026-08-07，`a743545`，`pkg/vknode`）**。
       `nodeutil.NewNode` 每节点自建 informer factory 且无注入钩子，故降到 `node` 包
       自行组装控制器。pod informer 一份带全部节点的 pod，每个节点的 PodController 用
