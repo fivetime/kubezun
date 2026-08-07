@@ -516,6 +516,44 @@ member 带 subnet）在真环境原样成立。
 哪儿也去不了的地址。VIP 需经 `status.loadBalancer.ingress` 回写 + 租户 DNS 解析，
 DNS 编排因此是必需项而非可选项。
 
+### 7.5a Service 与 Ingress 是两类东西，成本模型不同（2026-08-07 定案）
+
+K8s 里它们本就是两个 kind，在这套架构下差别更硬：
+
+| | Service | Ingress |
+|---|---|---|
+| Octavia provider | **ovn**（L4） | **amphora / incus**（L7）——⚠️ **绝不能用 ovn**，它是 L4-only，拒绝一切 L7 对象 |
+| 数据面形态 | OVN northbound 规则，**无实例** | **真实实例**（amphora 是 VM；incus driver 是容器化 L7 worker） |
+| 成本 | 近乎为零 | 有实实在在的资源成本 |
+| 供给策略 | **每个 Service 都建**（§7.5：不建则 pod 之间按名字/ClusterIP 都不通） | **按需/计费能力**，不默认给 |
+
+"每个 Service 都建 LB"之所以成立，前提正是 OVN provider 无 amphora。这条不能想当然
+推广到 Ingress。
+
+### 7.5b 两类证书，归属正好相反（2026-08-07 定案）
+
+| | ① kubelet 服务证书 | ② Ingress TLS 终止证书 |
+|---|---|---|
+| 用途 | apiserver 拨号 kubezun 的 kubelet API（logs/exec） | 租户自己服务的 HTTPS |
+| 谁签发 | **平台**——租户不知道 OpenStack/VK 存在，且 apiserver 必须信任签发者 | **租户自己**：在自己命名空间装 cert-manager / smallstep 等，这就是 K8s 的做法 |
+| 谁轮换 | 平台 | **租户**。不续期就该过期，kubezun 不替他续 |
+| kubezun 的责任 | 签发接入 + **热加载**（已实现，§见 TODO） | **只做传播**，不碰签发 |
+
+⚠️ **②"完全不管"会制造假健康**：Octavia 做 L7 终止时证书不是从 K8s Secret 直接读的——
+要先镜像进 Barbican，再由 listener 的 `default_tls_container_ref` 引用。若不传播续期：
+租户 cert-manager 续期成功、`kubectl get secret` 一切正常，**而 Octavia 仍送已过期的证书**，
+租户从自己能看到的任何地方都查不出原因。
+
+**分工定案：签发与轮换是租户的事，传播是我们的事。** 机械动作三步：
+watch 租户 TLS Secret → 内容变了重新镜像 → 更新 listener 引用。
+
+**实现直接抄 kubetron**（`pkg/ingress/barbican.go:43-44`）：Barbican secret 名字里带
+**证书内容的 sha256 前缀**，续期→内容变→哈希变→新名字→新 ref，reconcile 自然跟上，
+既不用比对有效期，也不用知道是谁签的。
+
+⚠️ **范围仅限 Ingress**：Service（L4）根本不终止 TLS，流量直通 pod，证书在租户容器里，
+我们看不见也不需要看见。
+
 ### 7.6a VIP port 与生命周期（2026-08-07 实测，含一次自我更正）
 
 **OVN provider 会建 VIP port**（`helper.py:3040 create_vip_port`，命名

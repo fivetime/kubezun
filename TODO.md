@@ -426,6 +426,30 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 
 ---
 
+## I：Ingress（按需计费能力，DESIGN §7.5a/§7.5b）
+
+⚠️ **与 Service 是两类东西**：Ingress 走 L7，Octavia provider 必须是 amphora 或 incus
+（**绝不能 ovn**，它是 L4-only 拒绝一切 L7 对象），意味着**真实实例成本** →
+按需/计费开通，不像 Service 那样默认给。
+
+- [ ] **抄 kubetron `pkg/ingress/`（1727 行）**，复用价值高于 Service 那次——最大的耦合点
+      `BuildMembers` 我们**已经重写过**（subnet 改从 capsule 取，不再需要 NetworkPortClaim），
+      Ingress 与 Service 共用同一个：
+      - `l7.go`（444 行，Ingress 规则 → L7 policy/rule）：基本可平移
+      - `barbican.go`（153 行，TLS Secret → PKCS12 → Barbican）：基本可平移
+      - `reconciler.go`（530 行）：需**剥掉两层 kubetron 私有模型**——
+        `service.NSConfig`/`ResolveNamespaceConfig`（每 namespace ConfigMap 配置；
+        kubezun 是每租户一进程带 flag）与 `webhook.NamespaceShard`（分片；
+        **kubezun 不继承 OVN chassis 约束**，§7.4 实测，整块删掉）
+      - `fip.go`/`tuning.go`：基本可用（FIP 语义我们已实测）
+- [ ] **TLS 分工按 §7.5b 实现**：租户签发+续期，kubezun **只传播**——
+      watch 租户 TLS Secret → 内容变则重新镜像进 Barbican → 更新 listener 引用。
+      抄 kubetron 的**内容哈希命名**（`barbican.go:43-44`）：续期→哈希变→新 ref→
+      reconcile 自然跟上，不比对有效期、不关心谁签的。
+      ⚠️ 不做传播 = 租户续期成功但 Octavia 仍送旧证书，且租户查不出原因
+
+---
+
 ## 阶段 4：生产化（§12）
 
 - [ ] Zun capsule 容器名 minLength=2，K8s 允许单字符容器名 → 租户写 `name: c` 得到一个
