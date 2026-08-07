@@ -93,6 +93,8 @@ func (p *Provider) syncOnce(ctx context.Context) error {
 					pod.Status.Phase = corev1.PodFailed
 					pod.Status.Reason = "CapsuleMissing"
 					pod.Status.Conditions = zun.PodConditions("Error", false, now)
+					failContainers(pod, "CapsuleMissing",
+						"the capsule backing this pod no longer exists", now)
 				})
 			}
 			continue
@@ -110,6 +112,8 @@ func (p *Provider) syncOnce(ctx context.Context) error {
 				pod.Status.Phase = corev1.PodFailed
 				pod.Status.Reason = "CapsuleStuckCreating"
 				pod.Status.Conditions = zun.PodConditions("Error", false, now)
+				failContainers(pod, "CapsuleStuckCreating",
+					"the capsule never left Creating; no compute node ever claimed it", now)
 			})
 			continue
 		}
@@ -142,6 +146,36 @@ func (p *Provider) syncOnce(ctx context.Context) error {
 		})
 	}
 	return nil
+}
+
+// failContainers records a pod-level failure on each container that has not
+// started.
+//
+// The phase alone does not reach the tenant, in either direction. kubectl
+// prints a waiting container's reason in preference to the pod phase, so a
+// failed pod goes on displaying ContainerCreating with nothing saying why; and
+// a container left marked Running keeps the pod reading 1/1 Ready after the
+// capsule behind it is gone, which is the false health this whole path exists
+// to prevent.
+//
+// A container that already terminated is left alone: its own exit describes
+// what happened better than any pod-level reason could.
+func failContainers(pod *corev1.Pod, reason, message string, t metav1.Time) {
+	for i := range pod.Status.ContainerStatuses {
+		st := &pod.Status.ContainerStatuses[i]
+		if st.State.Terminated != nil {
+			continue
+		}
+		st.Ready = false
+		st.State = corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{
+				ExitCode:   1,
+				Reason:     reason,
+				Message:    message,
+				FinishedAt: t,
+			},
+		}
+	}
 }
 
 // updateStatus applies a status change and notifies the node controller only
