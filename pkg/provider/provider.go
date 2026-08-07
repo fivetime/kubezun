@@ -15,6 +15,7 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 
 	"github.com/fivetime/kubezun/pkg/zun"
@@ -45,14 +46,19 @@ type Provider struct {
 	namespaces map[string]struct{}
 	capsules   *zun.CapsuleAPI
 
+	// podLister is the cluster's view of pods, used to tell a capsule whose
+	// pod is gone from one whose pod this process simply has not seen yet.
+	podLister corev1listers.PodLister
+
 	mu   sync.RWMutex
 	pods map[string]*corev1.Pod // key: namespace/name
 
 	notify func(*corev1.Pod)
 }
 
-// New builds a provider for one tenant.
-func New(cfg Config, client *zun.Client) (*Provider, error) {
+// New builds a provider for one tenant. podLister may be nil, which disables
+// orphan cleanup; everything else works without it.
+func New(cfg Config, client *zun.Client, podLister corev1listers.PodLister) (*Provider, error) {
 	if len(cfg.Namespaces) == 0 {
 		return nil, fmt.Errorf("at least one namespace must be served")
 	}
@@ -63,6 +69,7 @@ func New(cfg Config, client *zun.Client) (*Provider, error) {
 	return &Provider{
 		cfg:        cfg,
 		namespaces: ns,
+		podLister:  podLister,
 		capsules:   zun.NewCapsuleAPI(client),
 		pods:       make(map[string]*corev1.Pod),
 		notify:     func(*corev1.Pod) {},
@@ -87,6 +94,21 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 		return err
 	}
 
+	key := zun.PodKey(pod.Namespace, pod.Name)
+
+	// Zun does not reject a second capsule under an existing name, so a
+	// retried create — the node controller retries whenever anything after
+	// this fails — would leave a duplicate running and billed for every
+	// attempt. Check before creating rather than relying on the API to refuse.
+	if existing, err := p.capsules.ListManaged(ctx); err == nil {
+		if c, ok := existing[key]; ok && c.PodUID() == string(pod.UID) {
+			log.G(ctx).WithField("pod", key).WithField("capsule", c.Name()).
+				Info("capsule already exists for this pod; not creating another")
+			p.trackPod(pod, corev1.PodPending, "Creating")
+			return nil
+		}
+	}
+
 	tpl, err := zun.BuildTemplate(pod, zun.TemplateOptions{
 		NetworkID:        p.cfg.NetworkID,
 		AvailabilityZone: p.cfg.AvailabilityZone,
@@ -95,7 +117,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 		return err
 	}
 
-	log.G(ctx).WithField("pod", zun.PodKey(pod.Namespace, pod.Name)).Info("creating capsule")
+	log.G(ctx).WithField("pod", key).Info("creating capsule")
 	if _, err := p.capsules.Create(ctx, tpl); err != nil {
 		return err
 	}
@@ -216,6 +238,11 @@ func (p *Provider) NotifyPods(ctx context.Context, cb func(*corev1.Pod)) {
 	p.notify = cb
 	p.mu.Unlock()
 	go p.syncLoop(ctx)
+	if p.podLister != nil {
+		go p.orphanLoop(ctx)
+	} else {
+		log.G(ctx).Warn("orphan cleanup disabled: no pod cache was provided")
+	}
 }
 
 func (p *Provider) trackPod(pod *corev1.Pod, phase corev1.PodPhase, reason string) {

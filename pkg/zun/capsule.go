@@ -21,6 +21,7 @@ type Capsule struct {
 	Status       string               `json:"status"`
 	StatusReason string               `json:"status_reason"`
 	Host         string               `json:"host"`
+	CreatedAt    Time                 `json:"created_at"`
 	Addresses    map[string][]Address `json:"addresses"`
 	Containers   []Container          `json:"containers"`
 
@@ -146,11 +147,13 @@ func (a *CapsuleAPI) Delete(ctx context.Context, id string) error {
 	return translate(err)
 }
 
-// ListManaged returns every capsule this provider owns, keyed by pod. Capsules
-// the tenant created through the Zun API directly carry no ownership label and
-// are skipped: treating them as orphaned pods would delete work this node was
-// never asked to manage.
-func (a *CapsuleAPI) ListManaged(ctx context.Context) (map[string]*Capsule, error) {
+// ListManagedAll returns every capsule this provider owns, grouped by pod.
+//
+// A pod can map to more than one capsule: Zun does not enforce unique names,
+// so a retried create leaves duplicates behind, and each duplicate holds
+// resources of its own. Callers that only need current state can use
+// ListManaged; cleanup needs to see them all.
+func (a *CapsuleAPI) ListManagedAll(ctx context.Context) (map[string][]*Capsule, error) {
 	var body struct {
 		Capsules []Capsule `json:"capsules"`
 	}
@@ -160,17 +163,46 @@ func (a *CapsuleAPI) ListManaged(ctx context.Context) (map[string]*Capsule, erro
 		return nil, translate(err)
 	}
 
-	out := make(map[string]*Capsule, len(body.Capsules))
+	out := make(map[string][]*Capsule, len(body.Capsules))
 	for i := range body.Capsules {
 		c := &body.Capsules[i]
 		ns, name, ok := PodKeyFromLabels(c.Labels())
 		if !ok {
+			// A capsule the tenant created through the Zun API directly is not
+			// this node's to touch.
 			continue
 		}
-		out[PodKey(ns, name)] = c
+		key := PodKey(ns, name)
+		out[key] = append(out[key], c)
 	}
 	return out, nil
 }
+
+// ListManaged returns one capsule per pod: the one whose state the pod's
+// status should reflect. Where duplicates exist the newest wins, since that is
+// the one the most recent create produced.
+func (a *CapsuleAPI) ListManaged(ctx context.Context) (map[string]*Capsule, error) {
+	all, err := a.ListManagedAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]*Capsule, len(all))
+	for key, capsules := range all {
+		newest := capsules[0]
+		for _, c := range capsules[1:] {
+			if c.CreatedAt.After(newest.CreatedAt.Time) {
+				newest = c
+			}
+		}
+		out[key] = newest
+	}
+	return out, nil
+}
+
+// PodUID reports the pod a capsule was created for. Recreating a pod under the
+// same name yields a different UID, which is what distinguishes a capsule left
+// behind by the old pod from the one backing the new one.
+func (c *Capsule) PodUID() string { return c.Labels()[LabelPodUID] }
 
 // translate maps OpenStack transport errors onto the kinds the node controller
 // understands; without this a capsule that is already gone reads as a hard

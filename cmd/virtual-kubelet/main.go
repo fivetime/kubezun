@@ -130,7 +130,7 @@ func run(o options) error {
 			NetworkID:        o.networkID,
 			AvailabilityZone: o.zunAZ,
 			NodeName:         o.nodeName,
-		}, zunClient)
+		}, zunClient, cfg.Pods)
 		if err != nil {
 			return nil, nil, err
 		}

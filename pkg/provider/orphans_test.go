@@ -1,0 +1,142 @@
+package provider
+
+import (
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes/fake"
+	corev1listers "k8s.io/client-go/listers/core/v1"
+
+	"github.com/fivetime/kubezun/pkg/zun"
+)
+
+// listerWith builds a pod lister backed by the given pods.
+func listerWith(t *testing.T, pods ...*corev1.Pod) corev1listers.PodLister {
+	t.Helper()
+	objs := make([]any, 0, len(pods))
+	for _, p := range pods {
+		objs = append(objs, p)
+	}
+	client := fake.NewSimpleClientset()
+	factory := informers.NewSharedInformerFactory(client, 0)
+	informer := factory.Core().V1().Pods()
+	for _, o := range objs {
+		if err := informer.Informer().GetIndexer().Add(o); err != nil {
+			t.Fatalf("seed lister: %v", err)
+		}
+	}
+	return informer.Lister()
+}
+
+func livePod(namespace, name, uid string) *corev1.Pod {
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: namespace, Name: name, UID: types.UID(uid),
+	}}
+}
+
+func capsuleFor(namespace, name, uid string, age time.Duration) *zun.Capsule {
+	return &zun.Capsule{
+		UUID:      "capsule-" + uid,
+		NameField: "kubezun-" + uid,
+		CreatedAt: zun.Time{Time: time.Now().Add(-age)},
+		LabelsField: map[string]string{
+			zun.LabelManagedBy: zun.ManagedByValue,
+			zun.LabelNamespace: namespace,
+			zun.LabelPodName:   name,
+			zun.LabelPodUID:    uid,
+		},
+	}
+}
+
+// names returns the capsule names orphansAmong selected for deletion.
+func names(capsules []*zun.Capsule) []string {
+	out := make([]string, 0, len(capsules))
+	for _, c := range capsules {
+		out = append(out, c.Name())
+	}
+	return out
+}
+
+func TestOrphanSweepSparesCapsulesWithLivePods(t *testing.T) {
+	p := newTestProvider(t, "111111-default")
+	p.podLister = listerWith(t, livePod("111111-default", "web", "uid-1"))
+
+	capsule := capsuleFor("111111-default", "web", "uid-1", time.Hour)
+	got := p.orphansAmong(t.Context(), "111111-default/web", []*zun.Capsule{capsule})
+	if len(got) != 0 {
+		t.Fatalf("a capsule whose pod is alive was selected for deletion: %v", names(got))
+	}
+}
+
+func TestOrphanSweepDeletesDuplicatesOfALivePod(t *testing.T) {
+	// Zun accepts a second capsule under an existing name, so a retried create
+	// leaves duplicates that run and bill alongside the real one. Only the
+	// newest is kept, since that is the one the pod's status reflects.
+	p := newTestProvider(t, "111111-default")
+	p.podLister = listerWith(t, livePod("111111-default", "web", "uid-1"))
+
+	older := capsuleFor("111111-default", "web", "uid-1", 2*time.Hour)
+	older.NameField = "kubezun-uid-1-older"
+	newer := capsuleFor("111111-default", "web", "uid-1", time.Hour)
+
+	got := p.orphansAmong(t.Context(), "111111-default/web", []*zun.Capsule{older, newer})
+	if len(got) != 1 || got[0] != older {
+		t.Fatalf("duplicate cleanup kept the wrong capsule: %v", names(got))
+	}
+}
+
+func TestOrphanSweepDeletesCapsulesWhosePodIsGone(t *testing.T) {
+	p := newTestProvider(t, "111111-default")
+	p.podLister = listerWith(t)
+
+	capsule := capsuleFor("111111-default", "web", "uid-1", time.Hour)
+	if got := p.orphansAmong(t.Context(), "111111-default/web", []*zun.Capsule{capsule}); len(got) != 1 {
+		t.Fatal("a capsule with no pod was kept")
+	}
+}
+
+func TestOrphanSweepDeletesCapsuleOfRecreatedPod(t *testing.T) {
+	// Same pod name, different UID: the capsule belongs to the pod that was
+	// replaced, and nothing else will ever delete it.
+	p := newTestProvider(t, "111111-default")
+	p.podLister = listerWith(t, livePod("111111-default", "web", "uid-new"))
+
+	capsule := capsuleFor("111111-default", "web", "uid-old", time.Hour)
+	if got := p.orphansAmong(t.Context(), "111111-default/web", []*zun.Capsule{capsule}); len(got) != 1 {
+		t.Fatal("a capsule left behind by a recreated pod was kept")
+	}
+}
+
+func TestOrphanSweepSparesYoungCapsules(t *testing.T) {
+	// A capsule created moments ago may belong to a pod this process has not
+	// seen yet; deleting it would kill a pod that is starting normally.
+	p := newTestProvider(t, "111111-default")
+	p.podLister = listerWith(t)
+
+	capsule := capsuleFor("111111-default", "web", "uid-1", 5*time.Second)
+	if got := p.orphansAmong(t.Context(), "111111-default/web", []*zun.Capsule{capsule}); len(got) != 0 {
+		t.Fatal("a capsule younger than the grace period was selected for deletion")
+	}
+}
+
+func TestOrphanSweepIgnoresOtherNamespaces(t *testing.T) {
+	p := newTestProvider(t, "111111-default")
+	p.podLister = listerWith(t)
+
+	capsule := capsuleFor("222222-default", "web", "uid-1", time.Hour)
+	if got := p.orphansAmong(t.Context(), "222222-default/web", []*zun.Capsule{capsule}); len(got) != 0 {
+		t.Fatal("a capsule from a namespace this node does not serve was selected for deletion")
+	}
+}
+
+func TestOrphanSweepDoesNothingWithoutAPodCache(t *testing.T) {
+	// Without a cache every capsule looks orphaned, so the sweep must not run
+	// at all rather than delete the tenant's entire workload.
+	p := newTestProvider(t, "111111-default")
+	p.podLister = nil
+	p.sweepOrphans(t.Context())
+}
