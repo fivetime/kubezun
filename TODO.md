@@ -316,7 +316,25 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
       1/1 Running，探针定义（命令/路径/端口/全部阈值）已落 Zun 数据库
       ⚠️ 仍拒绝两类无法忠实执行的形式：无 handler 的探针、指向容器自身以外
       host 的 httpGet/tcpSocket（探针在容器内执行，否则会静默探错对象）
-- [ ] **探针 step2（门槛，卡阶段 3）：Zun 侧 prober 执行**——ExecSync + 周期执行 +
+- [x] **探针 step2 完成并实测（2026-08-07）**：
+      **step2a 改写**（kubezun `4574b43`，移植 kubetron `pkg/webhook/probes.go` 经验）：
+      httpGet/tcpSocket/grpc → `sh -c` exec against 127.0.0.1；命名端口按容器声明解析
+      （未声明则拒绝，否则会探到空）；curl→wget / nc→curl-telnet /
+      grpc_health_probe→nc 三级 fallback；镜像无工具时**显式失败而非静默健康**；
+      时间字段（period/threshold/timeout）原样保留；exec 探针不改。
+      ⚠️ 改写只作用于发给 Zun 的模板，**K8s 里的 pod spec 保持用户原样**
+      **step2b 执行**（fork `4a9d9fd1`）：CRI `ExecSync` + 周期执行 + 阈值计数 +
+      liveness 连续失败达 failureThreshold 后重启容器（**不动 sandbox，保住 capsule IP**）+
+      startup 探针门控前两者 + readiness 结果落 `healthcheck.k8s_probe_state`。
+      探针跑不起来一律判失败（否则会掩盖它本要发现的故障）
+      **实测**：readiness 指向 404 路径的 pod → DB 里存的是改写后的 curl 命令 →
+      prober 按周期执行 → curl 退出码 22 → `{"ready": false, "readiness_failures": 1}`
+      ⚠️ 部署踩坑：在 133 上装 grpcio-tools 升级了 protobuf/grpcio，生成的 pb2 与
+      134/135 的 runtime 不兼容（gencode 7.35.1 vs runtime 6.33.5）→ 三台需版本对齐
+- [ ] **探针 step3：readiness 回流 pod Ready condition**——provider 读
+      `healthcheck.k8s_probe_state.ready` 并纳入 PodConditions，打通
+      探针→pod Ready→EndpointSlice→kubetron/Octavia member 的完整链路
+- [ ] （原设计）Zun 侧 prober 执行——ExecSync + 周期执行 +
       阈值计数 + liveness 失败重启 + readiness 结果回流。
       ⚠️ **实测定案（DESIGN §6.0）：所有探针类型都必须在容器内执行**——
       宿主机网络与 kata sandbox netns **均不可达 capsule IP**（实测 ping/curl 全失败；
