@@ -163,9 +163,33 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 - [ ] 状态映射三处修复：Stopped→Running 误映射（zun.go:456）、exit code 恒 0（zun.go:468）、
       startTime 被覆盖（zun.go:325）（§5）
 - [ ] 孤儿 capsule 治理：不可伪造租户标记；deleteDanglingPods 只清本 VK 管理的 capsule（§5）
-- [ ] **MVP 验收 e2e**：1.36 集群上 Deployment pod 经逻辑节点建 capsule，状态/删除全链路
-      正确；带 limits 不 panic；不支持字段明确报错；EndpointSlice 出现 capsule OVN IP 且
-      kubetron LB 收编成功（§12）
+- [x] **MVP 验收 e2e 通过（2026-08-07，租户 111111 在 10.224.18.50 集群）**：
+      虚拟节点 `111111-node-az1` 注册 Ready（角色 serverless、v1.36.3-knaas.1、
+      运行时 zun://kata、容量 32C/64Gi/100pods、well-known 标签与 tenant 污点齐全）；
+      Deployment(replicas=2) → **pod 1/1 Running**，各持 OVN IP（192.168.100.x）；
+      **EndpointSlice 收录两个 capsule OVN IP 且 ready=true**（podIP==OVN IP 不变式
+      端到端成立 → kubetron service reconciler 可零改动收编）；删除 Deployment →
+      pod 全部清除。部署物：systemd `kubezun@111111`（appcred 走环境变量）+
+      ClusterRole/SA kubeconfig
+      期间修掉 8 个只有真实环境才暴露的问题（见 commit `aa2eb82`/`267c215`）：
+      gophercloud 用 application-container 构造 microversion header（Zun 只认
+      container，406）、gophercloud Capsule 类型与真实响应不符（restart_policy 对象、
+      时间戳非 RFC3339）、microversion ≥1.32 字段改名 name/labels、
+      capsule 模板 restartPolicy 用 K8s 拼写、K8s zone ≠ Zun AZ（AZ filter 滤掉全部
+      主机）、Zun 忽略容器名需按序匹配、删除需 force=True（否则 409）、
+      终态须先回写 K8s 才能删 pod 对象
+- [ ] 平台侧待办（阻塞项，非 provider bug）：
+      ⚠️ **系统 DS 落到虚拟节点**——cilium DS 容忍一切（`[{"operator":"Exists"}]`），
+      DS controller 为虚拟节点也建 pod → provider 按 namespace 白名单拒绝
+      （ProviderFailed，边界生效）→ 但 cilium 因此给节点打
+      `node.cilium.io/agent-not-ready` 污点，反过来挡住租户 pod。
+      正解见 DESIGN §4.5（给系统 DS 注入 `type NotIn (virtual-kubelet)` nodeAffinity），
+      验收时临时用 toleration 绕过
+      ⚠️ 租户 pod 需 `automountServiceAccountToken: false`（否则被 SA token
+      projected volume 拒绝，错误信息已点名该设置）——应由 Kyverno 默认注入
+      ⚠️ 计算节点需装 `numactl`（缺失则 Zun 报 cpus=0，一切调度失败）
+- [ ] 孤儿 capsule 治理：provider 停机期间删除的 pod 会留下 capsule（实测残留 6 个）
+      → ListManaged 已能按 owner label 识别，补一个启动时对账即可（§5）
 
 ---
 
