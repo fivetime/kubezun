@@ -172,9 +172,38 @@ ResourceQuota → VK 同步抬 capacity，"扩容节点"零秒完成。现有硬
 |---|---|---|
 | 默认 | 1 | 绝大多数租户；DS = 每租户一份 |
 | 按 AZ | 每 AZ 一个 | zone 标签映射真实 AZ：topologySpreadConstraints、DS per-AZ 扇出、AZ 容灾**全部免费复活**——K8s 拓扑机制原样工作 |
+| **按架构** | **每架构一个** | 混合 x86/ARM 计算池；见 §3.6 |
 | 按分区 | 每资源池一个 | 隔离"生产/批处理"配额：每节点镜像不同配额分区 |
 
 生命周期：Tenant CRD 声明式创建/销毁；缩节点走标准 drain（capsule 无宿主机绑定，迁移即重建）。
+
+### 3.6 混合架构（已实现，2026-08-07 实测）
+
+镜像不跨架构运行，而这一层原先无人把关：虚拟节点固定自称 amd64，capsule 不带任何
+架构信息，Zun 见空就随便放。租户写了 `nodeSelector: kubernetes.io/arch: arm64` 也只是
+选中一个说谎的标签，pod 调度成功、镜像执行失败。
+
+**一个节点只服务一种架构**，`--arch` 同时决定两件事，二者必须是同一个值：
+
+1. 节点的 `kubernetes.io/arch` 标签 —— K8s 调度器据此选节点；
+2. 该节点所建 capsule 的 `architecture` 字段 —— Zun 转成 `trait:COMPUTE_ARCH_*=required`
+   交给 Placement，把不匹配的宿主机在**调度阶段**就排除。
+
+Zun fork 侧配套（`zun/container/driver.py`、`capsules.py`、`schemas/parameter_types.py`）：
+CRI 驱动上报 `architecture` 与对应 trait（此前只有 docker 驱动上报），capsule 模板新增
+`architecture` 字段。`arm64`/`aarch64`、`amd64`/`x86_64` 归一到同一张表，K8s 词汇与
+Linux 词汇落到同一台机器。
+
+实测（2026-08-07，node-04/05/06 三台 x86）：
+- 三节点均上报 `COMPUTE_ARCH_X86_64`；
+- `architecture: amd64` 的 capsule → 落 incus-node-04，Running，拿到 OVN IP；
+- `architecture: arm64` → `There are not enough hosts available.`，**从未被放置**；
+- `architecture: sparc` → API 层 400，schema 拒绝。
+
+启动期校验 `--arch`：拼错会注册一个没有任何宿主机能满足的标签，pod 永远 Pending 且
+事件里没有任何线索指向这个拼写错误。
+
+> ⚠️ **同租户多节点是本节的副作用，也是三个隐藏缺陷的触发条件**——见 §4.4。
 
 ### 3.5 成本模型（每节点边际成本）
 
@@ -231,6 +260,34 @@ kubezoo M8 分片 + 多上游集群（M8 优先级据此重估）。空节点在
   同一逻辑节点内副本的物理分布由 Zun/Nova 决定——物理 HA 平台侧兜底（Zun 调度层对同
   owner capsule 软反亲和，fork 候选项 §10）；"节点资源压力" = 配额余量。
 - ⛔ 禁止：spec.nodeName 直写；改受保护标签/污点。
+
+---
+
+### 4.4 同一命名空间多个虚拟节点（混合架构的必然结果）
+
+在此之前每租户恰好一个节点，以下三处缺陷永不触发；一旦第二个节点出现（按架构、
+按 AZ 都会）就会立刻咬人。三处都已修复并有单测：
+
+**① 孤儿清理会删掉兄弟节点正在运行的 capsule。** VK 的 pod informer 按
+`spec.nodeName` 过滤（`virtual-kubelet/node/nodeutil/client.go:56`），所以 A 节点根本
+看不见 B 节点的 pod，B 的 capsule 在 A 眼里全是孤儿。对策：capsule 打上
+`knaas.io/node-name`，清理只判自己名下的。**没有该标签的旧 capsule 一律不动并记日志**
+——删错代价是打爆别人的工作负载，留着代价只是配额。
+
+**② 同名重建的 pod 永远拿不到 capsule。** VK 的 `createOrUpdatePod`
+（`node/pod.go:89-94`）先问 `GetPod`，再用 `podsEqual` 比 spec。我们为了上报终态而保留
+的已删除 pod 记录会被当成活 pod 返回，而重建 pod 的 spec 与它**完全相同** → 判定"无事
+可做"，create 和 update 都不调用。StatefulSet 每次重启都复用 pod 名，这是常态不是边角。
+对策：终态记录继续保留供状态上报，但对 `GetPod` 隐藏；另外 `UpdatePod` 遇到 UID 不同的
+同名 pod 时改为创建。
+
+**③ 状态同步会把旧 capsule 的健康和 IP 套到新 pod 上。** 匹配只按 namespace/name。
+对策：capsule 的 `pod-uid` 标签必须与 pod UID 相符，否则视为无 capsule。
+
+**④ Placement 拒绝的 capsule 显示成 Creating。** 没被放置就没有容器，容器状态停在初始
+值；kubectl 优先显示 waiting 容器的 reason 而不是 pod phase，于是一个已经确定失败的 pod
+永远显示"启动中"。对策：capsule 处于终态且 `host` 为空时，容器状态改报
+`CapsuleUnschedulable` + Zun 给出的原因。
 
 ---
 
@@ -461,6 +518,7 @@ capsule + CRI + zun-cni（正是以下各刀要动的地方）。
 | **门槛** | logs | CRI 驱动补 log_directory/log_path（cri/driver.py:89-94,181-192 现在不落日志文件）+ 新增 GET /capsules/{id}/logs（capsules.py:111-113 _custom_actions 为空）。capsule 容器 TYPE_CAPSULE_CONTAINER 无法借道 Container API（db/sqlalchemy/api.py:150-152） |
 | P2 | Barbican secret ref 注入 | §8.1；与上面两刀同动 cri/driver.py sandbox 路径 |
 | P3 | Manila/RWX（virtiofs） | §8.2 |
+| ✅ 已做 | 架构上报 + capsule 架构约束 | §3.6；`driver.py` 上报 architecture/trait，capsule 模板加 `architecture` → `trait:COMPUTE_ARCH_*=required` |
 | 候选 | 同 owner capsule 软反亲和 | §4 物理 HA 兜底 |
 | 候选 | nets/固定 IP 传递核实与补齐 | §5 待实测后定 |
 | 顺手 | linux_net.py ovs-vsctl → ovsdb | 上游自己的 TODO（linux_net.py:48）；规模下省每次 fork 进程 |

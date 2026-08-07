@@ -242,6 +242,23 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       ④ **DaemonSet 模板注入成功：DESIRED=1、pod 1/1 Running 在租户虚拟节点上**
       （注入必须落在 spec.template——DS controller 在建 pod 前按模板算节点资格）
       策略按 namespace 上的 `knaas.io/tenant` 标签选取，租户 ns 需打此标签
+- [x] **混合架构支持（2026-08-07，kubezun `69dd17f` + zun fork `f548d825`）**：
+      `--arch` 一个值同时决定节点 `kubernetes.io/arch` 标签与 capsule 的
+      `architecture` 字段，后者经 Zun 转成 `trait:COMPUTE_ARCH_*=required` 交 Placement，
+      不匹配的宿主机在**调度阶段**被排除。Zun 侧 CRI 驱动补上 architecture/trait 上报
+      （此前只有 docker 驱动有）。实测：amd64 capsule 落 node-04 Running；arm64 得到
+      "There are not enough hosts available." 从未被放置；sparc 被 API schema 拒（400）。
+      详见 DESIGN §3.6
+- [x] **同租户多节点暴露的四个缺陷全部修复并有单测（2026-08-07，DESIGN §4.4）**——
+      在此之前每租户恰好一个节点，四处永不触发：
+      ① 孤儿清理删掉兄弟节点运行中的 capsule（VK informer 按 nodeName 过滤，
+      看不见兄弟的 pod）→ capsule 打 `knaas.io/node-name`，无标签的旧 capsule 一律不动；
+      ② **同名重建 pod 永远拿不到 capsule**（VK `createOrUpdatePod` 先问 `GetPod` 再比
+      spec，我们保留的已删除记录被当活 pod 返回而 spec 完全相同 → 判"无事可做"）——
+      StatefulSet 每次重启都复用 pod 名，这是常态；
+      ③ 状态同步按 name 匹配，旧 capsule 的健康和 IP 会套到新 pod 上；
+      ④ Placement 拒绝的 capsule 显示成 Creating（kubectl 优先显示容器 waiting reason）
+      → 改报 `CapsuleUnschedulable` + Zun 原因
 - [ ] 每租户 VK Deployment 部署物（manifest/chart）：per-tenant SA、per-node :10250 +
       证书 + WebhookAuth(nodeName)（§2）
 - [ ] 同租户单进程多节点：共享 informer（pod watch 按 nodeName fieldSelector 合并）
@@ -285,6 +302,8 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 
 ## 阶段 4：生产化（§12）
 
+- [ ] Zun capsule 容器名 minLength=2，K8s 允许单字符容器名 → 租户写 `name: c` 得到一个
+      看不懂的 400。fork 侧放宽 schema，或 provider 侧改写并在状态里映射回原名
 - [ ] kubectl logs 通路：对接 fork 的 GET /capsules/{id}/logs；exec 返回 errdefs 明确错误（§10）
 - [ ] Barbican KMS：barbican-kms-plugin（CPO 现成）做 etcd 加密后端（§8.1）
 - [ ] Barbican secret ref 注入（对接 fork，替代 Secret 明文过 Zun DB）（§8.1）
