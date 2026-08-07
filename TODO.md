@@ -393,6 +393,16 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
       而容器内 `wget 127.0.0.1` / `nc -z 127.0.0.1` 实测可行。
       故 httpGet/tcpSocket/grpc 需注入**静态** helper（distroless 无 curl/nc）——
       **kubetron `cmd/probe/main.go` 现成可复用**（get/tcp/install 自安装）
+- [ ] **distroless 镜像的探针 helper 注入（未做，2026-08-07 复核）**。现状不是假健康：
+      无 curl/wget 的镜像探针会明确报 "image has no curl or wget"，非 distroless 镜像
+      的探针链路已完整可用并实测通过，故非紧急项。
+      ⚠️ **更正此前判断：不需要 Zun 支持 emptyDir**——Zun 现有 `local` volume driver
+      即可把文件送进 capsule。真正未决的是传输方式，两条路各有代价：
+      ① **宿主机预置**（每台计算节点铺一份，随 zun-cni 或独立 DaemonSet）：最省事，
+      但把"探针能否运行"绑死在宿主机镜像版本上，与租户自服务模型冲突；
+      ② **建 capsule 时由 provider 推下去**：干净，但每 pod 多一次数据面往返，且
+      **helper 是以租户身份注入进租户容器的可执行文件**——这条安全边界要先想清楚。
+      先定②的安全模型再动手；kubetron 已解同一问题，实现可直接借鉴
 - [ ] （原）**ExecSync + liveness 重启**：stub 现成
       （(Zun) api_pb2_grpc.py:100-103），zun-compute 落实 capsule 内执行 + restart 语义
 - [ ] **（门槛，卡阶段 4 logs）logs**：CRI 补 log_directory/log_path
