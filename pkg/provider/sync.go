@@ -89,8 +89,12 @@ func (p *Provider) syncOnce(ctx context.Context) error {
 			continue
 		}
 
-		if cap.Status == "Creating" && pod.Status.StartTime != nil &&
-			time.Since(pod.Status.StartTime.Time) > capsuleCreateTimeout {
+		// Judged by the capsule's own creation time, not the pod's start
+		// time: the latter is set by this process and resets whenever it
+		// restarts, so a capsule stuck since before a restart would never age
+		// out.
+		if cap.Status == "Creating" && !cap.CreatedAt.IsZero() &&
+			time.Since(cap.CreatedAt.Time) > capsuleCreateTimeout {
 			log.G(ctx).WithField("pod", key).WithField("capsule", cap.UUID).
 				Warn("capsule never left Creating; failing the pod so it can be replaced")
 			p.updateStatus(pod, func(pod *corev1.Pod) {
