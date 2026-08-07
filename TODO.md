@@ -338,11 +338,23 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
       **已声明但尚未应答 → 不 Ready**（不能把流量送给从未检查过的容器）；
       探针失败 → 不 Ready（这正是脑裂场景）；容器非 Running → 不 Ready
       （陈旧探针结果不得比容器活得久）；capsule 需全部容器 Ready
-      ⚠️ **端到端验证被环境阻塞**（非代码问题）：node-04 累积了 63 个僵死 kata
-      sandbox（多轮暴力清理的残留），containerd 重启后 devmapper 恢复 51 个残留
-      snapshot 耗时超过 systemd 默认 60s 启动超时 → 被杀 → 循环。
-      已加 drop-in `TimeoutStartSec=600` 让恢复跑完；恢复后需补测
-      "readiness 失败的 pod 被移出 EndpointSlice"
+      **端到端验证通过（2026-08-07，重启三节点后）**：探针成功的 pod
+      **1/1 Running 且 EndpointSlice ready=true**，完整链路闭合：
+      应用探针 → Zun prober 执行 → 容器 readiness → pod Ready condition →
+      EndpointSlice → （kubetron/Octavia member）
+      期间修掉三个只有真实环境才暴露的 bug（fork commit
+      `fd1f5fd9`/`5e8b2099`/`e4692f50`）：
+      ① **单次运行时查询失败即判容器 Deleted** → capsule 转 Stopped → pod 被判终止 →
+      控制器重建 → 下轮又改回 Running，**pod 无限 churn**。修：单次查不到不作判据
+      （容器创建中与运行时恢复中长得一样），真正消失由 capsule 删除与孤儿对账兜底
+      ② **readiness 仅在变化时写入 + 首次比较默认 True** → 首次即通过的探针什么都不写，
+      读侧把"缺值"当作"从未应答"而永久不 Ready。修：每次检查都记录
+      ③ **state 是 healthcheck 内部 dict 的引用** → 保存时拿自己和自己比较，
+      永远"无变化"，从不落库。修：先拷贝再修改
+      ⚠️ 环境教训：多轮 `force delete` + `crictl rmp -f` + `pkill -9 qemu` 在 kata 上
+      累积僵死 sandbox（node-04 到 63 个），最终 containerd 卡死无法恢复
+      （延长 systemd 超时、重建 devmapper 池、禁用 devmapper 均无效），**只有重启解决**。
+      重启后 containerd 恢复正常，陈旧 capsule 由孤儿对账自动清理（69 → 3）
 - [ ] （原设计）Zun 侧 prober 执行——ExecSync + 周期执行 +
       阈值计数 + liveness 失败重启 + readiness 结果回流。
       ⚠️ **实测定案（DESIGN §6.0）：所有探针类型都必须在容器内执行**——
