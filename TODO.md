@@ -369,17 +369,29 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       `pkg/zun/capsule.go:59`）：LB/listener/pool 生命周期、**幂等全量 PUT**
       （`BatchUpdatePoolMembers` 全集合语义，少放一个就清空 pool）、LB GC、
       双栈（一 pool 一族）、Ingress
-- [ ] **租户 DNS —— 需平台决策后才能实现**（勘察完成 2026-08-07，DESIGN §7.6）。
-      §7.5 定案后它是**必需项**：ClusterIP Service 的可用地址只在注解里，应用用名字。
-      ⚠️ 结构约束：VK 不得接入租户网络 → 应答者只能是**数据面**或**租户网内的 capsule**；
-      kubetron 的 ConfigMap+kubelet 挂载路径我们没有 kubelet。
-      **首选 A（OVN 内建 DNS）当前被阻塞**：实测 ML2 `extension_drivers` 只有
-      `port_security,qos`，DNS 驱动未加载，`dns_domain`/`dns_name` 静默失效。
-      需改 ML2 配置 + 重启 neutron-server（部署级变更）。
-      退路 C = 平台级 resolver + kubezun 推记录。B（CoreDNS capsule）因 capsule 不可变、
-      zone 变更即中断，不推荐。
-      ⚠️ 另需处理：capsule 的 resolv.conf 来自子网 `dns_nameservers`（实测 8.8.8.8），
-      要指向所选 resolver 且保留外部转发
+- [x] **租户 DNS 方案验证通过（2026-08-07，实测于 node-01，`deploy/designate.md`）**：
+      Designate 已部署（api/central/worker/producer/mdns + BIND9 后端），ML2 DNS 驱动已打开。
+      **实测链路**：带 `dns_name`+`dns_domain` 的 port → Designate 自动生成
+      `rsvc.111111-default.svc.cluster.local. A 192.168.100.47`；**删 port → 记录自动清理**。
+      后者是选这条路的核心理由——本轮 FIP/LB/capsule 的泄漏全是生命周期 bug，
+      记录的生死跟着 port 走就不会漏。
+      ⚠️ **四个静默失败的坑**（详见 `deploy/designate.md`）：
+      ① `[DEFAULT] dns_domain` 保持默认 `openstacklocal` → 扩展直接 return，
+      port 的 DNS 字段接受但不存储、无任何报错；
+      ② `subnet_dns_publish_fixed_ip` **继承自** `dns_domain_ports`，两个都列 → 逻辑跑两遍，
+      建 port 报 `NeutronDbObjectDuplicateEntry ... PortDNS`。只列前者即可；
+      ③ `neutron.conf` 里**本来就有一个注释掉的 `[designate]` 段**，追加在文件末尾的配置
+      被 oslo.config 忽略 → 报 `EndpointNotFound`，看起来像 catalog 问题其实是配置没生效；
+      ④ 子网需 `--dns-publish-fixed-ip`（capsule 用的是 fixed IP，默认只发布 FIP）。
+      另：Designate 的 `[keystone_authtoken]` 需 `interface = public`（本环境只发布 public endpoint）
+- [ ] **kubezun 侧接入 DNS**：在两类 port 上设 `dns_name`/`dns_domain`——
+      Service 的 `lb.VipPortID`、pod 的 capsule 地址里的 `port`（两个 id 都已在手）。
+      每 namespace 一个 Designate zone，随 namespace 创建
+- [ ] ⚠️ **DNS 仍有两个待决项**（DESIGN §7.6）：① capsule 的 `resolv.conf` 来自子网
+      `dns_nameservers`（实测 8.8.8.8），**不能直接指 Designate 后端**——那是权威 DNS 不做递归，
+      指过去公网域名全断；需要一个"持有这些 zone 为权威 + 其余递归"的 resolver；
+      ② 单一 resolver 持有全部 zone 时租户间可互查名字（IP 跨租户不可达，属信息泄露非通路），
+      要隔离需 per-tenant view
 - [ ] Octavia health monitor 作为**第二层**（LB 侧自检）是否需要：EndpointSlice 已能
       按 readiness 摘除 member，HM 是冗余保护而非必需；若启用需查 OVN provider 的
       `SUPPORTED_HEALTH_MONITOR_TYPES` 白名单（DESIGN §6）
