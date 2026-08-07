@@ -470,8 +470,16 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
       provider 侧回传 RestartCount（此前恒 0），并**加入状态指纹**——否则两次轮询之间被
       替换的容器回来仍是 Running+ready，指纹相同，重启永远不会写进 pod。
       实测 `kubectl get pod` RESTARTS 0→1→2
-- [ ] ⚠️ **探针周期未按 `periodSeconds` 执行**：实测按 zun-compute 的状态同步周期
-      （约 60s）跑，`periodSeconds: 5` 被忽略 → 故障检测延迟远大于租户声明
+- [x] **探针按声明的周期执行（2026-08-07，zun fork `055e3afd`）**：此前探针搭在
+      容器状态同步上，**所有探针都按同步间隔（默认 60s）跑**，`periodSeconds` 完全被
+      忽略，而且从外部无从察觉自己写的数字没被兑现。
+      改为独立周期任务 + 每个探针记录下次到期时间；新增 conf `probe_check_interval`
+      （默认 2s，**是 periodSeconds 的分辨率而非周期本身**，声明小于它的按它执行）。
+      **`initialDelaySeconds` 一并实现**（此前也被忽略）——从容器 started_at 起算，
+      否则慢启动应用一启动就被探，靠 failureThreshold 兜底才不至于立刻进重启循环。
+      单个容器探针异常不再中断本轮其余容器的探针。
+      实测：`periodSeconds:5` + `failureThreshold:2` 的 liveness 现在**约 10 秒**内
+      重启容器（此前 60 秒以上）；前 40 秒不健康 + `initialDelaySeconds:60` 的容器不被杀
 - [x] **logs 全链路打通（2026-08-07，zun fork `4432216e` + kubezun `b3a0210`）**：
       sandbox 加 `log_directory`、container 加 `log_path`（此前运行时**直接丢弃**输出，
       既无流可 attach 也无文件），新增 `GET /capsules/{id}/logs` 按 CRI 日志格式解析
