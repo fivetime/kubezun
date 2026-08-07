@@ -77,6 +77,31 @@ tens of seconds rather than a second or two. Set `initialDelaySeconds` on
 liveness probes accordingly — it is honoured, and without it a slow application
 can be restarted before it has finished coming up.
 
+## Services
+
+Every Service gets a load balancer on your network, including `ClusterIP`
+ones. The address that works is the one in `status.loadBalancer.ingress`, not
+the ClusterIP: your pods have one interface, on your own network, and the
+cluster's service range is not on it. `kubectl get svc` shows both — use the
+external one, or the name, which your DNS resolves to it.
+
+A headless Service (`clusterIP: None`) has no address and gets no load
+balancer. It resolves to your pods directly, which works: pod addresses are
+reachable from your other pods.
+
+**A Service is private unless you ask.** `type: LoadBalancer` gets an address on
+your network, reachable by your own workloads. To publish it to the internet:
+
+```yaml
+metadata:
+  annotations:
+    service.beta.kubernetes.io/openstack-internal-load-balancer: "false"
+```
+
+A public address is a billed resource, which is why copying a chart that says
+`type: LoadBalancer` does not spend one. Removing the annotation gives the
+address back.
+
 ## What works exactly as you expect
 
 Deployments, StatefulSets, Jobs, DaemonSets and their rollouts. Services and

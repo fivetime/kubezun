@@ -52,6 +52,16 @@ type Reconciler struct {
 	// sharing one OpenStack can tell theirs apart, and so a garbage collector
 	// can recognise its own.
 	Tenant string
+
+	// Neutron allocates the public addresses. Nil means none can be given.
+	Neutron *gophercloud.ServiceClient
+	// FloatingNetworkID is the external network public addresses come from.
+	FloatingNetworkID string
+	// PublicByDefault decides what a LoadBalancer Service gets when it says
+	// nothing. False keeps a tenant off the public network until they ask,
+	// because a public address costs the platform money and exposes a service
+	// its author may have only meant to reach from inside.
+	PublicByDefault bool
 }
 
 // Name of the load balancer backing a Service. Derived rather than random so a
@@ -99,7 +109,30 @@ func (r *Reconciler) Reconcile(ctx context.Context, namespace, name string) erro
 			return err
 		}
 	}
-	return r.publishAddress(ctx, svc, lb)
+
+	address := lb.VipAddress
+	if wantsPublicAddress(svc, r.PublicByDefault) {
+		if r.Neutron == nil {
+			return fmt.Errorf("service %s/%s asks for a public address but this "+
+				"node has no network client to allocate one", svc.Namespace, svc.Name)
+		}
+		network := r.FloatingNetworkID
+		if v := svc.Annotations[FloatingNetworkAnnotation]; v != "" {
+			network = v
+		}
+		public, err := ensureFloatingIP(ctx, r.Neutron, lb.VipPortID, network)
+		if err != nil {
+			return err
+		}
+		address = public
+	} else if r.Neutron != nil {
+		// Asked for one before and does not now: give it back rather than
+		// leave it allocated and charged for.
+		if err := releaseFloatingIP(ctx, r.Neutron, lb.VipPortID); err != nil {
+			return err
+		}
+	}
+	return r.publishAddress(ctx, svc, address)
 }
 
 func (r *Reconciler) ensureLoadBalancer(ctx context.Context, svc *corev1.Service) (*loadbalancers.LoadBalancer, error) {
@@ -273,13 +306,13 @@ func (r *Reconciler) slicesFor(svc *corev1.Service) ([]discoveryv1.EndpointSlice
 // LoadBalancer: the ClusterIP the API server assigned is unreachable from a
 // capsule, so a tenant reading it gets an address that goes nowhere. Publishing
 // here is what lets them, and the tenant's DNS, find the one that does.
-func (r *Reconciler) publishAddress(ctx context.Context, svc *corev1.Service, lb *loadbalancers.LoadBalancer) error {
+func (r *Reconciler) publishAddress(ctx context.Context, svc *corev1.Service, address string) error {
 	current := svc.Status.LoadBalancer.Ingress
-	if len(current) == 1 && current[0].IP == lb.VipAddress {
+	if len(current) == 1 && current[0].IP == address {
 		return nil
 	}
 	updated := svc.DeepCopy()
-	updated.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: lb.VipAddress}}
+	updated.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: address}}
 	_, err := r.ServiceClient.Services(svc.Namespace).UpdateStatus(ctx, updated, metav1.UpdateOptions{})
 	return err
 }
@@ -296,6 +329,27 @@ func (r *Reconciler) deleteLoadBalancer(ctx context.Context, svc *corev1.Service
 		}
 		id = lb.ID
 	}
+	// The public address goes back first, while it can still be found by the
+	// port it is attached to. Deleting the load balancer takes that port with
+	// it, and Neutron leaves the address allocated to the project — still
+	// billed, attached to nothing, with nothing left to trace it from.
+	if r.Neutron != nil {
+		lb, err := GetLoadBalancerByID(ctx, r.Octavia, id)
+		switch {
+		case err == nil:
+			if err := releaseFloatingIP(ctx, r.Neutron, lb.VipPortID); err != nil {
+				return err
+			}
+		case err == ErrNotFound:
+			// Already gone; any address it had is already orphaned and only a
+			// sweep can find it now.
+			log.G(ctx).WithField("loadbalancer", id).
+				Warn("load balancer was already deleted; a public address it held cannot be traced from here")
+		default:
+			return err
+		}
+	}
+
 	log.G(ctx).WithField("service", svc.Namespace+"/"+svc.Name).
 		WithField("loadbalancer", id).Info("deleting load balancer")
 	return DeleteLoadBalancer(ctx, r.Octavia, id)
