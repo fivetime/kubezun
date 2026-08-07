@@ -1,0 +1,53 @@
+# One tenant's virtual-kubelet process. Install as
+# /etc/systemd/system/kubezun@<TENANT>.service and substitute <TENANT> and the
+# values marked below; the flags a tenant's nodes share are here, and each
+# extra node is one --node.
+#
+# Everything secret lives in files under /etc/kubezun/<TENANT>/, mode 0600 in a
+# 0700 directory. Nothing secret belongs in this file: unit files are
+# world-readable, so an application credential written here is readable by
+# every account on the host.
+[Unit]
+Description=KNaaS virtual kubelet for tenant <TENANT>
+After=network.target
+
+[Service]
+# OS_AUTH_URL, OS_APPLICATION_CREDENTIAL_ID, OS_APPLICATION_CREDENTIAL_SECRET,
+# OS_REGION_NAME. One credential per tenant: a shared one would let a
+# compromised process act for every other tenant, which is the whole point of
+# running a process per tenant.
+EnvironmentFile=/etc/kubezun/<TENANT>/openrc
+Environment=KUBECONFIG=/etc/kubezun/<TENANT>/kubeconfig
+
+ExecStart=/usr/local/bin/kubezun \
+  --nodename <TENANT>-node-az1 \
+  --tenant <TENANT> \
+  --namespaces <TENANT>-default \
+  --zone az1 \
+  --arch amd64 \
+  --zun-availability-zone nova \
+  --network-id <TENANT NEUTRON NETWORK ID> \
+  --internal-ip <ADDRESS THE API SERVER REACHES THIS HOST ON> \
+  --capacity-cpu 32 \
+  --capacity-memory 64Gi \
+  --capacity-pods 100 \
+  --tls-cert-file /etc/kubezun/<TENANT>/tls.crt \
+  --tls-private-key-file /etc/kubezun/<TENANT>/tls.key \
+  --client-ca-file /etc/kubezun/<TENANT>/client-ca.crt \
+  --log-level info
+
+# A tenant needing more than one architecture or availability zone adds a line
+# per node, above --log-level. They share this process's informers and
+# credential, so the second node costs a node object and a lease, not another
+# watch. Each needs its own listen address; the certificate covers the address,
+# so one serves them all.
+#
+#  --node name=<TENANT>-node-arm64,arch=arm64,listen=:10251 \
+
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

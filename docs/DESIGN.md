@@ -611,9 +611,19 @@ kubetron DNS 分发通道改造、M8 编排层独立部署形态。
    `nets:[{"port"}]` → 删 capsule 后清 device_id → 重建复用）。好处：IP 稳定性不依赖
    Zun 的 admin 权限配置，且与 §2"每租户 appcred、严禁 admin 凭据"一致；代价是
    provider 要为 port 的孤儿回收负责（capsule 删除后 port 需按 pod 生命周期显式删除）。
-3. **kube-system 控制器 pod 过 Kyverno**：resourceFilters/excludeGroups 核查——决定
+3. **VK 进程的部署形态：宿主机 systemd 还是集群内 Deployment**（2026-08-07 提出）。
+   自然形态是 Deployment——凭据变 Secret、证书变 Secret、kubeconfig 变投影 token，
+   `deploy/tenant-vk.yaml` 的 SA/RBAC 原样可用。**未决的是地址**：
+   apiserver 按节点上报的地址拨 kubelet API，而 pod 的地址每次重新调度都变。
+   两条路：① 每次启动重新签证书（真 kubelet 的 bootstrap 就是这么做的）；
+   ② 上报一个稳定名字作 `InternalDNS` 地址、证书覆盖该名字——但这取决于控制面
+   能否解析集群 DNS（托管控制面不一定能）。
+   两者都不难，但差别足够大，值得**明确选一个而不是默认滑进去**。
+   在此之前，已验证并支持的形态是宿主机 systemd（`deploy/kubezun@.service`）。
+   ⚠️ 若走 hostNetwork 规避地址问题：计算节点的 kubelet 已占 10250，需换端口。
+4. **kube-system 控制器 pod 过 Kyverno**：resourceFilters/excludeGroups 核查——决定
    validate 边界的实际覆盖。
-4. **租户业务标签写自己节点**：MVP 禁；有 pinning 需求再经 VAP 白名单放开。
+5. **租户业务标签写自己节点**：MVP 禁；有 pinning 需求再经 VAP 白名单放开。
 5. **InternalIP 展示值**：是否在 kubezoo 层改写为中性值。
 6. **SA token 长期轮换通道**：fork ExecSync 落地后评估文件刷新机制。
 7. **单进程多节点 informer 共享**的具体实现形态（pod watch fieldSelector 合并粒度）。

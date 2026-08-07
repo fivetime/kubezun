@@ -279,8 +279,16 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       但 apiserver 只校验 SAN 不看 CN，故写哪个节点名无所谓）
 - [ ] 证书轮换：`kubelet-serving` 证书短期有效，当前无轮换机制 →
       过期即 logs/exec 中断（节点本身不受影响，证书只服务 kubelet API）
-- [ ] 每租户 VK 部署形态从手写 systemd unit 收敛为 manifest/chart；
-      appcred 明文进 unit 文件需换成 Secret 挂载
+- [x] **appcred 移出 unit 文件（2026-08-07）**：unit 文件是 **world-readable**（实测
+      644，`nobody` 可读到 appcred）。改为 `EnvironmentFile=/etc/kubezun/<T>/openrc`，
+      0600 文件 + 0700 目录，与 tls.key / client-ca / kubeconfig 同一目录。
+      两个租户已迁移，节点保持 Ready。模板见 `deploy/kubezun@.service`，
+      流程见 `deploy/README.md`
+- [ ] **部署形态：systemd vs 集群内 Deployment —— 需先决策再实现**（DESIGN §14.3）。
+      未决点是**地址**：apiserver 按节点上报地址拨 kubelet API，pod 地址每次重调度就变
+      → 要么每次启动重签证书（真 kubelet 的 bootstrap 路线），要么上报稳定的
+      `InternalDNS` 名字（取决于控制面能否解析集群 DNS）。
+      ⚠️ hostNetwork 规避不通：计算节点 kubelet 已占 10250
 - [x] **同租户单进程多节点：共享 informer（2026-08-07，`a743545`，`pkg/vknode`）**。
       `nodeutil.NewNode` 每节点自建 informer factory 且无注入钩子，故降到 `node` 包
       自行组装控制器。pod informer 一份带全部节点的 pod，每个节点的 PodController 用
