@@ -293,9 +293,21 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       （节点名标签守卫保留为主防线）。
       CLI：`--nodename` 等仍描述单节点（存量部署不变），额外节点用可重复的
       `--node name=<n>[,arch=][,zone=][,zun-az=][,listen=]`；同名或同端口直接拒绝
-- [ ] ⚠️ ConfigMap/Secret **按对象 GET**（不用集群级 informer——namespace 级 Role 下
-      nodeutil 默认 informer 会 403，(VK) controller.go:329-346）；env/文件合成进 capsule
-      （DESIGN 优先级 P2，租户真实负载需要则此阶段落地）（§8.1）
+- [x] **ConfigMap/Secret 进 capsule（2026-08-07，kubezun `a1812c4` + zun fork `50aca0f2`）**：
+      ① **env 本来就通**（VK 在 CreatePod 前调 `PopulateEnvironmentVariables` 解析
+      `envFrom`/`valueFrom`）——实测 configMapRef 与 secretKeyRef 都正确落到 capsule；
+      ② **文件挂载此前是静默丢弃**：`Validate` 只拦 hostPath/projected，configMap/secret
+      卷直接穿过去，capsule `mounts: None`，而 pod 显示 **1/1 Running**——租户以为
+      `/etc/appcfg` 存在。已实测复现并修复。
+      实现：Zun 的 `Local` 卷驱动本来就能写 base64 内容并 bind-mount（Container API 一直在用），
+      只有 capsule 路径拒收——fork 侧给 capsule 卷加 `file: {contents}` 源
+      （schema + `capsules.py` + ⚠️ `common/utils.py:429` 还有第二处硬编码 cinder-only 检查）。
+      provider 侧按 key 拆成一卷一文件（Zun Local 一卷只写一个文件），
+      subPath 挂到 mountPath 本身，两容器共享的卷只声明一次。
+      **实测**：容器内 `/etc/appcfg/{GREETING,app.conf}` 存在且内容正确。
+      ⚠️ **是快照不是投影**：ConfigMap 事后修改不会到达运行中的 capsule
+      （真 kubelet 会刷新）。其余卷类型现在**按名字明确拒绝**，不再穿透
+      ⚠️ 原"按对象 GET 避免 403"的顾虑已由共享 informer 的 namespace 作用域解决（见上）
 - [ ] SA token：Kyverno 默认强制 automountServiceAccountToken=false；显式开启者创建时
       注入一次性 TokenRequest token + TTL 文档（§8.1）
 - [ ] Kyverno validate 策略集：禁 spec.nodeName、禁指向外租户节点的 nodeSelector/toleration、
