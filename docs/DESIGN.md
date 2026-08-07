@@ -516,24 +516,31 @@ member 带 subnet）在真环境原样成立。
 哪儿也去不了的地址。VIP 需经 `status.loadBalancer.ingress` 回写 + 租户 DNS 解析，
 DNS 编排因此是必需项而非可选项。
 
-### 7.6a ⚠️ OVN provider 的 VIP **没有 Neutron port**（2026-08-07 实测，影响两个功能）
+### 7.6a VIP port 与生命周期（2026-08-07 实测，含一次自我更正）
 
-三个 kubezun 建的 LB，`vip_port_id` 全部指向**不存在的 port**：按 id 查 `PortNotFound`，
-按 IP 查 0 个 port（原始 API 复核，排除 CLI 干扰）。而 LB 本身 ACTIVE、VIP 流量实测可达。
-原因是 amphora-less：地址活在 OVN northbound 规则里，不需要一张 port 承载。
+**OVN provider 会建 VIP port**（`helper.py:3040 create_vip_port`，命名
+`ovn-lb-vip-<lb_id>`，并设 `device_id=lb-<id>` 防止被 Nova 挂载）。
+新建 Service 立刻验证：port 存在。
 
-**这推翻了两个功能共同的隐含假设**（"`lb.VipPortID` 能解析成一个真实 Neutron port"）：
+⚠️ **但本轮早先建的三个 LB，其 `vip_port_id` 全部指向不存在的 port**（按 id、按 IP、
+原始 API 三种方式复核一致），而 LB 处于 ACTIVE 且 VIP 流量可达。
+**原因未确定**；最可能是创建过程中一度进入 ERROR，provider 在错误路径上删掉了 VIP port
+（`helper.py:1570-1578` "Deleting the VIP port ... since LB went into ERROR state"），
+其后 LB 恢复 ACTIVE 但 `vip_port_id` 成为悬空引用。本 reconciler 的激进重试与此吻合。
 
-| 功能 | 影响 |
-|---|---|
-| **FIP 绑定** | FIP 挂在 port 上 → 这条路在 OVN provider 下**不可用**。`type=LoadBalancer` + 要公网时需另寻机制（候选：给 VIP 所在子网做 SNAT/DNAT、或改用有 amphora 的 provider、或在 router 上做 FIP） |
-| **DNS 命名** | 记录靠 port 的 `dns_name` 发布 → 同样不可用。**Neutron 自动集成这条路对 Service VIP 失效**，但**对 capsule port 仍然成立**（capsule 有真实 port） |
+> 📌 **自我更正**：我曾据这三个样本把"VIP 没有 port"写成 OVN provider 的**性质**。
+> 它不是性质，是**故障症状**。三个样本、未查证机制就下普遍结论，是这一轮最该避免的错误。
 
-**已做的处理**：两处都从"静默不生效"改为**显式失败/告警**——FIP 直接报错，
-DNS 记一条 warning 说明该 Service 只能靠地址访问。⚠️ **两条替代路径尚未确定**。
+**由此得出的设计选择（仍然成立，但理由变了）：kubezun 自己预建 VIP port，
+建 LB 时传 `vip_port_id`**（`loadbalancers.CreateOpts.VipPortID`，OVN provider 会消费它，
+`helper.py:495-520`）。理由不再是"provider 不建 port"，而是：
 
-> 教训：FIP 与 DNS 都是先写代码后验证，两次都建立在同一个未验证的假设上。
-> 涉及外部系统对象模型的功能，应先用一次真实调用确认对象存在。
+- **不依赖 provider 的失败路径**：port 由我们持有，LB 进 ERROR 不会把它删掉，
+  也就不会出现悬空引用；
+- **DNS 与 FIP 都挂在这张 port 上**，而它的生命周期由我们与 Service 对齐；
+- **VIP 地址稳定**：LB 重建不换地址（与 §14.2 保住 capsule IP 是同一模式）。
+
+代价：每 Service 多管一张 port。⚠️ 存量 LB 需重建一次才能改用预建 port（VIP 会变）。
 
 ### 7.6 租户 DNS：方案空间与当前阻塞（2026-08-07 勘察）
 
