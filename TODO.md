@@ -217,10 +217,18 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       结果：**①③ 在 K8s 层都成功绑到了 B 的节点**（调度层挡不住，符合预期），
       但 provider 白名单让其停在 ProviderFailed，**B 的 OpenStack project 零 capsule**；
       ② 被 apiserver 直接拒（Conflict）。执行面隔离成立
-- [ ] ⚠️ **发现真实 DoS 向量（需 Kyverno 补齐）**：被 provider 拒绝的 pod **仍计入
-      受害节点 Allocated resources**（实测 limits=4CPU/8Gi 的攻击 pod 占掉对方节点 12%）
-      → 租户 A 可用大 limits 垃圾 pod 耗尽 B 的可调度容量。
-      **执行面靠 provider 白名单，容量面必须靠准入层**（DESIGN §4.2 已回写）
+- [x] **Kyverno 1.18.2 部署 + 租户策略落地并实测（2026-08-07，
+      `deploy/kyverno-tenant-policies.yaml`）**，DoS 向量已封堵：
+      ① `spec.nodeName` 直写 → **被拒**（DoS 主路，因其绕过调度器直接绑定计入容量）；
+      ② 指向他人 pool 的 nodeSelector/toleration → **被 mutate 改写成自己的**，
+      pod 落到自己节点（⚠️ Kyverno mutate 先于 validate，所以 refuse-foreign-pool
+      规则实际不触发——矫正比拒绝更友好，规则保留作 mutate 失效时的兜底）；
+      ③ `automountServiceAccountToken=false` 自动注入 → **裸 Deployment
+      （无 nodeSelector/toleration/automount）直接 1/1 Running**，租户不再需要
+      写任何 KNaaS 专属样板；
+      ④ **DaemonSet 模板注入成功：DESIRED=1、pod 1/1 Running 在租户虚拟节点上**
+      （注入必须落在 spec.template——DS controller 在建 pod 前按模板算节点资格）
+      策略按 namespace 上的 `knaas.io/tenant` 标签选取，租户 ns 需打此标签
 - [ ] 每租户 VK Deployment 部署物（manifest/chart）：per-tenant SA、per-node :10250 +
       证书 + WebhookAuth(nodeName)（§2）
 - [ ] 同租户单进程多节点：共享 informer（pod watch 按 nodeName fieldSelector 合并）
