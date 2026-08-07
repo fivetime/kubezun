@@ -57,11 +57,17 @@ func Validate(pod *corev1.Pod) error {
 			return unsupported("spec.volumes[].hostPath",
 				"there is no shared host filesystem behind a virtual node")
 		case v.Projected != nil:
-			// The service account token volume is injected into every pod that
-			// does not opt out, so name the opt-out here: without it the
-			// message reads as a defect in the workload rather than a setting
-			// the tenant has to make.
 			if strings.HasPrefix(v.Name, "kube-api-access-") {
+				// Kubernetes' own ServiceAccount admission injects this volume
+				// before any webhook runs, so a policy that sets
+				// automountServiceAccountToken later cannot remove what is
+				// already there. The field is the pod's stated intent: honour
+				// it and drop the volume rather than refusing a pod that did
+				// opt out.
+				if pod.Spec.AutomountServiceAccountToken != nil &&
+					!*pod.Spec.AutomountServiceAccountToken {
+					continue
+				}
 				return unsupported("the service account token volume",
 					"a capsule cannot refresh a bound token; set "+
 						"automountServiceAccountToken: false on the pod")
