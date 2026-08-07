@@ -284,10 +284,19 @@ kubezoo M8 分片 + 多上游集群（M8 优先级据此重估）。空节点在
 **③ 状态同步会把旧 capsule 的健康和 IP 套到新 pod 上。** 匹配只按 namespace/name。
 对策：capsule 的 `pod-uid` 标签必须与 pod UID 相符，否则视为无 capsule。
 
-**④ Placement 拒绝的 capsule 显示成 Creating。** 没被放置就没有容器，容器状态停在初始
-值；kubectl 优先显示 waiting 容器的 reason 而不是 pod phase，于是一个已经确定失败的 pod
-永远显示"启动中"。对策：capsule 处于终态且 `host` 为空时，容器状态改报
-`CapsuleUnschedulable` + Zun 给出的原因。
+**④ pod 级失败必须同时写进容器状态**（这一条与多节点无关，是同一次排查顺带挖出的）。
+kubectl 优先显示容器状态而非 pod phase，所以两个方向都会说谎：
+- capsule 被 Placement 拒绝 → 没被放置就没有容器，容器状态停在初始值 →
+  已确定失败的 pod 永远显示"启动中"（实测有一个这样卡了 3 小时）；
+- capsule 在 pod 运行中消失（`CapsuleMissing`）或始终卡在 Creating
+  （`CapsuleStuckCreating`）→ 容器仍标记 Running → **pod 显示 1/1 Ready，而它的
+  capsule 已经不存在了**——正是本项目要消灭的那类假健康。
+
+对策：这三条路径都改写容器状态（`CapsuleUnschedulable` 带 Zun 原文，另两条带各自原因），
+**已终止的容器不动**——它自己的退出信息比任何 pod 级理由都准确。
+
+> ⚠️ 已经处于 `Failed` 的 pod 不会被追认：VK 不再同步终态 pod
+> （`node/podcontroller.go` "Ignore the pod if it is in the Failed or Succeeded state"）。
 
 ---
 
