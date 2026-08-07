@@ -21,8 +21,8 @@
 |---|---|---|
 | 租户体验 | "能跑 pod 的命名空间"：workload/Service/DNS 完整；`kubectl get no` 为空；DaemonSet 拒绝（`tenant-deny-daemonset.yaml` 维持现状） | 完整集群幻觉：逻辑节点可见、DS 扇出、配额即容量、AZ 拓扑语义 |
 | 算力 | 平台共享 kata 节点池，K8s 记账 | Zun capsule，**归属租户 OpenStack project**（kaaas 文档 §2.4 翻案条件成立：容器与 Nova VM 共用 OpenStack 配额/调度/计费） |
-| 网络 | kubetron 全量（port 接入 + 编排） | Zun 原生 port + kubetron 编排半边（§7） |
-| 探针/logs/exec | 原生 kubelet 白拿 | Octavia HM + Zun fork（§6） |
+| 网络 | kubetron 全量（port 接入 + 编排） | Zun 原生 port + **kubezun 自建编排**（§7、§14.4） |
+| 探针/logs/exec | 原生 kubelet 白拿 | Zun fork：容器内探针 + logs + ExecSync（§6，已实现） |
 
 两档可同租户混用：B1 pod 与 B2' capsule 都满足 podIP==OVN IP 不变式，同一个
 EndpointSlice / 同一个 Octavia LB 后面可同时站两种后端，租户升级 KNaaS 时 Service 流量
@@ -71,7 +71,7 @@ kubelet API（logs/exec）。
 【算力层】B1: kata 真实节点池 + 原生 kubelet（主路）
          B2': kubezun 逻辑虚拟节点 → Zun capsule（本文档）
   │
-【数据面】kubetron 编排半边 + OVN/Octavia
+【数据面】OVN/Octavia（B1 由 kubetron 编排，B2' 由 kubezun 自建编排，两者共存互不干涉）
   Service = Octavia OVN LB（member = OVN IP，EndpointSlice 驱动）、租户 DNS zone、
   VIP 独立子网 + tenant router。K8s Service CIDR 与数据面无关。
   │
@@ -316,10 +316,12 @@ kubectl 优先显示容器状态而非 pod phase，所以两个方向都会说�
   表达，(Zun) parameter_types.py:461-549；CRI 恒传 privileged=False，cri/driver.py:163-178）、
   projected volume（§8）。现有静默丢弃（zun.go:206-210 TODO）废弃。
 - **podIP==OVN IP 不变式**：GetPodStatus 把 capsule 的 Neutron/OVN IP 回填 podIP。守住它，
-  EndpointSlice 里自然是 OVN IP，(kubetron) pkg/service/members.go:25,107 的 Octavia member
-  同步**零改动**适用于 capsule。
-- **Ready 判定**：capsule Running ∧ Neutron port ACTIVE（现只看 Running，zun.go:359,516-536，
-  缺数据面就绪信号）。应用级 readiness 由 Octavia HM 承担（§6）。
+  EndpointSlice 里自然是 OVN IP，Octavia member 直接可用。
+  ⚠️ 它是**必要而不充分**条件：member 还需 subnet ID。kubezun 从 capsule 地址记录的
+  `subnet_id` 取（自建 reconciler，§14.4），不经 kubetron 的 NetworkPortClaim。
+- **Ready 判定**：capsule Running ∧ 有地址 ∧ 容器 readiness 通过（§6，已实现）。
+  应用级 readiness 走**容器内探针 → pod Ready → EndpointSlice**（实测 5 秒内生效）；
+  Octavia HM 是 LB 侧的第二层冗余，不是必需路径。
 - **状态推送**：实现 PodNotifier/NotifyPods（(VK) podcontroller.go:79-90），替代无通知时库
   回退的全量轮询（(VK) node/sync.go:99-120）；DeletePod 去掉 300×1s 同步阻塞
   （zun.go:419-445），改异步等待 + 通知终态。
@@ -372,7 +374,8 @@ kubectl 优先显示容器状态而非 pod phase，所以两个方向都会说�
 
 三类探针语义的归属：liveness 失败 → Zun 侧重启容器（restart 只有 Zun 能闭环）；
 readiness 结果 → 回流 container 状态 → provider 读回 → pod Ready condition →
-EndpointSlice → kubetron 的 Octavia member 上下线；startup 为前两者的启动期门控。
+EndpointSlice → Octavia member 上下线（由 kubezun 自建 reconciler 消费，§14.4）；
+startup 为前两者的启动期门控。
 
 **声明留在 K8s，执行必须下沉。方案 A（定案）：**
 
@@ -405,17 +408,17 @@ DESIGN §4.3，仅可作过渡）；C（capsule 内自报 sidecar——注入/�
   br-int 并设 `external-ids:iface-id=<port_id>`（(Zun) network/linux_net.py:36-43）——
   与 ovs-cni 设同一字段、插同一 br-int。**OVN 看不出 capsule port 和 kubetron pod port
   的区别**：安全组、逻辑交换机隔离、FIP、Octavia member、租户 DNS 全部无差别生效。
-- **kubetron 复用切面在 port 之上**（B1 照旧全量部署，B2' 流量汇入其编排层）：
-  - `pkg/service/`：Service→Octavia OVN LB reconciler——EndpointSlice 驱动，
-    ⚠️ **不是零改动复用（2026-08-07 查证纠正）**：`members.go:100-147` 的
-    `memberEndpoint` 强制要求 member pod 带 kubetron claim 注解，并从
-    `NetworkPortClaim.Status.Subnet.ID` 取 member 子网。capsule 走 Zun 原生 port、
-    无 claim 无注解 → **每个 kubezun pod 都会在此报错**。
-    缺的**只有 subnet 这一个字段**（其余：读 EndpointSlice、readiness 过滤、
-    BatchUpdate 全量 PUT、LB GC、双栈、Ingress 复用，全部后端无关）。
-    capsule 地址记录本就带 `subnet_id`。三条路见 §14.6；
-  - `pkg/controller/dns_controller.go`：租户 DNS zone 渲染——逻辑复用，分发通道要改
-    （无 kubelet 挂 ConfigMap；DNS 跑成租户网内 capsule，控制器直推 zone）。
+- **编排层不复用 kubetron，kubezun 自建，两者共存**（定案 2026-08-07，§14.4）。
+  kubetron 的 Service reconciler 从 `NetworkPortClaim` 取 member 子网、且对无其注解的
+  pod 报错而非跳过（`members.go:100-147`、`:54-57`），capsule 无 claim 必然卡住。
+  **共存是安全的**：kubetron 的孤儿 GC 按 `device_owner` tag 过滤
+  （`kubetron`/`kubetron:<clusterid>`），Zun port 是 `compute:zun`，不在其列表内。
+  kubezun 自建的两块，以 kubetron 同名实现为蓝本（同作者同 gophercloud v2 栈）：
+  - Service→Octavia OVN LB reconciler：EndpointSlice 驱动，subnet 取自 capsule 地址的
+    `subnet_id`。⚠️ `BatchUpdatePoolMembers` 是**全集合 PUT**，member 列表少一个就清空
+    整个 pool——这是照抄时最容易踩的一处。
+  - 租户 DNS zone 渲染：分发通道要改（无 kubelet 挂 ConfigMap；DNS 跑成租户网内 capsule，
+    控制器直推 zone）。
     **resolver 下发已实测打通（2026-08-06，PoC-4）**：原先 capsule 继承宿主
     resolv.conf（CRI sandbox 无 DNSConfig），fork 分支 `feat/capsule-dns` 把
     `_write_cni_metadata` 已查到的 subnet `dns_nameservers` 收集后填入
