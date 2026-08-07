@@ -331,9 +331,18 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
       prober 按周期执行 → curl 退出码 22 → `{"ready": false, "readiness_failures": 1}`
       ⚠️ 部署踩坑：在 133 上装 grpcio-tools 升级了 protobuf/grpcio，生成的 pb2 与
       134/135 的 runtime 不兼容（gencode 7.35.1 vs runtime 6.33.5）→ 三台需版本对齐
-- [ ] **探针 step3：readiness 回流 pod Ready condition**——provider 读
-      `healthcheck.k8s_probe_state.ready` 并纳入 PodConditions，打通
-      探针→pod Ready→EndpointSlice→kubetron/Octavia member 的完整链路
+- [x] **探针 step3 代码完成（2026-08-07，kubezun `fcb45ef`）**：provider 读
+      `healthcheck.k8s_probe_state.ready`，Ready 现在要求三件事同时成立——
+      capsule Running ∧ 有地址 ∧ **容器自称在服务**；
+      语义（各有测试守卫）：无 readiness 探针 → 一 Running 即 Ready（同 K8s）；
+      **已声明但尚未应答 → 不 Ready**（不能把流量送给从未检查过的容器）；
+      探针失败 → 不 Ready（这正是脑裂场景）；容器非 Running → 不 Ready
+      （陈旧探针结果不得比容器活得久）；capsule 需全部容器 Ready
+      ⚠️ **端到端验证被环境阻塞**（非代码问题）：node-04 累积了 63 个僵死 kata
+      sandbox（多轮暴力清理的残留），containerd 重启后 devmapper 恢复 51 个残留
+      snapshot 耗时超过 systemd 默认 60s 启动超时 → 被杀 → 循环。
+      已加 drop-in `TimeoutStartSec=600` 让恢复跑完；恢复后需补测
+      "readiness 失败的 pod 被移出 EndpointSlice"
 - [ ] （原设计）Zun 侧 prober 执行——ExecSync + 周期执行 +
       阈值计数 + liveness 失败重启 + readiness 结果回流。
       ⚠️ **实测定案（DESIGN §6.0）：所有探针类型都必须在容器内执行**——
