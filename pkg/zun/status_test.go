@@ -177,3 +177,48 @@ func TestCapsuleIsReadyOnlyWhenEveryContainerIs(t *testing.T) {
 		t.Error("a capsule with no containers was reported ready")
 	}
 }
+
+// A capsule Placement refused never creates its containers, so they sit in
+// their initial state forever. kubectl prints a waiting container's reason
+// ahead of the pod phase, so the tenant would see "Creating" indefinitely for
+// a pod that has definitively failed.
+func TestContainerStatusesReportUnschedulableCapsule(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{
+		Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+	}}
+	cap := &Capsule{
+		Status:       "Error",
+		StatusReason: "There are not enough hosts available.",
+		Containers:   []Container{{UUID: "u", Status: "Creating"}},
+	}
+	got := ContainerStatuses(pod, cap)
+	w := got[0].State.Waiting
+	if w == nil {
+		t.Fatalf("container is not waiting: %+v", got[0].State)
+	}
+	if w.Reason != "CapsuleUnschedulable" {
+		t.Errorf("reason = %q, want CapsuleUnschedulable", w.Reason)
+	}
+	if w.Message != "There are not enough hosts available." {
+		t.Errorf("message = %q, want Zun's reason", w.Message)
+	}
+}
+
+// A capsule that ran on a host and then stopped is a different thing: its
+// containers describe what happened, and overwriting that would hide a real
+// exit behind a placement message.
+func TestContainerStatusesLeavePlacedCapsulesAlone(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{
+		Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+	}}
+	cap := &Capsule{
+		Status: "Stopped",
+		Host:   "incus-node-04",
+		// Waiting rather than terminated so the override path is the one under
+		// test: a terminated container would never reach it.
+		Containers: []Container{{UUID: "u", Status: "Creating"}},
+	}
+	if w := ContainerStatuses(pod, cap)[0].State.Waiting; w == nil || w.Reason != "Creating" {
+		t.Errorf("waiting state was overwritten for a capsule that had a host: %+v", w)
+	}
+}

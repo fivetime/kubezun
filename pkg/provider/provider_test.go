@@ -3,12 +3,15 @@ package provider
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/fivetime/kubezun/pkg/zun"
 )
 
 func newTestProvider(t *testing.T, namespaces ...string) *Provider {
@@ -117,5 +120,82 @@ func TestNotifyFiresOnlyWhenStatusChanges(t *testing.T) {
 	})
 	if calls != 1 {
 		t.Errorf("changed status notified %d times, want 1", calls)
+	}
+}
+
+// The node controller keys work by namespace/name, so a pod deleted and
+// recreated under the same name — every StatefulSet restart — can reach the
+// provider as an update rather than a create. Ignoring it would leave the new
+// pod Pending forever with no capsule and nothing to explain it.
+func TestUpdatePodCreatesCapsuleForARecreatedPod(t *testing.T) {
+	p := newTestProvider(t, "111111-default")
+
+	old := testPod("111111-default", "web")
+	old.UID = "uid-old"
+	p.trackPod(old, corev1.PodRunning, "Running")
+
+	replacement := testPod("111111-default", "web")
+	replacement.UID = "uid-new"
+
+	// CreatePod talks to Zun, so the call fails here; what matters is that the
+	// update was routed to it rather than silently dropped.
+	err := p.UpdatePod(t.Context(), replacement)
+	if err == nil {
+		t.Fatal("expected UpdatePod to attempt a create for the recreated pod")
+	}
+
+	// The same pod must still be a no-op, or every status change would recreate
+	// the capsule and restart the workload.
+	same := old.DeepCopy()
+	if err := p.UpdatePod(t.Context(), same); err != nil {
+		t.Fatalf("update of an unchanged pod should be a no-op, got %v", err)
+	}
+}
+
+// A pod on its way out must not get a capsule: nothing would ever delete it.
+func TestUpdatePodIgnoresTerminatingPods(t *testing.T) {
+	p := newTestProvider(t, "111111-default")
+	pod := testPod("111111-default", "web")
+	pod.UID = "uid-new"
+	now := metav1.NewTime(time.Now())
+	pod.DeletionTimestamp = &now
+
+	if err := p.UpdatePod(t.Context(), pod); err != nil {
+		t.Fatalf("terminating pod should be ignored, got %v", err)
+	}
+}
+
+// A deleted pod's record is kept only to report its terminal status. The node
+// controller asks GetPod before deciding whether a pod needs creating, and it
+// compares specs — which are identical for a pod recreated under the same name.
+// Answering with the dead pod makes it conclude there is nothing to do, and the
+// new pod never gets a capsule. StatefulSets reuse names on every restart.
+func TestGetPodHidesADeletedPodFromItsReplacement(t *testing.T) {
+	p := newTestProvider(t, "111111-default")
+	pod := testPod("111111-default", "web")
+	pod.UID = "uid-old"
+	p.trackPod(pod, corev1.PodRunning, "Running")
+
+	// Zun is unreachable in tests, so the capsule delete fails; record the
+	// deletion the way DeletePod does once it succeeds.
+	p.mu.Lock()
+	p.deleted[zun.PodKey("111111-default", "web")] = pod.UID
+	p.mu.Unlock()
+
+	if _, err := p.GetPod(t.Context(), "111111-default", "web"); !errdefs.IsNotFound(err) {
+		t.Fatalf("GetPod returned a deleted pod: err=%v", err)
+	}
+
+	// Once a replacement is tracked, it is a live pod again.
+	replacement := testPod("111111-default", "web")
+	replacement.UID = "uid-new"
+	p.trackPod(replacement, corev1.PodPending, "Creating")
+
+	got, err := p.GetPod(t.Context(), "111111-default", "web")
+	if err != nil {
+		t.Fatalf("GetPod on the replacement: %v", err)
+	}
+	if got.UID != "uid-new" {
+		t.Errorf("GetPod returned UID %q, want uid-new", got.UID)
 	}
 }

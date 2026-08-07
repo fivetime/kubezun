@@ -48,6 +48,7 @@ func capsuleFor(namespace, name, uid string, age time.Duration) *zun.Capsule {
 			zun.LabelNamespace: namespace,
 			zun.LabelPodName:   name,
 			zun.LabelPodUID:    uid,
+			zun.LabelNodeName:  "111111-node-az1",
 		},
 	}
 }
@@ -139,4 +140,34 @@ func TestOrphanSweepDoesNothingWithoutAPodCache(t *testing.T) {
 	p := newTestProvider(t, "111111-default")
 	p.podLister = nil
 	p.sweepOrphans(t.Context())
+}
+
+// A tenant needing more than one architecture runs more than one virtual node
+// in the same namespace. Each node's pod informer is filtered to its own node,
+// so the pods behind a sibling's capsules are invisible here — and without the
+// node label every one of them would be deleted while running.
+func TestOrphanSweepSparesAnotherNodesCapsules(t *testing.T) {
+	p := newTestProvider(t, "111111-default")
+	p.podLister = listerWith(t) // this node sees none of the sibling's pods
+
+	sibling := capsuleFor("111111-default", "web", "uid-1", time.Hour)
+	sibling.LabelsField[zun.LabelNodeName] = "111111-node-arm64"
+
+	if got := p.orphansAmong(t.Context(), "111111-default/web", []*zun.Capsule{sibling}); len(got) != 0 {
+		t.Fatalf("deleted another node's running capsule: %v", names(got))
+	}
+}
+
+// A capsule from before the label cannot be attributed to any node. Deleting it
+// risks another node's workload, so it is kept and reported instead.
+func TestOrphanSweepSparesUnlabelledCapsules(t *testing.T) {
+	p := newTestProvider(t, "111111-default")
+	p.podLister = listerWith(t)
+
+	old := capsuleFor("111111-default", "web", "uid-1", time.Hour)
+	delete(old.LabelsField, zun.LabelNodeName)
+
+	if got := p.orphansAmong(t.Context(), "111111-default/web", []*zun.Capsule{old}); len(got) != 0 {
+		t.Fatalf("deleted a capsule of unknown ownership: %v", names(got))
+	}
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 
@@ -36,6 +37,10 @@ type Config struct {
 	// AvailabilityZone maps this node's topology zone onto Zun.
 	AvailabilityZone string
 
+	// Architecture is the machine this node's capsules run on, matching the
+	// node's kubernetes.io/arch label.
+	Architecture string
+
 	// NodeName is the name this provider's node registered under.
 	NodeName string
 }
@@ -52,6 +57,12 @@ type Provider struct {
 
 	mu   sync.RWMutex
 	pods map[string]*corev1.Pod // key: namespace/name
+	// deleted holds pods kept only so their terminal status can be reported.
+	// The node controller refuses to remove a pod object whose status still
+	// says running, so the record has to outlive the capsule — but it must not
+	// be presented as a live pod, or a pod recreated under the same name would
+	// be mistaken for it. Values are the deleted pod's UID.
+	deleted map[string]types.UID
 
 	notify func(*corev1.Pod)
 }
@@ -72,6 +83,7 @@ func New(cfg Config, client *zun.Client, podLister corev1listers.PodLister) (*Pr
 		podLister:  podLister,
 		capsules:   zun.NewCapsuleAPI(client),
 		pods:       make(map[string]*corev1.Pod),
+		deleted:    make(map[string]types.UID),
 		notify:     func(*corev1.Pod) {},
 	}, nil
 }
@@ -112,6 +124,8 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 	tpl, err := zun.BuildTemplate(pod, zun.TemplateOptions{
 		NetworkID:        p.cfg.NetworkID,
 		AvailabilityZone: p.cfg.AvailabilityZone,
+		Architecture:     p.cfg.Architecture,
+		NodeName:         p.cfg.NodeName,
 	})
 	if err != nil {
 		return err
@@ -126,16 +140,39 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 	return nil
 }
 
-// UpdatePod is a no-op: a capsule's spec cannot be changed in place, and
-// recreating it here would drop the pod's IP and restart every container
-// behind the caller's back.
+// UpdatePod is a no-op for a pod that already has its capsule: a capsule's spec
+// cannot be changed in place, and recreating it here would drop the pod's IP
+// and restart every container behind the caller's back.
+//
+// It is not a no-op when the pod is a different pod that reused a name. The
+// node controller keys its work by namespace/name, so when a pod is deleted and
+// one of the same name is created before the deletion is processed — routine
+// for a StatefulSet, whose pod names are stable across restarts — the new pod
+// arrives here as an update. Treating that as nothing to do would leave it
+// Pending forever with no capsule and no error to explain it.
 func (p *Provider) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
 	if err := p.authorize(pod.Namespace); err != nil {
 		return err
 	}
-	log.G(ctx).WithField("pod", zun.PodKey(pod.Namespace, pod.Name)).
-		Debug("ignoring pod update: capsules are immutable")
-	return nil
+	key := zun.PodKey(pod.Namespace, pod.Name)
+
+	p.mu.RLock()
+	tracked, known := p.pods[key]
+	p.mu.RUnlock()
+
+	if known && tracked.UID == pod.UID {
+		log.G(ctx).WithField("pod", key).
+			Debug("ignoring pod update: capsules are immutable")
+		return nil
+	}
+	if pod.DeletionTimestamp != nil {
+		// On its way out; creating a capsule now would leave one behind.
+		return nil
+	}
+
+	log.G(ctx).WithField("pod", key).WithField("uid", pod.UID).
+		Info("pod reused a name this node was still tracking; creating its capsule")
+	return p.CreatePod(ctx, pod)
 }
 
 // DeletePod removes the capsule backing a pod. It does not wait for the
@@ -189,6 +226,7 @@ func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) (err error) {
 		}
 	}
 	p.pods[key] = terminated
+	p.deleted[key] = terminated.UID
 	notify := p.notify
 	p.mu.Unlock()
 
@@ -201,10 +239,21 @@ func (p *Provider) GetPod(ctx context.Context, namespace, name string) (*corev1.
 	if err := p.authorize(namespace); err != nil {
 		return nil, err
 	}
+	key := zun.PodKey(namespace, name)
+
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	pod, ok := p.pods[zun.PodKey(namespace, name)]
+	pod, ok := p.pods[key]
 	if !ok {
+		return nil, errdefs.NotFoundf("pod %s/%s is not running on this node", namespace, name)
+	}
+	if uid, gone := p.deleted[key]; gone && uid == pod.UID {
+		// Kept only to report its terminal status. Answering with it would let
+		// the node controller compare a pod recreated under this name against
+		// the dead one — and their specs match, so it would conclude there is
+		// nothing to do and the new pod would never get a capsule. A
+		// StatefulSet reuses pod names on every restart, so this is the normal
+		// case, not a corner one.
 		return nil, errdefs.NotFoundf("pod %s/%s is not running on this node", namespace, name)
 	}
 	return pod.DeepCopy(), nil
@@ -264,8 +313,10 @@ func (p *Provider) trackPod(pod *corev1.Pod, phase corev1.PodPhase, reason strin
 			})
 	}
 
+	key := zun.PodKey(pod.Namespace, pod.Name)
 	p.mu.Lock()
-	p.pods[zun.PodKey(pod.Namespace, pod.Name)] = tracked
+	p.pods[key] = tracked
+	delete(p.deleted, key)
 	p.mu.Unlock()
 	p.notify(tracked)
 }

@@ -17,6 +17,13 @@ const (
 	LabelNamespace = "knaas.io/pod-namespace"
 	LabelPodName   = "knaas.io/pod-name"
 	LabelPodUID    = "knaas.io/pod-uid"
+	// LabelNodeName records which virtual node created the capsule. A tenant
+	// runs one node per architecture, so several providers share a namespace,
+	// and each one's pod informer is filtered to its own node — meaning a
+	// provider cannot see the pods behind another node's capsules. Without
+	// this label those capsules look like orphans and get deleted out from
+	// under a running workload.
+	LabelNodeName = "knaas.io/node-name"
 
 	ManagedByValue = "kubezun"
 )
@@ -191,6 +198,28 @@ type template struct {
 	Spec             spec     `json:"spec"`
 	Nets             []net    `json:"nets,omitempty"`
 	AvailabilityZone string   `json:"availabilityZone,omitempty"`
+	Architecture     string   `json:"architecture,omitempty"`
+}
+
+// knownArchitectures are the machines Zun can place a capsule on. The
+// Kubernetes spelling is what appears here and in the node's arch label; Zun
+// normalises it to the Linux one (arm64 -> aarch64) on the way to Placement.
+var knownArchitectures = map[string]struct{}{
+	"amd64": {}, "arm64": {}, "ppc64le": {}, "s390x": {}, "riscv64": {},
+}
+
+// ValidateArchitecture rejects an architecture Zun cannot place. Catching this
+// at startup matters: a node labelled with an architecture no host reports
+// still registers and still accepts pods, which then sit Pending with nothing
+// in their events pointing at the typo.
+func ValidateArchitecture(arch string) error {
+	if arch == "" {
+		return nil
+	}
+	if _, ok := knownArchitectures[arch]; !ok {
+		return fmt.Errorf("unknown architecture %q: want one of amd64, arm64, ppc64le, s390x, riscv64", arch)
+	}
+	return nil
 }
 
 // TemplateOptions carries the placement decisions the provider makes for a pod.
@@ -204,6 +233,14 @@ type TemplateOptions struct {
 	PortID string
 	// AvailabilityZone maps the virtual node's topology zone onto Zun.
 	AvailabilityZone string
+	// NodeName is the virtual node creating the capsule; it is stamped on the
+	// capsule so another node serving the same namespace can tell whose it is.
+	NodeName string
+	// Architecture is the machine this node's capsules must run on. A node
+	// serves one architecture: its kubernetes.io/arch label is what got the
+	// pod scheduled here, and the capsule has to land on a host that matches
+	// or the image will not execute.
+	Architecture string
 }
 
 // BuildTemplate converts a pod into a Zun capsule template.
@@ -226,6 +263,13 @@ func BuildTemplate(pod *corev1.Pod, opts TemplateOptions) ([]byte, error) {
 		},
 		Spec:             spec{RestartPolicy: restartPolicy(pod)},
 		AvailabilityZone: opts.AvailabilityZone,
+		Architecture:     opts.Architecture,
+	}
+	if opts.NodeName != "" {
+		// Written only when known: an empty value would claim ownership by a
+		// node with no name, and the orphan sweep reads an absent label as
+		// "ownership cannot be established" and leaves the capsule alone.
+		t.Metadata.Labels[LabelNodeName] = opts.NodeName
 	}
 
 	switch {

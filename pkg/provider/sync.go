@@ -62,12 +62,21 @@ func (p *Provider) syncOnce(ctx context.Context) error {
 	for _, pod := range tracked {
 		key := zun.PodKey(pod.Namespace, pod.Name)
 		cap, found := managed[key]
+		if found && cap.PodUID() != "" && cap.PodUID() != string(pod.UID) {
+			// A capsule left behind by an earlier pod of the same name. Reading
+			// its status onto this pod would report the dead pod's health, and
+			// its address as this pod's — sending traffic somewhere this pod
+			// never ran. The orphan sweep removes it; until then this pod has
+			// no capsule.
+			found = false
+		}
 		if !found {
 			// A pod already reported terminal has nothing left to reconcile;
 			// drop it so provider state does not grow with every deletion.
 			if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 				p.mu.Lock()
 				delete(p.pods, key)
+				delete(p.deleted, key)
 				p.mu.Unlock()
 				continue
 			}

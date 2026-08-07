@@ -75,6 +75,30 @@ func (p *Provider) orphansAmong(ctx context.Context, key string, capsules []*zun
 		return nil
 	}
 
+	// Capsules another virtual node created are not this one's to judge. Its
+	// pod informer is filtered to its own node, so it cannot see the pods
+	// behind them and every one would read as an orphan (DESIGN §4).
+	//
+	// A capsule carrying no node name predates the label. Leaving it alone
+	// leaks the tenant's quota; deleting it could destroy another node's
+	// running workload. Neither is free, so it is left to a human, logged once
+	// per sweep rather than silently.
+	var mine []*zun.Capsule
+	for _, c := range capsules {
+		switch c.NodeName() {
+		case p.cfg.NodeName:
+			mine = append(mine, c)
+		case "":
+			log.G(ctx).WithField("pod", key).WithField("capsule", c.Name()).
+				Info("orphan sweep left a capsule alone: it names no node, so " +
+					"whether it belongs to this node cannot be established")
+		}
+	}
+	capsules = mine
+	if len(capsules) == 0 {
+		return nil
+	}
+
 	podGone := false
 	var podUID string
 	pod, err := p.podLister.Pods(namespace).Get(name)

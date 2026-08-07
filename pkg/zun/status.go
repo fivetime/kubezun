@@ -133,9 +133,53 @@ func ContainerStatuses(pod *corev1.Pod, cap *Capsule) []corev1.ContainerStatus {
 			st.Ready = ContainerReady(c)
 			st.ContainerID = "zun://" + c.UUID
 		}
+		if w := st.State.Waiting; w != nil {
+			if reason, msg, failed := capsuleFailure(cap); failed {
+				// A capsule that never reached a host leaves its containers
+				// reporting Creating forever. kubectl prints a waiting
+				// container's reason in preference to the pod phase, so
+				// without this the pod reads as still starting when it has
+				// definitively failed — and the reason it failed, which Zun
+				// did report, never reaches the tenant.
+				w.Reason, w.Message = reason, msg
+			}
+		}
 		out = append(out, st)
 	}
 	return out
+}
+
+// capsuleFailure reports whether the capsule as a whole has failed in a way
+// its containers cannot show, and why.
+//
+// The case that matters is a capsule Placement refused: no host can satisfy
+// what it asked for — an architecture none of them run, an availability zone
+// with no capacity — so no container was ever created and each one is left in
+// whatever pre-start state it was born in.
+func capsuleFailure(cap *Capsule) (reason, message string, failed bool) {
+	switch cap.Status {
+	case "Error", "Dead":
+	case "Stopped":
+		if cap.Host != "" {
+			// It ran somewhere and then stopped; that is not a failure to
+			// place, and the containers' own states describe it.
+			return "", "", false
+		}
+	default:
+		return "", "", false
+	}
+	if cap.Host == "" {
+		return "CapsuleUnschedulable", capsuleReasonOr(cap,
+			"no compute host could satisfy this pod's placement requirements"), true
+	}
+	return "CapsuleFailed", capsuleReasonOr(cap, "the capsule failed"), true
+}
+
+func capsuleReasonOr(cap *Capsule, fallback string) string {
+	if cap.StatusReason != "" {
+		return cap.StatusReason
+	}
+	return fallback
 }
 
 // ContainerReady reports whether a container should receive traffic.

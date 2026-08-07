@@ -247,6 +247,10 @@ func (a *CapsuleAPI) ListManaged(ctx context.Context) (map[string]*Capsule, erro
 // behind by the old pod from the one backing the new one.
 func (c *Capsule) PodUID() string { return c.Labels()[LabelPodUID] }
 
+// NodeName returns the virtual node that created the capsule, or "" for a
+// capsule created before nodes stamped their name on one.
+func (c *Capsule) NodeName() string { return c.Labels()[LabelNodeName] }
+
 // translate maps OpenStack transport errors onto the kinds the node controller
 // understands; without this a capsule that is already gone reads as a hard
 // failure and its pod is retried forever.
