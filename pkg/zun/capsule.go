@@ -137,9 +137,11 @@ func (a *CapsuleAPI) Get(ctx context.Context, id string) (*Capsule, error) {
 	return &out, nil
 }
 
-// Delete removes a capsule.
+// Delete removes a capsule. force is required because Zun answers 409 for a
+// capsule that is not already stopped, which is every capsule backing a
+// running pod: without it the pod would hang in Terminating forever.
 func (a *CapsuleAPI) Delete(ctx context.Context, id string) error {
-	_, err := a.client.ServiceClient().Delete(ctx, a.url(id),
+	_, err := a.client.ServiceClient().Delete(ctx, a.url(id)+"?force=True",
 		&gophercloud.RequestOpts{OkCodes: []int{200, 202, 204}})
 	return translate(err)
 }

@@ -52,8 +52,17 @@ func (p *Provider) syncOnce(ctx context.Context) error {
 
 	now := metav1.NewTime(time.Now())
 	for _, pod := range tracked {
-		cap, found := managed[zun.PodKey(pod.Namespace, pod.Name)]
+		key := zun.PodKey(pod.Namespace, pod.Name)
+		cap, found := managed[key]
 		if !found {
+			// A pod already reported terminal has nothing left to reconcile;
+			// drop it so provider state does not grow with every deletion.
+			if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+				p.mu.Lock()
+				delete(p.pods, key)
+				p.mu.Unlock()
+				continue
+			}
 			// Zun records a capsule before it is readable by name, so a pod
 			// created moments ago is not yet evidence of a lost capsule;
 			// failing it here would make the ReplicaSet churn through pods.

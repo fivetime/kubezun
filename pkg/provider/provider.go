@@ -131,28 +131,46 @@ func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) (err error) {
 		return err
 	}
 
+	// The pod stays in provider state, marked terminated, rather than being
+	// dropped here: the node controller refuses to remove a pod object whose
+	// status still says running, so it has to observe the terminal status
+	// first. The sync loop drops the entry once the capsule is gone.
+	//
+	// The pod handed in is used when this provider has no record of it, which
+	// is the case for every pod already terminating when the process started:
+	// without this the deletion would never be reported and the pod would hang
+	// in Terminating forever.
 	now := metav1.NewTime(time.Now())
 	p.mu.Lock()
 	tracked, ok := p.pods[key]
-	if ok {
-		tracked.Status.Phase = corev1.PodSucceeded
-		tracked.Status.Reason = "CapsuleDeleted"
-		for i := range tracked.Status.ContainerStatuses {
-			tracked.Status.ContainerStatuses[i].Ready = false
-			tracked.Status.ContainerStatuses[i].State = corev1.ContainerState{
-				Terminated: &corev1.ContainerStateTerminated{
-					Reason:     "CapsuleDeleted",
-					FinishedAt: now,
-				},
-			}
+	if !ok {
+		tracked = pod
+	}
+	terminated := tracked.DeepCopy()
+	terminated.Status.Phase = corev1.PodSucceeded
+	terminated.Status.Reason = "CapsuleDeleted"
+	terminated.Status.Conditions = zun.PodConditions("Deleted", false, now)
+	if len(terminated.Status.ContainerStatuses) == 0 {
+		for _, c := range terminated.Spec.Containers {
+			terminated.Status.ContainerStatuses = append(
+				terminated.Status.ContainerStatuses,
+				corev1.ContainerStatus{Name: c.Name, Image: c.Image})
 		}
 	}
-	delete(p.pods, key)
+	for i := range terminated.Status.ContainerStatuses {
+		terminated.Status.ContainerStatuses[i].Ready = false
+		terminated.Status.ContainerStatuses[i].State = corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{
+				Reason:     "CapsuleDeleted",
+				FinishedAt: now,
+			},
+		}
+	}
+	p.pods[key] = terminated
+	notify := p.notify
 	p.mu.Unlock()
 
-	if ok {
-		p.notify(tracked)
-	}
+	notify(terminated)
 	return nil
 }
 
