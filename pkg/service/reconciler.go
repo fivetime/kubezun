@@ -57,6 +57,9 @@ type Reconciler struct {
 	// the pod subnet: an address on the pod subnet makes east-west traffic
 	// arrive with the wrong destination MAC.
 	VIPSubnetID string
+	// VIPNetworkID is the network that subnet belongs to, needed to create the
+	// address port.
+	VIPNetworkID string
 
 	// Tenant scopes the names of the objects created, so several tenants
 	// sharing one OpenStack can tell theirs apart, and so a garbage collector
@@ -120,6 +123,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, namespace, name string) erro
 	if err != nil {
 		return err
 	}
+	portID := lb.VipPortID
 
 	slices, err := r.slicesFor(svc)
 	if err != nil {
@@ -133,43 +137,27 @@ func (r *Reconciler) Reconcile(ctx context.Context, namespace, name string) erro
 
 	address := lb.VipAddress
 	if wantsPublicAddress(svc, r.PublicByDefault) {
-		if r.Neutron == nil {
-			return fmt.Errorf("service %s/%s asks for a public address but this "+
-				"node has no network client to allocate one", svc.Namespace, svc.Name)
-		}
-		if lb.VipPortID == "" {
-			return fmt.Errorf(
-				"service %s/%s asks for a public address, but its load balancer "+
-					"reports no address port to attach one to",
-				svc.Namespace, svc.Name)
-		}
 		network := r.FloatingNetworkID
 		if v := svc.Annotations[FloatingNetworkAnnotation]; v != "" {
 			network = v
 		}
-		public, err := ensureFloatingIP(ctx, r.Neutron, lb.VipPortID, network)
+		public, err := ensureFloatingIP(ctx, r.Neutron, portID, network)
 		if err != nil {
 			return err
 		}
 		address = public
-	} else if r.Neutron != nil {
+	} else {
 		// Asked for one before and does not now: give it back rather than
 		// leave it allocated and charged for.
-		if err := releaseFloatingIP(ctx, r.Neutron, lb.VipPortID); err != nil {
+		if err := releaseFloatingIP(ctx, r.Neutron, portID); err != nil {
 			return err
 		}
 	}
-	// Named after the address is settled, so the record never points at one the
-	// Service has stopped using. Neutron publishes the record and withdraws it
-	// with the port, which is why nothing here writes one itself.
-	//
-	// This depends on the load balancer's address having a Neutron port, which
-	// is not true of every provider: the OVN provider in the lab records a port
-	// id that Neutron does not have, because the address lives in northbound
-	// rules rather than on a port. Where there is no port there is no record,
-	// and saying so once is better than a Service that silently has no name.
-	if r.ClusterDomain != "" && r.Neutron != nil {
-		if err := ensurePortDNS(ctx, r.Neutron, lb.VipPortID, svc.Name,
+	// The name was set when the port was created, so the record exists as soon
+	// as the address does. This keeps it right if the domain configuration
+	// changes under an existing Service.
+	if r.ClusterDomain != "" {
+		if err := ensurePortDNS(ctx, r.Neutron, portID, svc.Name,
 			ServiceDomain(svc.Namespace, r.ClusterDomain)); err != nil {
 			log.G(ctx).WithError(err).WithField("service", svc.Namespace+"/"+svc.Name).
 				Warn("could not give this Service a name; it is reachable only at its address")
@@ -186,9 +174,26 @@ func (r *Reconciler) ensureLoadBalancer(ctx context.Context, svc *corev1.Service
 	if id := svc.Annotations[lbIDAnnotation]; id != "" {
 		lb, err := GetLoadBalancerByID(ctx, r.Octavia, id)
 		if err == nil {
-			return WaitActive(ctx, r.Octavia, lb.ID)
-		}
-		if err != ErrNotFound {
+			lb, err = WaitActive(ctx, r.Octavia, lb.ID)
+			if err != nil {
+				return nil, err
+			}
+			if r.addressPortMissing(ctx, lb) {
+				// The provider deletes its address port when a create fails and
+				// leaves the load balancer pointing at an id that no longer
+				// resolves. Such a load balancer cannot be named or given a
+				// public address, and nothing repairs it in place, so it is
+				// replaced rather than carried forward.
+				log.G(ctx).WithField("service", svc.Namespace+"/"+svc.Name).
+					WithField("loadbalancer", lb.ID).
+					Warn("load balancer has no address port; rebuilding it")
+				if err := DeleteLoadBalancer(ctx, r.Octavia, lb.ID); err != nil {
+					return nil, err
+				}
+			} else {
+				return lb, nil
+			}
+		} else if err != ErrNotFound {
 			return nil, fmt.Errorf("reading load balancer %s: %w", id, err)
 		}
 		// Deleted behind our back; fall through and make another.
@@ -226,6 +231,21 @@ func (r *Reconciler) ensureLoadBalancer(ctx context.Context, svc *corev1.Service
 // recordLoadBalancerID writes the id onto the Service. Done immediately after
 // creation: if this process dies before it, the next pass finds the load
 // balancer by name, and the annotation only has to survive a rename.
+// addressPortMissing reports whether the load balancer's address port is gone.
+//
+// It happens when a create fails: the provider removes the port it made and the
+// load balancer keeps the id. The load balancer still carries traffic, so
+// nothing else notices, but there is no port to hang a name or a public address
+// on — measured in the lab on three load balancers at once.
+func (r *Reconciler) addressPortMissing(ctx context.Context, lb *loadbalancers.LoadBalancer) bool {
+	if r.Neutron == nil || lb.VipPortID == "" {
+		return false
+	}
+	var body struct{}
+	_, err := r.Neutron.Get(ctx, r.Neutron.ServiceURL("ports", lb.VipPortID), &body, nil)
+	return gophercloud.ResponseCodeIs(err, 404)
+}
+
 func (r *Reconciler) recordLoadBalancerID(ctx context.Context, svc *corev1.Service, id string) error {
 	if svc.Annotations[lbIDAnnotation] == id {
 		return nil
@@ -390,7 +410,7 @@ func (r *Reconciler) deleteByName(ctx context.Context, namespace, name string) e
 	if err != nil {
 		return err
 	}
-	return r.tearDown(ctx, namespace+"/"+name, lb.ID)
+	return r.tearDown(ctx, namespace, name, lb.ID)
 }
 
 func (r *Reconciler) deleteLoadBalancer(ctx context.Context, svc *corev1.Service) error {
@@ -405,10 +425,11 @@ func (r *Reconciler) deleteLoadBalancer(ctx context.Context, svc *corev1.Service
 		}
 		id = lb.ID
 	}
-	return r.tearDown(ctx, svc.Namespace+"/"+svc.Name, id)
+	return r.tearDown(ctx, svc.Namespace, svc.Name, id)
 }
 
-func (r *Reconciler) tearDown(ctx context.Context, service, id string) error {
+func (r *Reconciler) tearDown(ctx context.Context, namespace, name, id string) error {
+	service := namespace + "/" + name
 	// The public address goes back first, while it can still be found by the
 	// port it is attached to. Deleting the load balancer takes that port with
 	// it, and Neutron leaves the address allocated to the project — still
@@ -432,5 +453,7 @@ func (r *Reconciler) tearDown(ctx context.Context, service, id string) error {
 
 	log.G(ctx).WithField("service", service).
 		WithField("loadbalancer", id).Info("deleting load balancer")
+	// Cascade takes the listeners, pools and the address port with it, and the
+	// DNS record goes with the port.
 	return DeleteLoadBalancer(ctx, r.Octavia, id)
 }

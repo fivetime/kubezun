@@ -50,6 +50,7 @@ type options struct {
 	tlsKey        string
 	clientCA      string
 	vipSubnet     string
+	vipNetwork    string
 	floatingNet   string
 	clusterDomain string
 	publicSvcs    bool
@@ -87,6 +88,8 @@ func main() {
 		"node memory capacity; mirror the tenant's quota")
 	flag.StringVar(&o.capacityPod, "capacity-pods", envOr("KUBEZUN_CAPACITY_PODS", "0"),
 		"maximum pods; mirror the tenant's quota")
+	flag.StringVar(&o.vipNetwork, "vip-network-id", os.Getenv("KUBEZUN_VIP_NETWORK_ID"),
+		"network the VIP subnet belongs to; the Service address port is created on it")
 	flag.StringVar(&o.vipSubnet, "vip-subnet-id", os.Getenv("KUBEZUN_VIP_SUBNET_ID"),
 		"subnet a Service's load balancer address comes from. Not the pod subnet: "+
 			"an address there makes east-west traffic arrive with the wrong "+
@@ -257,6 +260,7 @@ func run(o options) error {
 			Slices:            set.EndpointSliceInformer().Lister(),
 			ServiceClient:     client.CoreV1(),
 			VIPSubnetID:       o.vipSubnet,
+			VIPNetworkID:      o.vipNetwork,
 			FloatingNetworkID: o.floatingNet,
 			PublicByDefault:   o.publicSvcs,
 			ClusterDomain:     o.clusterDomain,
