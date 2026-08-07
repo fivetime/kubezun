@@ -119,34 +119,41 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 
 ## 阶段 1：MVP 单租户（§11 P0/P1，§12）
 
-### P0 骨架
+### P0 骨架 ✅ 全完（2026-08-07，分支 `feat/rewrite-provider`，2 commit）
 
-- [ ] go.mod 重建：Go/k8s.io 版本对齐 kubezoo（1.36 族），VK 取上游 master；删除
-      node-cli 依赖（现 go.mod:3 go1.12 + main.go 已归档 node-cli）（§1.1/§11）
-- [ ] main.go 重写：nodeutil.NewNode 骨架，NodeOpt 里设标签/污点全集（§3.1）
-- [ ] provider 骨架：实现 nodeutil.Provider 接口；旧 zun.go 仅保留状态映射函数迁移
-- [ ] ⚠️ provider **namespace 白名单**：所有入口（CreatePod/GetPod/GetPodStatus/
-      GetContainerLogs/…）先校验 pod.Namespace，非本租户返回 errdefs.NotFound——
-      这是唯一不可绕过的授权边界，不是兜底（§4.1）
-- [ ] provider 入口 defer recover；修 Limits nil-map panic（zun.go:202-203/236 区域，
-      types.go:70 map 未初始化）（§5）
-- [ ] 凭据层：application credential 加载（照抄 (kubetron) pkg/neutron/provider.go
-      `NewClientFromAppCred` 模式）；废弃 AuthOptionsFromEnv（zun.go:41-75）；
-      删 config.go:20-56 loadConfig 死代码。⚠️ **严禁 admin 凭据**（§2 凭据纪律）
+- [x] go.mod 重建：go 1.26 + k8s.io/* v0.36.3（对齐 kubezoo）+ VK v1.13.0 +
+      gophercloud/v2 v2.13.0；删除 node-cli。踩坑：pbr 式旧代码需移出构建
+      （`legacy/*.go.txt`）、client-go/apiserver 要与 api 同版本、genproto 老版本
+      造成 ambiguous import 需升级
+- [x] main.go 重写：nodeutil.NewNode + 每租户配置（namespaces/tenant/zone/
+      network-id/capacity/internal-ip），节点对象在 `pkg/node/node.go`：
+      well-known 三件套 + pool label + zone + role + instance-type +
+      `knaas.io/tenant` 污点 + kubelet 端点 + semver 版本串
+- [x] provider 骨架 `pkg/provider/provider.go`：实现 nodeutil.Provider 全部方法；
+      未实现能力（logs/exec/attach/port-forward/stats/metrics）返回指明原因的错误
+- [x] ⚠️ **namespace 白名单**：7 个入口全覆盖，返回 NotFound（与"存在但为空"
+      不可区分，防租户探测）；**已有测试逐入口验证**
+- [x] defer recover（CreatePod/DeletePod）+ 资源转换不再依赖未初始化 map
+      （测试 `TestBuildTemplateSurvivesPodWithoutResources` 守卫）
+- [x] 凭据层 `pkg/zun/client.go`：**只接受 application credential**（缺少
+      OS_APPLICATION_CREDENTIAL_SECRET 直接拒绝启动），废弃密码/admin 路径
 
 ### P1 主链路
 
-- [ ] Pod→capsule 转换重写：capsule 名用 pod UID（弃 "ns-name"，zun.go:80,149）（§5）
-- [ ] nets 显式传租户网络（按 PoC 结论实现；现在丢弃网络参数由 Zun 自动选，
-      (Zun) capsules.py:221-223）
-- [ ] 资源映射：K8s **limits**（非 requests）→ Zun（§5）
-- [ ] ⚠️ 不可支持字段 errdefs 显式拒绝（hostNetwork/hostPath/privileged/projected volume），
-      不静默丢弃（现 zun.go:206-210 静默 TODO）（§5）
-- [ ] **podIP 回填 capsule OVN IP**（podIP==OVN IP 不变式——kubetron Service/DNS 零改动
-      复用的前提）（§5/§7）
-- [ ] Ready 判定 = capsule Running ∧ Neutron port ACTIVE（现只看 Running，zun.go:359）（§5）
-- [ ] NotifyPods 异步状态推送（(VK) podcontroller.go:79-90）；无它则库回退全量轮询（§5）
-- [ ] DeletePod 异步化（去掉 300×1s 阻塞，zun.go:419-445）（§5）
+- [x] Pod→capsule 转换重写（`pkg/zun/template.go`）：capsule 名 = `kubezun-<podUID>`
+      （测试守卫跨 namespace 不碰撞）
+- [x] nets 显式传租户网络（`TemplateOptions.NetworkID`；`PortID` 优先，为保 IP 铺路）
+- [x] 资源映射：K8s **limits** → Zun（测试 `...MapsLimitsNotRequests` 守卫）
+- [x] ⚠️ 不可支持字段显式拒绝（hostNetwork/hostPID/hostIPC/hostPath/projected/
+      privileged/**探针**），错误信息点名字段与原因；测试逐项覆盖
+- [x] **podIP 回填 capsule OVN IP**（`sync.go`，同时填 PodIPs/HostIP）
+- [x] Ready 判定 = capsule Running ∧ 有地址（`zun.PodConditions(status, ready, t)`，
+      未就绪时 Reason=NetworkNotReady）
+- [x] NotifyPods 异步状态推送（`provider.NotifyPods` + 5s `syncLoop`）；
+      **状态指纹去抖**——稳态零通知（测试守卫）
+- [x] DeletePod 异步化（不等 capsule 消失，终态由状态轮询回报）
+- [ ] 状态映射三处修复的**单元测试**（Stopped→Terminated / exit code≠0 / startTime）
+      —— 代码已修，测试待补
 - [ ] 节点真实上报：capacity 镜像 ResourceQuota（⚠️ kaaas §2.3 教训：静态容量把失败位移到
       ContainerCreating；弃硬编码 zun.go:66-68,539-545）；conditions 真实化（弃静态恒 Ready
       + OutOfDisk，zun.go:255-299）；InternalIP=VK 实例 IP（现 nil，zun.go:303-305）（§3）

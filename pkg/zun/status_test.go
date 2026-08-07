@@ -1,0 +1,107 @@
+package zun
+
+import (
+	"testing"
+	"time"
+
+	"github.com/gophercloud/gophercloud/v2/openstack/container/v1/capsules"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+func TestStoppedContainerIsTerminatedNotRunning(t *testing.T) {
+	// Reporting a stopped container as Running leaves a Job forever
+	// incomplete and hides a crash from a Deployment.
+	st := ContainerState(&capsules.Container{Status: "Stopped"})
+	if st.Running != nil {
+		t.Fatal("a stopped container was reported as running")
+	}
+	if st.Terminated == nil {
+		t.Fatal("a stopped container has no terminated state")
+	}
+	if st.Terminated.ExitCode != 0 {
+		t.Errorf("clean exit code = %d, want 0", st.Terminated.ExitCode)
+	}
+}
+
+func TestFailedContainerDoesNotReportSuccess(t *testing.T) {
+	// Exit code 0 is what every caller reads as success, so a failed
+	// container must not report it.
+	for _, status := range []string{"Error", "Dead"} {
+		st := ContainerState(&capsules.Container{Status: status})
+		if st.Terminated == nil {
+			t.Fatalf("%s: no terminated state", status)
+		}
+		if st.Terminated.ExitCode == 0 {
+			t.Errorf("%s reported exit code 0, which reads as success", status)
+		}
+	}
+}
+
+func TestStartTimeIsPreserved(t *testing.T) {
+	started := time.Date(2026, 8, 7, 10, 0, 0, 0, time.UTC)
+	st := ContainerState(&capsules.Container{Status: "Running", StartedAt: started})
+	if st.Running == nil {
+		t.Fatal("running container has no running state")
+	}
+	if !st.Running.StartedAt.Time.Equal(started) {
+		t.Errorf("startedAt = %v, want %v", st.Running.StartedAt, started)
+	}
+}
+
+func TestReadyRequiresTheDataPlane(t *testing.T) {
+	// A capsule whose port has no address is running but unreachable;
+	// reporting Ready would put it behind a Service and black-hole traffic.
+	now := metav1.NewTime(time.Now())
+	notReady := conditionByType(PodConditions("Running", false, now), corev1.PodReady)
+	if notReady.Status != corev1.ConditionFalse {
+		t.Errorf("running capsule without an address is Ready=%v", notReady.Status)
+	}
+	if notReady.Reason == "" {
+		t.Error("not-ready condition gives no reason")
+	}
+	ready := conditionByType(PodConditions("Running", true, now), corev1.PodReady)
+	if ready.Status != corev1.ConditionTrue {
+		t.Errorf("running capsule with an address is Ready=%v", ready.Status)
+	}
+}
+
+func TestPodPhaseMapping(t *testing.T) {
+	cases := map[string]corev1.PodPhase{
+		"Running":  corev1.PodRunning,
+		"Stopped":  corev1.PodSucceeded,
+		"Error":    corev1.PodFailed,
+		"Dead":     corev1.PodFailed,
+		"Creating": corev1.PodPending,
+		"Nonsense": corev1.PodUnknown,
+	}
+	for status, want := range cases {
+		if got := PodPhase(status); got != want {
+			t.Errorf("PodPhase(%q) = %v, want %v", status, got, want)
+		}
+	}
+}
+
+func TestPodIPPrefersIPv4Address(t *testing.T) {
+	cap := &capsules.Capsule{Addresses: map[string][]capsules.Address{
+		"net": {{Version: 4, Addr: "192.168.100.10", Port: "port-1"}},
+	}}
+	if got := PodIP(cap); got != "192.168.100.10" {
+		t.Errorf("PodIP = %q, want the capsule's tenant network address", got)
+	}
+	if ports := PortIDs(cap); len(ports) != 1 || ports[0] != "port-1" {
+		t.Errorf("PortIDs = %v, want [port-1]", ports)
+	}
+	if got := PodIP(&capsules.Capsule{}); got != "" {
+		t.Errorf("PodIP of an address-less capsule = %q, want empty", got)
+	}
+}
+
+func conditionByType(conds []corev1.PodCondition, t corev1.PodConditionType) corev1.PodCondition {
+	for _, c := range conds {
+		if c.Type == t {
+			return c
+		}
+	}
+	return corev1.PodCondition{}
+}
