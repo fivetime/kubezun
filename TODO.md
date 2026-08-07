@@ -447,9 +447,20 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
       先定②的安全模型再动手；kubetron 已解同一问题，实现可直接借鉴
 - [ ] （原）**ExecSync + liveness 重启**：stub 现成
       （(Zun) api_pb2_grpc.py:100-103），zun-compute 落实 capsule 内执行 + restart 语义
-- [ ] **（门槛，卡阶段 4 logs）logs**：CRI 补 log_directory/log_path
-      （cri/driver.py:89-94,181-192）+ 新增 GET /capsules/{id}/logs
-      （capsules.py:111-113 _custom_actions 为空）
+- [x] **logs 全链路打通（2026-08-07，zun fork `4432216e` + kubezun `b3a0210`）**：
+      sandbox 加 `log_directory`、container 加 `log_path`（此前运行时**直接丢弃**输出，
+      既无流可 attach 也无文件），新增 `GET /capsules/{id}/logs` 按 CRI 日志格式解析
+      （P/F 标记合并被运行时截断的长行），新增 `capsule:logs` policy。
+      新增 conf `cri_log_root`（默认 /var/log/zun/capsules，⚠️ 无自动清理）。
+      ⚠️ **踩到的关键坑**：`container.host` 为 None（只有 capsule 记录 host），
+      RPC 走共享 topic → **任意计算节点应答**，而只有真正跑 capsule 那台有文件 →
+      端点按节点数比例随机返回空。修为按 `capsule.host` 定向。
+      实测：修前 3 次里约 1 次有内容，修后 20/20 全对。
+      ⚠️ **第二个坑**：Zun 丢弃模板给的容器名、自己生成
+      （`capsule-<uuid>-phi-12`），按名字查必 404 → provider 改为**按位置**解析成
+      container uuid（与状态映射同一不变式）。
+      实测 `kubectl logs` / `--tail` / `--timestamps` 全部正确；
+      `-f` 明确拒绝（Zun 一次性返回全量，轮询会在每个边界重复行）
 - [ ] Barbican secret ref：sandbox 创建时服务端拉取挂 tmpfs，DB 只存引用（§8.1）
 - [ ] （P3）Manila/RWX：virtiofs 透传（参考 CPO pkg/csi/manila）（§8.2）
 - [ ] （候选）同 owner capsule 软反亲和——逻辑节点内物理 HA 兜底（§4）
