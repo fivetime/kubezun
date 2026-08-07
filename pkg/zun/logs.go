@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
@@ -85,4 +86,60 @@ func (a *CapsuleAPI) LogsForPod(ctx context.Context, podUID string, index int, o
 	}
 	opts.Container = capsule.Containers[index].UUID
 	return a.Logs(ctx, name, opts)
+}
+
+// ExecResult is what a command left behind.
+type ExecResult struct {
+	Output   string `json:"output"`
+	ExitCode int    `json:"exit_code"`
+}
+
+// Exec runs a command in one container of a capsule and waits for it.
+//
+// Zun runs it to completion and answers with everything at once, so there is
+// no stdin to write to and no output before the command ends. An interactive
+// session needs the runtime's streaming endpoint, which Zun does not expose.
+func (a *CapsuleAPI) Exec(ctx context.Context, podUID string, index int, cmd []string) (*ExecResult, error) {
+	if podUID == "" {
+		return nil, fmt.Errorf("a pod UID is required to find its capsule")
+	}
+	if len(cmd) == 0 {
+		return nil, fmt.Errorf("a command is required")
+	}
+	name := "kubezun-" + podUID
+
+	capsule, err := a.Get(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if index < 0 || index >= len(capsule.Containers) {
+		return nil, errdefs.NotFoundf(
+			"the capsule has %d containers, so there is none at position %d",
+			len(capsule.Containers), index)
+	}
+
+	q := url.Values{}
+	q.Set("container", capsule.Containers[index].UUID)
+	// Sent as one string: Zun splits it the way a shell would. Quoting each
+	// argument keeps a value with spaces in it a single argument.
+	q.Set("command", shellQuote(cmd))
+	q.Set("run", "True")
+
+	var out ExecResult
+	if _, err := a.client.ServiceClient().Post(ctx,
+		a.url(name, "execute")+"?"+q.Encode(), nil, &out,
+		&gophercloud.RequestOpts{OkCodes: []int{200}}); err != nil {
+		return nil, translate(err)
+	}
+	return &out, nil
+}
+
+// shellQuote joins a command into the single string Zun's endpoint takes,
+// quoting each argument so one containing a space stays one argument.
+func shellQuote(cmd []string) string {
+	quoted := make([]string, 0, len(cmd))
+	for _, arg := range cmd {
+		quoted = append(quoted, "'"+strings.ReplaceAll(arg, "'", `'"'"'`)+"'")
+	}
+	return strings.Join(quoted, " ")
 }

@@ -406,8 +406,44 @@ func (p *Provider) RunInContainer(ctx context.Context, namespace, podName, conta
 	if err := p.authorize(namespace); err != nil {
 		return err
 	}
-	return errNotImplemented(
-		"exec needs the capsule ExecSync endpoint, which this Zun build does not serve yet")
+	p.mu.RLock()
+	pod, tracked := p.pods[zun.PodKey(namespace, podName)]
+	p.mu.RUnlock()
+	if !tracked {
+		return errdefs.NotFoundf("pod %s/%s is not running on this node", namespace, podName)
+	}
+	if attach != nil && attach.TTY() {
+		// Zun runs the command to completion and answers with everything at
+		// once. There is no stream to attach a terminal to, and pretending
+		// otherwise would leave a caller waiting at a prompt that never reads.
+		return errNotImplemented(
+			"exec with a terminal needs a streaming endpoint Zun does not serve; " +
+				"run the command without -t")
+	}
+
+	index := containerIndex(pod, containerName)
+	if index < 0 {
+		return errdefs.NotFoundf(
+			"pod %s/%s has no container named %s", namespace, podName, containerName)
+	}
+
+	result, err := p.capsules.Exec(ctx, string(pod.UID), index, cmd)
+	if err != nil {
+		return err
+	}
+	if attach != nil {
+		if out := attach.Stdout(); out != nil {
+			if _, err := io.WriteString(out, result.Output); err != nil {
+				return err
+			}
+		}
+	}
+	if result.ExitCode != 0 {
+		// The caller has to see this: kubectl reports a command's exit status,
+		// and swallowing it would make a failed command look successful.
+		return fmt.Errorf("command terminated with exit code %d", result.ExitCode)
+	}
+	return nil
 }
 
 func (p *Provider) AttachToContainer(ctx context.Context, namespace, podName, containerName string, attach api.AttachIO) error {
