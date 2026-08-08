@@ -19,6 +19,7 @@ import (
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	discoveryv1listers "k8s.io/client-go/listers/discovery/v1"
+	"k8s.io/client-go/tools/record"
 )
 
 const (
@@ -33,12 +34,17 @@ const (
 
 	// AddressAnnotation carries the address a Service is actually reachable on.
 	//
-	// The status field would be the natural place, but the API server allows it
-	// only on a Service typed LoadBalancer, and here every Service has an
-	// address — the ClusterIP it was assigned is not reachable from a pod. So
-	// the annotation is where it always is, and the status is filled in as well
-	// when the type permits.
-	AddressAnnotation = "knaas.io/address"
+	// The gateway reads it and reports it as the Service's cluster address, so
+	// a tenant sees, and their resolver answers, the address that works — the
+	// one the API server assigned is from a range that does not exist on their
+	// network. The key is the gateway's rather than ours because nothing about
+	// it should assume a load balancer: another data plane would fill the same
+	// key.
+	//
+	// The status field would be the natural place and cannot be used: the API
+	// server allows it only on a Service typed LoadBalancer, and here every
+	// Service has an address.
+	AddressAnnotation = "kubezoo.io/cluster-ip"
 )
 
 // Reconciler turns a tenant's Services into Octavia load balancers.
@@ -65,6 +71,11 @@ type Reconciler struct {
 	// sharing one OpenStack can tell theirs apart, and so a garbage collector
 	// can recognise its own.
 	Tenant string
+
+	// Events records why a Service has no working address yet. Without one the
+	// gateway reports the address the API server assigned, which does not work,
+	// and a tenant has nowhere to look for the reason.
+	Events record.EventRecorder
 
 	// Neutron allocates the public addresses. Nil means none can be given.
 	Neutron *gophercloud.ServiceClient
@@ -213,6 +224,17 @@ func (r *Reconciler) ensureLoadBalancer(ctx context.Context, svc *corev1.Service
 		if err != nil {
 			return nil, fmt.Errorf("creating load balancer %q on subnet %s: %w",
 				name, r.VIPSubnetID, err)
+		}
+		// Published before waiting for the load balancer to finish
+		// provisioning. The address is settled the moment the create returns —
+		// a few seconds — while provisioning takes tens of them, and until it
+		// is published the gateway reports the address the API server
+		// assigned, which nothing on the tenant's network can reach. An
+		// application that resolves the name in that window may cache what it
+		// got for far longer than the window lasts.
+		if err := r.publishAddress(ctx, svc, lb.VipAddress); err != nil {
+			log.G(ctx).WithError(err).WithField("service", svc.Namespace+"/"+svc.Name).
+				Warn("could not publish the address yet; the gateway still reports the unreachable one")
 		}
 	default:
 		return nil, fmt.Errorf("looking up load balancer %q: %w", name, err)

@@ -277,6 +277,7 @@ func run(o options) error {
 			FloatingNetworkID: o.floatingNet,
 			PublicByDefault:   o.publicSvcs,
 			ClusterDomain:     o.clusterDomain,
+			Events:            set.EventRecorder("service-controller"),
 			Tenant:            o.tenant,
 		}, set.ServiceInformer(), set.EndpointSliceInformer())
 		if err != nil {

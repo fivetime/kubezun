@@ -129,6 +129,17 @@ func NewSet(opts SetOptions) (*Set, error) {
 	}, nil
 }
 
+// EventRecorder returns a recorder for a component sharing this set's
+// broadcaster, so events reach the API server through the same path the pod
+// controllers use.
+func (s *Set) EventRecorder(component string) record.EventRecorder {
+	if s.broadcaster == nil {
+		s.broadcaster = record.NewBroadcaster()
+	}
+	return s.broadcaster.NewRecorder(scheme.Scheme,
+		corev1.EventSource{Component: component})
+}
+
 // Pods is the shared pod lister, spanning every node in the process rather than
 // only one node's pods.
 func (s *Set) Pods() corev1listers.PodLister { return s.pods.Lister() }

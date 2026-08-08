@@ -123,6 +123,20 @@ func (c *Controller) processNext(ctx context.Context) {
 	}
 }
 
+// recordFailure puts the reason on the Service, where kubectl describe finds it.
+func (c *Controller) recordFailure(namespace, name string, cause error) {
+	r := c.reconciler
+	if r.Events == nil {
+		return
+	}
+	svc, err := r.Services.Services(namespace).Get(name)
+	if err != nil {
+		return
+	}
+	r.Events.Eventf(svc, corev1.EventTypeWarning, "AddressNotReady",
+		"the Service has no reachable address yet: %v", cause)
+}
+
 func (c *Controller) reconcile(ctx context.Context, key string) {
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
@@ -137,6 +151,10 @@ func (c *Controller) reconcile(ctx context.Context, key string) {
 		// with no further attempt.
 		log.G(ctx).WithError(err).WithField("service", key).
 			Warn("reconciling the load balancer failed; will retry")
+		// Recorded on the Service as well: until this succeeds the tenant is
+		// shown an address that does not work, and the reason is otherwise
+		// only in this process's log, which they cannot read.
+		c.recordFailure(namespace, name, err)
 		c.queue.AddRateLimited(key)
 		return
 	}
