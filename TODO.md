@@ -462,7 +462,8 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       2. **kubezun 没有服务 `111111-kube-system`**（`--namespaces` 是静态单值），
          所以不给 kube-dns 建 LB，注解不出现，kubezoo 只能报上游那个不可达地址
          → 见下面的 selector 改造
-      3. **CoreDNS 镜像是 distroless**（`registry.k8s.io/coredns/coredns:v1.13.1`，
+      3. ~~**CoreDNS 镜像是 distroless**~~ **✅ 已解决（2026-08-08）**：见下面的探针 helper。
+         原文保留备查：（`registry.k8s.io/coredns/coredns:v1.13.1`，
          实测 `/bin/sh` 直接 `CreateContainerError`），而它的 readinessProbe 是
          `httpGet :8181/ready`，我们改写成容器内执行 → 无可执行文件 → 永不 Ready
          → **永远不能成为 Octavia member** → 见下面的探针 helper
@@ -530,6 +531,33 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       **处置**：把三个老 LB 删掉重建，四个 LB 现在各自都有 provider 端口。
       ⚠️ 留给将来：LB 被非正常删除时，其地址会变成无主，下一个 LB 可能抢走——
       这是"删了重建"类 bug 的放大器，所以那类 bug 要当作数据面事故对待
+- [x] **✅ distroless 探针 helper（2026-08-08，kubezun `3749bc6`+`35bad6f`，
+      zun fork `e38751e9`+`4a6e6847`+`2471ed6c`）**。
+      **先排除了两条更省事的路**：
+      ① 学 kubelet 从节点发 HTTP 到 pod IP——实测三台计算节点，**根命名空间和任何 netns
+         都到不了 capsule 地址**（Kata 把地址搬进 guest，宿主 netns 只剩 tap），
+         所以 Zun 里"探针无法从别处到达容器"那句注释是对的，exec 躲不掉
+      ② 往每个 capsule 塞二进制——不必要，`_get_mounts` 本来就在建 host_path 挂载，
+         所以 helper 放宿主机 `/opt/kubezun/probe`、**只读挂进 `/.kubezun`** 即可：
+         每个 capsule 零负载，不动租户镜像
+      **实测通过**：`registry.k8s.io/coredns`（无 `/bin/sh`）+ `httpGet :8181/ready` → **1/1 Ready**
+      ⚠️ **过程中查出 Zun 一个死锁级 bug（`2471ed6c`）**：`_probe_due` 在 `started_at` 为空时
+      `return delay == 0`，于是 `initialDelaySeconds > 0` 的探针**永远不到期 → 永不执行 →
+      `_schedule_next` 永不写 `_next` → 永远不到期**。容器整个生命周期不就绪且日志里什么都没有
+      （不执行的探针无法失败）。而 `docs/tenant-guide.md` 恰恰**建议租户设 initialDelaySeconds**
+      （Kata 冷启动慢），所以它专打我们让人写的那种 pod。已改为回退到 `created_at`
+- [ ] **⚠️ CoreDNS 跑成 capsule 会反复建删（2026-08-08 未解决，已回滚保服务）**：
+      打上 `knaas.io/tenant` 后 CoreDNS 确实落到虚拟节点并**拿到租户网络地址**
+      （192.168.100.x），但 capsule 反复 `Creating → CapsuleDeleted`。
+      线索：kubezun 日志里 `pod ... not found in pod lister` + `deletePodsFromKubernetes`
+      被触发——即上游的 dangling 删除。`111111-default` 的 pod 正常，只有
+      `111111-kube-system` 的抖，怀疑与每节点 pod informer 的覆盖/同步有关。
+      **已回滚**（去标签 + CoreDNS 回集群节点），租户解析器恢复正常
+- [ ] **⚠️ arm64 虚拟节点没有硬件却照样上报容量（2026-08-08 发现）**：
+      CoreDNS 先被调度到 `111111-node-arm64`，全部 `CapsuleUnschedulable`（Placement 拒绝）。
+      这正是"节点上报的 capacity 是承诺不是库存"的实例——虚拟节点按配额镜像容量，
+      与该架构背后有没有主机无关。暂时用 `nodeSelector: kubernetes.io/arch=amd64` 绕开。
+      真修法待定：某架构无可用主机时该不该上报可调度容量
 - [ ] **Pod 失败原因用 K8s 词汇而不是后端词汇（2026-08-08 发现，小改）**：
       现在写的是 `CapsuleMissing` / `CapsuleStuckCreating`，租户没听说过 capsule。
       K8s 自己有：`ContainerStatusUnknown`（kubelet 判断不出容器结局时用的）、
