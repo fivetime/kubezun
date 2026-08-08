@@ -558,6 +558,24 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       这正是"节点上报的 capacity 是承诺不是库存"的实例——虚拟节点按配额镜像容量，
       与该架构背后有没有主机无关。暂时用 `nodeSelector: kubernetes.io/arch=amd64` 绕开。
       真修法待定：某架构无可用主机时该不该上报可调度容量
+- [ ] **⚠️ securityContext 大部分字段被静默丢弃（2026-08-08 发现）**：
+      Zun 的 CRI 驱动只传一个字段——`LinuxContainerSecurityContext(privileged=...)`
+      （`driver.py:262`），而我们的 `unsupported()` 也只拦 `privileged`。于是租户写的
+      这些**全部无声消失**：
+      | 租户写的 | capsule 里实际 |
+      |---|---|
+      | `runAsNonRoot` / `runAsUser` | 用镜像自带用户（镜像默认 root 就是 root） |
+      | `readOnlyRootFilesystem: true` | 根文件系统可写 |
+      | `capabilities.drop: [ALL]` | 没有丢弃 |
+      | `seccompProfile: RuntimeDefault` | 无 seccomp |
+      撞的正是 `template.go:38` 自己写下的原则（"静默丢弃比失败更糟：pod 会以更弱的
+      隔离运行"）。而 PodSecurity `restricted` **强制**租户写这些字段——等于我们要求
+      他们写、然后忽略。
+      缓解：capsule 是 Kata VM 且 `privileged` 恒 False，逃逸落在 guest 内核里而不是
+      宿主机。但"要求非 root 却以 root 运行"本身就是错的。
+      **两条路**：① fork 补齐 CRI 的 security_context 传递（run_as_user/readonly_rootfs/
+      capabilities/seccomp，CRI 都有对应字段）；② 暂时按 `unsupported()` 明确拒绝。
+      倾向 ①——②会让符合 PodSecurity restricted 的 pod 全部无法运行
 - [ ] **Pod 失败原因用 K8s 词汇而不是后端词汇（2026-08-08 发现，小改）**：
       现在写的是 `CapsuleMissing` / `CapsuleStuckCreating`，租户没听说过 capsule。
       K8s 自己有：`ContainerStatusUnknown`（kubelet 判断不出容器结局时用的）、
