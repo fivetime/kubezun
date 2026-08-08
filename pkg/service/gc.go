@@ -5,6 +5,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gophercloud/gophercloud/v2/openstack/loadbalancer/v2/loadbalancers"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/ports"
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
@@ -92,6 +94,56 @@ func (c *Controller) sweep(ctx context.Context) {
 		if err := r.tearDown(ctx, namespace, name, lb.ID); err != nil {
 			log.G(ctx).WithError(err).WithField("loadbalancer", lb.ID).
 				Warn("could not delete an orphaned load balancer")
+		}
+	}
+
+	c.sweepAddressPorts(ctx, all)
+}
+
+// sweepAddressPorts removes address ports whose load balancer is gone.
+//
+// They are left behind when this process dies between deleting a load balancer
+// and releasing its port — the port is deleted second on purpose, since Neutron
+// refuses while the address is in use. One costs an address on the tenant's
+// subnet and nothing reports it, because the Service it belonged to is gone
+// too.
+func (c *Controller) sweepAddressPorts(ctx context.Context, all []loadbalancers.LoadBalancer) {
+	r := c.reconciler
+	if r.Neutron == nil {
+		return
+	}
+
+	live := make(map[string]struct{}, len(all))
+	for _, lb := range all {
+		live[vipPortName(lb.Name)] = struct{}{}
+	}
+
+	prefix := "kubezun_" + r.Tenant + "_"
+	pages, err := ports.List(r.Neutron, ports.ListOpts{}).AllPages(ctx)
+	if err != nil {
+		log.G(ctx).WithError(err).Warn("address port sweep skipped: could not list ports")
+		return
+	}
+	found, err := ports.ExtractPorts(pages)
+	if err != nil {
+		log.G(ctx).WithError(err).Warn("address port sweep skipped: could not read ports")
+		return
+	}
+
+	for _, p := range found {
+		// Only this tenant's, and only the ones this package names. Anything
+		// else on the subnet belongs to somebody else.
+		if !strings.HasPrefix(p.Name, prefix) || !strings.HasSuffix(p.Name, "_vip") {
+			continue
+		}
+		if _, ok := live[p.Name]; ok {
+			continue
+		}
+		log.G(ctx).WithField("port", p.Name).
+			Info("releasing an address port whose load balancer is gone")
+		if err := ports.Delete(ctx, r.Neutron, p.ID).ExtractErr(); err != nil {
+			log.G(ctx).WithError(err).WithField("port", p.Name).
+				Warn("could not release it")
 		}
 	}
 }
