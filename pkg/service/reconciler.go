@@ -192,16 +192,20 @@ func (r *Reconciler) ensureLoadBalancer(ctx context.Context, svc *corev1.Service
 			// one and moving the tenant onto it.
 			//
 			// ⚠️ There was such a condition here: the address port was read
-			// from Neutron and a 404 taken to mean the provider had discarded
-			// it. Neutron answers 404 for a port in another project as well as
-			// for one that is absent, and the address port belongs to
-			// Octavia's project rather than the tenant's, so the check was
-			// true on every healthy load balancer. Every reconcile deleted all
-			// three of the lab's and rebuilt them, and each rebuild gave the
-			// tenant a new address — the fault reads as "the load balancer is
-			// broken" in the log while the load balancer is fine and it is
-			// this process breaking it. Nothing here holds a credential that
-			// can see that port, so nothing here can make that judgement.
+			// from Neutron and a 404 taken to mean the load balancer had been
+			// left broken by a failed create. It is not evidence of that. All
+			// three of the lab's load balancers are ACTIVE, operating ONLINE
+			// and carrying members, and the vip_port_id each one reports does
+			// not resolve even for an administrator — the port is there
+			// shortly after creation and gone later, while the load balancer
+			// goes on working, because the OVN provider carries the address in
+			// the data plane rather than on a port that has to persist.
+			//
+			// So the check was true on every healthy load balancer, and every
+			// reconcile deleted all three and built new ones, handing the
+			// tenant a different address each time. The log said the load
+			// balancer had no address port while this process was the only
+			// thing breaking anything.
 			return WaitActive(ctx, r.Octavia, lb.ID)
 		} else if err != ErrNotFound {
 			return nil, fmt.Errorf("reading load balancer %s: %w", id, err)
