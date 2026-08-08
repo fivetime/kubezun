@@ -109,13 +109,13 @@ func New(cfg Config, client *zun.Client, caches Caches) (*Provider, error) {
 		return nil, fmt.Errorf("a namespace check is required")
 	}
 	return &Provider{
-		cfg:        cfg,
-		podLister:  caches.Pods,
-		objects:    caches.Objects,
-		capsules:   zun.NewCapsuleAPI(client),
-		pods:       make(map[string]*corev1.Pod),
-		deleted:    make(map[string]types.UID),
-		notify:     func(*corev1.Pod) {},
+		cfg:       cfg,
+		podLister: caches.Pods,
+		objects:   caches.Objects,
+		capsules:  zun.NewCapsuleAPI(client),
+		pods:      make(map[string]*corev1.Pod),
+		deleted:   make(map[string]types.UID),
+		notify:    func(*corev1.Pod) {},
 	}, nil
 }
 
@@ -261,10 +261,16 @@ func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) (err error) {
 		terminated.Status.ContainerStatuses[i].Ready = false
 		terminated.Status.ContainerStatuses[i].State = corev1.ContainerState{
 			Terminated: &corev1.ContainerStateTerminated{
-				// The pod was deleted, so the containers were stopped without
-				// their own exit being observed. This is the word kubelet uses
-				// when it cannot report a container's outcome.
-				Reason:     "ContainerStatusUnknown",
+				// Deleted, which is what happened and what this code did.
+				//
+				// ⚠️ ContainerStatusUnknown was here, on the reasoning that the
+				// container's own exit was never observed. That is true and it
+				// is not what a reader needs: the outcome is not unknown, the
+				// thing was removed because its pod was going away, and saying
+				// "cannot be determined" hides a fact this process is certain
+				// of. Same mistake as reporting a paused container as unknown,
+				// made in a second place.
+				Reason:     "Deleted",
 				FinishedAt: now,
 			},
 		}
