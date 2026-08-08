@@ -11,6 +11,7 @@ informers and their credential.
 | `serving-cert.md` | Getting a certificate for the kubelet API |
 | `kyverno-tenant-policies.yaml` | Admission policies for a tenant's namespace |
 | `exclude-virtual-nodes.md` | Keeping cluster DaemonSets off virtual nodes |
+| `zun/` | How Zun itself is configured, on both kinds of host |
 
 ## Order
 

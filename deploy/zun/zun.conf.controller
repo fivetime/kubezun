@@ -1,0 +1,53 @@
+# zun-api and zun-conductor. Install as /etc/zun/zun.conf on the host that
+# serves the API. Placeholders as in zun.conf.compute.
+
+[DEFAULT]
+debug = True
+transport_url = <RABBIT URL>
+state_path = /opt/stack/data/zun
+
+capsule_driver = cri
+
+# ⚠️ Reads wrong and is harmless: this host runs no zun-compute, so no driver is
+# ever loaded here and the value is never used. It is worth knowing because the
+# CRI driver's source is present on this host too and is *not* what runs -- when
+# checking which code is live, check a compute node. Getting this backwards once
+# produced a confident report that the lab was behind master.
+container_driver = docker
+
+[api]
+host_ip = <THIS HOST'S ADDRESS>
+port = 9517
+api_paste_config = /etc/zun/api-paste.ini
+
+[database]
+connection = <DB URL>
+
+[keystone_authtoken]
+memcached_servers = localhost:11211
+cafile = <CA BUNDLE>
+www_authenticate_uri = <KEYSTONE URL>
+auth_url = <KEYSTONE URL>
+auth_version = v3
+auth_type = password
+interface = public
+project_domain_name = Default
+project_name = service
+user_domain_name = Default
+username = zun
+password = <ZUN SERVICE PASSWORD>
+
+[keystone_auth]
+auth_url = <KEYSTONE URL>
+auth_type = password
+project_domain_id = default
+project_name = service
+user_domain_id = default
+username = zun
+password = <ZUN SERVICE PASSWORD>
+
+[oslo_concurrency]
+lock_path = /opt/stack/data/zun
+
+[glance]
+images_directory = /opt/stack/data/zun/images

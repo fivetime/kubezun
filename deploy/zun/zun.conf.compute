@@ -1,0 +1,90 @@
+# zun-compute on a node that runs capsules. Install as /etc/zun/zun.conf.
+#
+# Every <PLACEHOLDER> is a secret or a site address; nothing here is a working
+# value. The settings that are not obvious carry the reason they are set, since
+# the reason is the part that gets lost.
+
+[DEFAULT]
+debug = True
+transport_url = <RABBIT URL>
+state_path = /var/lib/zun
+host = <THIS NODE'S NAME IN ZUN>
+my_ip = <THIS NODE'S ADDRESS>
+
+# Both drivers are the CRI one: this host runs capsules and nothing else. The
+# Container API's own paths are skipped on such a host, which is what lets it
+# exist without a Docker daemon (fork commits "Allow capsule-only compute nodes
+# via container_driver=cri" and "Skip Container API paths on a capsule-only
+# compute host").
+capsule_driver = cri
+container_driver = cri
+
+# The isolation the whole tier is sold on. Named handlers are configured in
+# containerd; kata-clh and kata-fc are the other two on these nodes.
+container_runtime = kata-qemu
+
+# ⚠️ Upstream defaults these to 512 MB and 1.0 CPU, applied to any container
+# that does not ask for something. A Kubernetes BestEffort pod asks for
+# nothing, so it would be capped at 512 MB and then be OOM-killed with nothing
+# on the Kubernetes side saying why -- the pod's own spec has no limit to point
+# at. Zero means no default is imposed, which is what BestEffort means.
+default_cpu = 0
+default_memory = 0
+default_disk = 0
+
+[database]
+connection = <DB URL>
+
+[keystone_auth]
+auth_url = <KEYSTONE URL>
+auth_type = password
+project_domain_id = default
+project_name = service
+user_domain_id = default
+username = zun
+password = <ZUN SERVICE PASSWORD>
+
+[keystone_authtoken]
+memcached_servers = <MEMCACHED>
+www_authenticate_uri = <KEYSTONE URL>
+auth_url = <KEYSTONE URL>
+auth_version = v3
+auth_type = password
+interface = public
+project_domain_name = Default
+project_name = service
+user_domain_name = Default
+username = zun
+password = <ZUN SERVICE PASSWORD>
+
+# ⚠️ Admin, and it has to be: Zun creates and binds the capsule's port itself,
+# inline with the sandbox (cri/driver.py). This is Zun's own credential and is
+# unrelated to the per-tenant application credential kubezun uses -- that one is
+# never admin, for the reason in DESIGN §4.
+[neutron]
+auth_url = <KEYSTONE URL>
+auth_type = password
+project_domain_name = Default
+project_name = admin
+user_domain_name = Default
+username = admin
+password = <ADMIN PASSWORD>
+region_name = RegionOne
+
+[glance]
+images_directory = /var/lib/zun/images
+
+[oslo_concurrency]
+lock_path = /var/lib/zun
+
+[cni_daemon]
+cni_daemon_host = 127.0.0.1
+cni_daemon_port = 9036
+zun_cni_config_file = /etc/cni/zun-net.d/10-zun-cni.conf
+
+# ⚠️ The default is tcp:127.0.0.1:6640, which nothing listens on when Open
+# vSwitch runs in a container -- the socket is the only way in. Getting this
+# wrong fails as "binding_failed" on the port with no mention of ovsdb, so it
+# reads as a Neutron problem. See os-vif's vif_plug_ovs/ovs.py.
+[os_vif_ovs]
+ovsdb_connection = unix:/run/openvswitch/db.sock
