@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 	discoveryv1informers "k8s.io/client-go/informers/discovery/v1"
 	networkingv1informers "k8s.io/client-go/informers/networking/v1"
@@ -105,7 +106,7 @@ func (c *Controller) enqueueSlice(obj any) {
 	if !c.serves(slice.Namespace) {
 		return
 	}
-	ings, err := c.reconciler.Ingresses.Ingresses(slice.Namespace).List(nil)
+	ings, err := c.reconciler.Ingresses.Ingresses(slice.Namespace).List(labels.Everything())
 	if err != nil {
 		return
 	}

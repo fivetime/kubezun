@@ -145,3 +145,7 @@ func backend(svc string, port int32) networkingv1.IngressBackend {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// List(nil) panics inside the lister — caught live on first deployment: every
+// EndpointSlice event crashed the process. The selector must always be
+// labels.Everything(); this pins the fan-out path with a real lister.
