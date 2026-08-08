@@ -1,5 +1,23 @@
 # Tenant DNS through Designate
 
+> ⚠️ **Not how this works any more, and kept for the four failure modes below
+> rather than for the approach.** A tenant resolves names through its own
+> CoreDNS, which reads Services through the gateway and answers with the address
+> in `kubezoo.io/cluster-ip`. Nothing is published to Designate or to Neutron.
+>
+> The reason is not effort. What this publishes is
+> `<svc>.<tid>-<namespace>.svc.cluster.local`, the platform's name for the
+> Service. A tenant's application asks for `<svc>.<namespace>.svc.cluster.local`,
+> because that is the namespace it can see, and **no global DNS namespace can
+> serve that name at all** — every tenant needs the same name to resolve to a
+> different address. A per-tenant resolver is not an optimisation here, it is
+> the only arrangement that can work.
+>
+> Still worth reading if authoritative DNS is ever needed for something else,
+> such as publishing a tenant's service under a public domain: the four silent
+> failures recorded below cost a day to find and none of them announce
+> themselves.
+
 A Service's usable address is its load balancer's, not the ClusterIP the API
 server assigned — a capsule has one interface, on the tenant's network, and the
 cluster's service range is not on it. Applications use names, so name

@@ -276,7 +276,6 @@ func run(o options) error {
 			VIPNetworkID:      o.vipNetwork,
 			FloatingNetworkID: o.floatingNet,
 			PublicByDefault:   o.publicSvcs,
-			ClusterDomain:     o.clusterDomain,
 			Events:            set.EventRecorder("service-controller"),
 			Tenant:            o.tenant,
 		}, set.ServiceInformer(), set.EndpointSliceInformer())

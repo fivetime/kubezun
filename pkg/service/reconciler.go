@@ -86,11 +86,6 @@ type Reconciler struct {
 	// because a public address costs the platform money and exposes a service
 	// its author may have only meant to reach from inside.
 	PublicByDefault bool
-
-	// ClusterDomain is the suffix a Service's name resolves under, normally
-	// svc.cluster.local. Empty disables naming, and then a Service is reachable
-	// only at the address in its annotation.
-	ClusterDomain string
 }
 
 // Name of the load balancer backing a Service. Derived rather than random so a
@@ -164,17 +159,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, namespace, name string) erro
 			return err
 		}
 	}
-	// The name was set when the port was created, so the record exists as soon
-	// as the address does. This keeps it right if the domain configuration
-	// changes under an existing Service.
-	if r.ClusterDomain != "" {
-		if err := ensurePortDNS(ctx, r.Neutron, portID, svc.Name,
-			ServiceDomain(svc.Namespace, r.ClusterDomain)); err != nil {
-			log.G(ctx).WithError(err).WithField("service", svc.Namespace+"/"+svc.Name).
-				Warn("could not give this Service a name; it is reachable only at its address")
-		}
-	}
-
+	// No name is published for the address. The tenant runs its own resolver,
+	// which answers from the Service objects it reads through the gateway, and
+	// the address it answers with is the one publishAddress puts on the Service
+	// below — so a name published here would be a second copy of the same fact,
+	// kept in a different system, that no tenant application ever asks for.
+	//
+	// It was tried: the address port carried a dns_name and Neutron published
+	// it. What that produced was <svc>.<tid>-<namespace>.svc.cluster.local,
+	// the name the platform uses. A tenant's application asks for
+	// <svc>.<namespace>.svc.cluster.local, because that is the namespace it can
+	// see — and no global DNS namespace can serve that name, since every tenant
+	// needs it to resolve to a different address.
 	return r.publishAddress(ctx, svc, address)
 }
 
