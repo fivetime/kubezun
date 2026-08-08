@@ -38,6 +38,15 @@ func (c *Controller) RunGC(ctx context.Context) {
 func (c *Controller) sweep(ctx context.Context) {
 	r := c.reconciler
 
+	// ⚠️ An empty served set is not "serves nothing", it is "does not know
+	// yet" — the watch behind it fails closed. Sweeping on that would read
+	// every one of the tenant's load balancers as belonging to a namespace it
+	// does not serve and delete all of them.
+	if r.Namespaces == nil || len(r.Namespaces()) == 0 {
+		log.G(ctx).Warn("load balancer sweep skipped: no namespaces are known yet")
+		return
+	}
+
 	all, err := listLoadBalancers(ctx, r.Octavia)
 	if err != nil {
 		log.G(ctx).WithError(err).Warn("load balancer sweep skipped: could not list them")
@@ -49,6 +58,22 @@ func (c *Controller) sweep(ctx context.Context) {
 		if !ok {
 			// Someone else's, or this tenant's from another deployment. Not
 			// ours to judge.
+			continue
+		}
+
+		// A load balancer for a namespace this process does not serve is one it
+		// should never have built. They exist because the Service informer
+		// spans the cluster and the reconciler did not check, so this is both
+		// the cleanup for that and what keeps it from lingering if the served
+		// set shrinks.
+		if !c.serves(namespace) {
+			log.G(ctx).WithField("service", namespace+"/"+name).
+				WithField("loadbalancer", lb.ID).
+				Info("deleting a load balancer for a namespace this process does not serve")
+			if err := r.tearDown(ctx, namespace, name, lb.ID); err != nil {
+				log.G(ctx).WithError(err).WithField("loadbalancer", lb.ID).
+					Warn("could not delete it")
+			}
 			continue
 		}
 

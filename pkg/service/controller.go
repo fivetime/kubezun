@@ -64,6 +64,16 @@ func NewController(
 	return c, nil
 }
 
+// serves reports whether a namespace is one this process may build load
+// balancers for. The informers span the cluster, so this is what keeps a
+// tenant's credential from being spent on somebody else's Service.
+func (c *Controller) serves(namespace string) bool {
+	if c.reconciler.ServesNamespace == nil {
+		return false
+	}
+	return c.reconciler.ServesNamespace(namespace)
+}
+
 func (c *Controller) enqueueService(obj any) {
 	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 		obj = tombstone.Obj
@@ -140,6 +150,10 @@ func (c *Controller) recordFailure(namespace, name string, cause error) {
 func (c *Controller) reconcile(ctx context.Context, key string) {
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
+		c.queue.Forget(key)
+		return
+	}
+	if !c.serves(namespace) {
 		c.queue.Forget(key)
 		return
 	}

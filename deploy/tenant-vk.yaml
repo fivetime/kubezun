@@ -41,11 +41,27 @@ rules:
   - apiGroups: [""]
     resources: ["pods/status"]
     verbs: ["update", "patch"]
-  # Read to resolve a pod's environment. The informers are scoped to the served
-  # namespace when a process serves exactly one, so in practice this reads only
-  # the tenant's own objects even though the role cannot say so.
+  # Which namespaces this process serves. Watched rather than configured: a
+  # tenant creates namespaces while this is running, and a fixed list leaves one
+  # made afterwards with no compute and nothing saying why.
+  #
+  # Cluster-scoped, and it has to be — a list is not namespaced, so there is no
+  # way to grant "list the namespaces labelled for this tenant". The process
+  # asks for them with a label selector and refuses to serve anything until that
+  # list answers, so what this grants is the ability to see namespace names and
+  # labels, not to read anything inside one.
   - apiGroups: [""]
-    resources: ["secrets", "configmaps", "services"]
+    resources: ["namespaces"]
+    verbs: ["list", "watch"]
+  # Secrets and configmaps are read one object at a time, by name, to resolve a
+  # pod's environment and file volumes — never listed or watched, so nothing is
+  # cached and no other tenant's ever enters this process. Services are listed,
+  # for the FOO_SERVICE_HOST variables and for the load balancers.
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["services"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["events"]

@@ -525,3 +525,7 @@ func (s *Set) Serves(namespace string) bool {
 
 // Objects reads a pod's ConfigMaps and Secrets on demand, without caching them.
 func (s *Set) Objects() provider.ObjectReader { return objectReader{client: s.client} }
+
+// ServedNamespaces lists the namespaces this process serves right now. Empty
+// means the set is not known yet, not that there are none.
+func (s *Set) ServedNamespaces() []string { return s.servedNamespaces() }

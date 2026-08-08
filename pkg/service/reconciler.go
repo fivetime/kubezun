@@ -55,6 +55,20 @@ type Reconciler struct {
 	// Subnets resolves a member's subnet from its capsule.
 	Subnets SubnetResolver
 
+	// ServesNamespace reports whether a Service is this tenant's to act on.
+	//
+	// ⚠️ Not a filter for tidiness. The Service informer spans the cluster —
+	// it has to, because a tenant's namespaces are not known until they are
+	// watched — so without this the reconciler builds a load balancer, in this
+	// tenant's OpenStack project and against this tenant's quota, for every
+	// Service in the cluster: other tenants' and the platform's own. Measured:
+	// 19 of them, including another tenant's kube-dns.
+	ServesNamespace func(namespace string) bool
+
+	// servedNamespaces lists them, so the sweep can tell "serves nothing" from
+	// "does not know yet" and refuse to run on the second.
+	Namespaces func() []string
+
 	Services      corev1listers.ServiceLister
 	Slices        discoveryv1listers.EndpointSliceLister
 	ServiceClient corev1client.ServicesGetter
