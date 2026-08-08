@@ -32,6 +32,7 @@ check-mod: # verifies that module changes for go.mod and go.sum are checked in
 mod:
 	@go mod tidy
 
+bin/probe: BUILD_VERSION          ?= $(shell git describe --tags --always --dirty="-dev")
 bin/virtual-kubelet: BUILD_VERSION          ?= $(shell git describe --tags --always --dirty="-dev")
 bin/virtual-kubelet: BUILD_DATE             ?= $(shell date -u '+%Y-%m-%d-%H:%M UTC')
 bin/virtual-kubelet: VERSION_FLAGS    := -ldflags='-X "main.buildVersion=$(BUILD_VERSION)" -X "main.buildTime=$(BUILD_DATE)"'
