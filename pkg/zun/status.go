@@ -51,9 +51,15 @@ func tenantReason(status string) string {
 	// are plain words a tenant reads without knowing anything about the service
 	// behind the node, which is the only thing that has to be true here.
 	//
-	// Paused, Deleting, Deleted and Dead are kept for the same reason. Dead in
-	// particular is a state Zun distinguishes from Error, and merging them
-	// would answer a question nobody asked with less than was known.
+	// Paused, Deleting and Deleted are kept for the same reason.
+	//
+	// ⚠️ Dead reaches this only in theory. Zun sets it in one place, the docker
+	// driver, from Docker's own state.Dead — a container that could not be
+	// cleaned up. A capsule runs through the CRI driver, which sets only
+	// Created, Running, Stopped and Unknown, so nothing on this path produces
+	// it. Kept because a fallback that passes a status through is the safe
+	// shape, not because there is a distinction here worth preserving: an
+	// earlier version of this comment claimed there was.
 	return status
 }
 
