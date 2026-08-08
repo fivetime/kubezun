@@ -210,10 +210,15 @@ func TestBuildTemplateCarriesProbes(t *testing.T) {
 	if _, still := ready["httpGet"]; still {
 		t.Error("httpGet reached the capsule unrewritten; it could never succeed there")
 	}
-	shell := ready["exec"].(map[string]any)["command"].([]any)
-	script := shell[len(shell)-1].(string)
+	script := joinCommand(ready["exec"].(map[string]any)["command"].([]any))
 	if !strings.Contains(script, "127.0.0.1:8080/ready") {
 		t.Errorf("rewritten probe does not target the container itself: %s", script)
+	}
+	// Through the helper, not the image's own tools: a distroless image has
+	// no shell to run them and no shell to say so either, so the container
+	// would report unhealthy while answering perfectly well.
+	if !strings.Contains(script, ProbeHelper) {
+		t.Errorf("rewritten probe does not use the probe helper: %s", script)
 	}
 	if ready["failureThreshold"].(float64) != 3 {
 		t.Errorf("failureThreshold = %v, want 3: timing must survive the rewrite",
@@ -241,7 +246,7 @@ func TestRewriteResolvesNamedPorts(t *testing.T) {
 	}
 	c := decode(t, raw)["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)
 	cmd := c["readinessProbe"].(map[string]any)["exec"].(map[string]any)["command"].([]any)
-	if script := cmd[len(cmd)-1].(string); !strings.Contains(script, "127.0.0.1:9090/healthz") {
+	if script := joinCommand(cmd); !strings.Contains(script, "127.0.0.1:9090/healthz") {
 		t.Errorf("named port was not resolved: %s", script)
 	}
 }
@@ -311,4 +316,14 @@ func TestPodKeyFromLabelsIgnoresForeignCapsules(t *testing.T) {
 	if !ok || ns != "111111-default" || name != "web" {
 		t.Errorf("managed capsule not recognised: %q %q %v", ns, name, ok)
 	}
+}
+
+// joinCommand renders an exec command for assertions, so a test says what it
+// means regardless of how the arguments are split.
+func joinCommand(cmd []any) string {
+	parts := make([]string, 0, len(cmd))
+	for _, a := range cmd {
+		parts = append(parts, a.(string))
+	}
+	return strings.Join(parts, " ")
 }

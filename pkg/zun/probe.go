@@ -27,6 +27,23 @@ import (
 
 // RewriteProbe converts a network probe into an exec probe against the
 // container itself. Exec probes are returned unchanged: they need no network.
+// ProbeHelper is where the compute node's probe helper appears inside a
+// container. It must match Zun's probe_helper_mount.
+//
+// A network probe becomes an exec because nothing outside the container can
+// reach it: the address is on the tenant's OVN network and, under Kata, lives
+// inside the VM rather than in the sandbox's namespace on the host — measured
+// on every lab compute node, from the root namespace and from each network
+// namespace on it.
+//
+// It runs this helper rather than the image's own tools. Shelling out to curl
+// or wget works on a distribution image and fails on everything distroless:
+// registry.k8s.io images, FROM scratch images, most Go applications — CoreDNS
+// among them, which is a tenant's own resolver. Such an image has no shell to
+// report the problem either, so a container answering perfectly well reads as
+// unhealthy, and the tenant is told their application is failing.
+const ProbeHelper = "/.kubezun/probe"
+
 func RewriteProbe(p *corev1.Probe, c *corev1.Container) (*corev1.Probe, error) {
 	if p == nil {
 		return nil, nil
@@ -53,31 +70,21 @@ func RewriteProbe(p *corev1.Probe, c *corev1.Container) (*corev1.Probe, error) {
 			path = "/"
 		}
 		url := fmt.Sprintf("%s://127.0.0.1:%d%s", scheme, port, path)
-		// curl first for its richer HTTP handling, with -k because in-pod TLS
-		// is typically self-signed; wget is the busybox and alpine default.
-		// An image with neither fails loudly rather than reporting healthy.
-		cmd := fmt.Sprintf(
-			`if command -v curl >/dev/null 2>&1; then exec curl -fsk -o /dev/null -m %d %q; `+
-				`elif command -v wget >/dev/null 2>&1; then exec wget -q -O /dev/null -T %d %q; `+
-				`else echo "kubezun probe: image has no curl or wget" >&2; exit 1; fi`,
-			timeout, url, timeout, url)
 		out.HTTPGet = nil
-		out.Exec = &corev1.ExecAction{Command: []string{"sh", "-c", cmd}}
+		out.Exec = &corev1.ExecAction{Command: []string{
+			ProbeHelper, "-http", url, "-timeout", fmt.Sprintf("%ds", timeout),
+		}}
 
 	case p.TCPSocket != nil:
 		port, err := resolveProbePort(p.TCPSocket.Port, c)
 		if err != nil {
 			return nil, err
 		}
-		// curl's telnet scheme is the fallback: exit code 7 is specifically
-		// "failed to connect", so anything else means the port answered.
-		cmd := fmt.Sprintf(
-			`if command -v nc >/dev/null 2>&1; then exec nc -z -w %d 127.0.0.1 %d; `+
-				`elif command -v curl >/dev/null 2>&1; then curl -s -m %d telnet://127.0.0.1:%d </dev/null >/dev/null 2>&1; [ $? -ne 7 ]; `+
-				`else echo "kubezun probe: image has no nc or curl" >&2; exit 1; fi`,
-			timeout, port, timeout, port)
 		out.TCPSocket = nil
-		out.Exec = &corev1.ExecAction{Command: []string{"sh", "-c", cmd}}
+		out.Exec = &corev1.ExecAction{Command: []string{
+			ProbeHelper, "-tcp", fmt.Sprintf("127.0.0.1:%d", port),
+			"-timeout", fmt.Sprintf("%ds", timeout),
+		}}
 
 	case p.GRPC != nil:
 		// grpc_health_probe predates the native probe and most gRPC images
