@@ -610,21 +610,37 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 （**绝不能 ovn**，它是 L4-only 拒绝一切 L7 对象），意味着**真实实例成本** →
 按需/计费开通，不像 Service 那样默认给。
 
-- [ ] **抄 kubetron `pkg/ingress/`（1727 行）**，复用价值高于 Service 那次——最大的耦合点
-      `BuildMembers` 我们**已经重写过**（subnet 改从 capsule 取，不再需要 NetworkPortClaim），
-      Ingress 与 Service 共用同一个：
-      - `l7.go`（444 行，Ingress 规则 → L7 policy/rule）：基本可平移
-      - `barbican.go`（153 行，TLS Secret → PKCS12 → Barbican）：基本可平移
-      - `reconciler.go`（530 行）：需**剥掉两层 kubetron 私有模型**——
-        `service.NSConfig`/`ResolveNamespaceConfig`（每 namespace ConfigMap 配置；
-        kubezun 是每租户一进程带 flag）与 `webhook.NamespaceShard`（分片；
-        **kubezun 不继承 OVN chassis 约束**，§7.4 实测，整块删掉）
-      - `fip.go`/`tuning.go`：基本可用（FIP 语义我们已实测）
-- [ ] **TLS 分工按 §7.5b 实现**：租户签发+续期，kubezun **只传播**——
-      watch 租户 TLS Secret → 内容变则重新镜像进 Barbican → 更新 listener 引用。
-      抄 kubetron 的**内容哈希命名**（`barbican.go:43-44`）：续期→哈希变→新 ref→
-      reconcile 自然跟上，不比对有效期、不关心谁签的。
-      ⚠️ 不做传播 = 租户续期成功但 Octavia 仍送旧证书，且租户查不出原因
+- [x] **✅ 抄 kubetron `pkg/ingress/` 完成（2026-08-08，`8abc1b6`+`684ee25`+`9353aca`）**：
+      `l7.go`/`barbican.go`/`tuning.go` 基本平移；`reconciler.go` 剥掉了 kubetron 的
+      `NSConfig`/`ResolveNamespaceConfig`（每 namespace ConfigMap）和 `webhook.NamespaceShard`
+      （分片）——kubezun 每租户一进程，作用域是服务命名空间集。teardown 不用 finalizer，
+      改走 pkg/service 的**名字派生 + 孤儿 sweep**（一套恢复模型盖两种 LB）；FIP 归属从
+      Ingress 注解移到 **FIP 的 description**（sweep 没有对象也能判 delete/detach）。
+      `BuildMembers` 与 Service 复用同一个（member 取 capsule 地址与 subnet）。
+      ⚠️ **Service sweep 的 `parseLBName` 必须拒绝 ing 名字**：两种名字共享租户前缀，
+      按第一个下划线切会把 "ing" 读成 namespace、找不到同名 Service，然后把每个
+      Ingress LB 当孤儿删掉。
+      **实测（租户视角）**：建 Ingress → 拿到 ADDRESS `192.168.200.174`；Octavia 侧
+      LB ACTIVE、listener :80、两条 l7policy（position 1/2，按最长路径排序）、pool member
+      `192.168.100.228:80 ONLINE`——**控制面全部正确**。
+      ⚠️ **首次部署撞了两个**：① `Ingresses().List(nil)` 在 lister 里 panic，每个
+      EndpointSlice 事件都崩 → 改 `labels.Everything()`；② 网关给 cluster-scoped 名字
+      **加租户前缀**，IngressClass 也不例外——租户写 `knaas` 这边读到 `111111-knaas`，
+      只匹配裸名会把每个租户 Ingress 判成"非我的"而走进 teardown；而那条 teardown 的
+      Barbican 清理是无条件调用的，租户没有 key-manager 权限时 403 无限重试卡死整个队列。
+      已修：`Ours` 认前缀 + 无 LB 时的 Barbican 清理改 best-effort
+- [ ] **⚠️ L7 数据面 503：断点在 incus octavia provider，不在 kubezun（2026-08-08 隔离实测）**：
+      capsule 访问 Ingress VIP 返回 503；**同一个 capsule、同一个 member、同一个 VIP 子网**
+      访问 L4 Service VIP（ovn provider）返回正常 HTML。member 在 Octavia 里是 ONLINE
+      （worker→member 的健康检查是通的），但 incus provider 的 L7 worker（haproxy）
+      没把请求转给 backend。**kubezun 建的 Octavia 对象全部正确**，断点在 provider
+      把对象翻成 haproxy 配置那一层。生产用 amphora provider 可能不同。
+      下一步：查 incus provider 的 worker 配置，或换 amphora 验一遍以确认对象无误
+- [ ] **TLS 分工（§7.5b）已实现，待端到端验**：`ensureTLS` + `barbican.go` 的内容哈希命名
+      （续期→哈希变→新 ref→reconcile 自然跟上，不比对有效期、不关心谁签的）；
+      `spec.tls` 存在时自动建 TERMINATED_HTTPS listener，陈旧 bundle 在 listener 指向
+      新 ref **之后**才删（顺序反了会把两种 provider 卡在 PENDING_UPDATE）。
+      ⚠️ 本轮测的是纯 HTTP Ingress，尚未用真证书跑一遍
 
 ---
 
