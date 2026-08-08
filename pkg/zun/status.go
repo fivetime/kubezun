@@ -31,23 +31,29 @@ import (
 // handle it, which is how two of Zun's own words slipped through a fallback.
 func tenantReason(status string) string {
 	switch status {
-	case "Creating", "Created", "Rebuilding", "Restarting":
-		// kubelet's own word for a container that has not started yet, and it
-		// means the same thing here. Rebuilding is Zun's name for recreating
-		// one, which is this from a tenant's side.
-		return "ContainerCreating"
 	case "Stopped":
+		// A container that finished reads as Completed everywhere in
+		// Kubernetes, and this is the one state where the word carries a
+		// convention rather than just a description: it is what a tenant looks
+		// for to see that a Job's container did its work.
 		return "Completed"
-	case "Error", "Dead":
-		// Both mean it stopped badly. Error is what kubelet reports for a
-		// container that exited non-zero, and Dead says nothing more.
-		return "Error"
 	case "Unknown":
-		// Here the state really is unknown, which is what kubelet's word says.
+		// The state really is unknown, and this is Kubernetes' way of saying so
+		// — the same meaning, in the spelling a tenant's tooling recognises.
 		return "ContainerStatusUnknown"
 	}
-	// Paused, Deleting, Deleted: no Kubernetes equivalent, and each describes
-	// itself in terms a tenant reads without knowing anything about Zun.
+	// Everything else is reported as it is.
+	//
+	// ⚠️ Creating, Created, Rebuilding and Restarting were flattened into
+	// ContainerCreating to match kubelet's spelling. That lost real
+	// information: a container that is Restarting is not one being created for
+	// the first time, and Rebuilding says which of the two is happening. Both
+	// are plain words a tenant reads without knowing anything about the service
+	// behind the node, which is the only thing that has to be true here.
+	//
+	// Paused, Deleting, Deleted and Dead are kept for the same reason. Dead in
+	// particular is a state Zun distinguishes from Error, and merging them
+	// would answer a question nobody asked with less than was known.
 	return status
 }
 

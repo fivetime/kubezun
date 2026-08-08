@@ -221,10 +221,9 @@ func TestContainerStatusesLeavePlacedCapsulesAlone(t *testing.T) {
 		// test: a terminated container would never reach it.
 		Containers: []Container{{UUID: "u", Status: "Creating"}},
 	}
-	// ContainerCreating, which is what a starting container reads as in
-	// Kubernetes — and specifically not the placement failure, which is the
-	// override this guards against.
-	if w := ContainerStatuses(pod, cap)[0].State.Waiting; w == nil || w.Reason != "ContainerCreating" {
+	// The container's own state, and specifically not the placement failure,
+	// which is the override this guards against.
+	if w := ContainerStatuses(pod, cap)[0].State.Waiting; w == nil || w.Reason != "Creating" {
 		t.Errorf("waiting state was overwritten for a capsule that had a host: %+v", w)
 	}
 }
@@ -274,18 +273,13 @@ func TestNoBackendVocabularyReachesTheTenant(t *testing.T) {
 		"Error", "Running", "Stopped", "Paused", "Unknown", "Creating",
 		"Created", "Deleted", "Deleting", "Rebuilding", "Dead", "Restarting",
 	}
-	// Words that name Zun's own model rather than describing a container.
-	// Rebuilding is here because it is Zun's name for recreating a container,
-	// and Dead because Kubernetes says Error; neither tells a tenant anything
-	// their tooling understands.
-	backendWords := map[string]bool{
-		"Rebuilding": true, "Dead": true, "Created": true,
-	}
-
+	// ⚠️ There is no list of forbidden state names here, and there was: it held
+	// Created, Rebuilding and Dead, on the reading that those are Zun's words.
+	// They are not — created, paused, dead and restarting are the container
+	// world's own state names, Docker's included, and a Kubernetes user has been
+	// reading them for years. What must not appear is the name of the service
+	// running the pod, which is a much narrower thing.
 	leaks := func(where, reason string) {
-		if backendWords[reason] {
-			t.Errorf("%s produced %q, which is the backend's word for it", where, reason)
-		}
 		for _, term := range []string{"capsule", "Capsule", "zun", "Zun"} {
 			if strings.Contains(reason, term) {
 				t.Errorf("%s produced %q, which names the compute backend", where, reason)
@@ -315,16 +309,19 @@ func TestNoBackendVocabularyReachesTheTenant(t *testing.T) {
 // into something vaguer. Reporting "cannot be determined" about a container that
 // is simply paused loses the only useful thing there was to say.
 func TestStatesKubernetesCannotExpressAreStillDescribed(t *testing.T) {
-	for _, status := range []string{"Paused", "Deleting", "Deleted"} {
+	for _, status := range []string{
+		"Paused", "Deleting", "Deleted", "Creating", "Created",
+		"Rebuilding", "Restarting", "Dead", "Error",
+	} {
 		if got := waitingReason(status); got != status {
 			t.Errorf("waitingReason(%q) = %q; a known state was replaced with something vaguer",
 				status, got)
 		}
 	}
-	// And where a kubelet word means the same thing, it wins: a tenant's tooling
-	// already knows this one.
-	if got := waitingReason("Creating"); got != "ContainerCreating" {
-		t.Errorf("waitingReason(Creating) = %q, want ContainerCreating", got)
+	// The two exceptions, each because the Kubernetes spelling carries a
+	// convention rather than just a description.
+	if got := terminatedReason("Stopped"); got != "Completed" {
+		t.Errorf("terminatedReason(Stopped) = %q, want Completed", got)
 	}
 	if got := waitingReason("Unknown"); got != "ContainerStatusUnknown" {
 		t.Errorf("waitingReason(Unknown) = %q, want ContainerStatusUnknown", got)
