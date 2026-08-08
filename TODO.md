@@ -478,7 +478,23 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       语义差异（ConfigMap 是快照不是投影、探针在容器内跑且 distroless 无 curl 会失败、
       SA token 默认关）、以及"该怎么写"（设 limits、需要架构就写 nodeSelector、
       VM 冷启动慢要设 initialDelaySeconds）。每条都有本轮实测依据
-- [ ] **⭐ 命名空间作用域改为标签 selector（2026-08-08 定，kube-dns 链路的前置项）**：
+- [x] **✅ 命名空间作用域改为标签 selector（2026-08-08 完成，`41ac354`+`a04e267`）**：
+      `--namespace-selector kubezoo.io/tenant=<id>`；Secret/ConfigMap 改成按需读、零缓存
+      （上游 PodController 只用 `.Lister()` 从不用 `.Informer()`，所以自己实现 lister 即可）；
+      pod 改成每节点一个 informer 按 `spec.nodeName` 选（`orphans.go` 的注释本来就这么写，
+      实现终于对上了）。**实测服务 4 个命名空间，`111111-kube-system` 自动纳入，kube-dns 有 LB 了**。
+      ⚠️ **部署时连撞三个问题，全部已修，值得记住**：
+      ① RBAC 缺 `namespaces: list/watch` → 进程阻塞在同步 → 节点停心跳 →
+         **`TaintManagerEviction` 把 pod 全驱逐、ReplicaSet 重建**。设计错在
+         "让一条 watch 决定节点死活"；改成有界等待 + 失败只告警（`373f04e`）。
+         **节点该说"我在但不收新 pod"，不该说"我没了"**——后者会毁掉正在跑的东西
+      ② Service informer 变全集群后 reconciler 不查命名空间 → **用租户凭据、在租户 project 里
+         给全集群的 Service 建了 19 个 LB**，含平台的 hubble/kyverno/kubetron、
+         `default/kubernetes`、以及**另一个租户的 kube-dns**。加命名空间检查 + GC 回收
+         （`7896008`），实测 19→4 自动清干净。GC 在集合为空时整轮跳过——
+         "空"是"还不知道"不是"没有"
+      ③ 见下面的地址占用
+- [ ] ~~命名空间作用域改造~~（原条目，已完成，保留描述备查）：
       现在是 `--namespaces 111111-default` 静态单值，代价有三——
       `<tid>-kube-system` 进不来（kube-dns 因此没有 LB）；租户新建命名空间那里
       **永远 Pending 且静默**（`authorize` 故意不区分"无权"和"空"）；
@@ -502,6 +518,18 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       而不是虚假的安全感（虚假隔离比没有隔离危险，没有隔离时人会自己小心）。
       **再实现**：NetworkPolicy → Neutron 安全组挂到 capsule port；
       基本 `podSelector`+端口能翻译，`namespaceSelector`/`ipBlock`/egress 组合很硬
+- [x] **✅ 查清：LB 地址由 provider 的端口持有（2026-08-08）**。
+      现象是两个 ACTIVE 的 LB 共用 `192.168.200.36`（probesvc 与 kube-dns），
+      流量归属未定义。
+      **查证**：`ovn-octavia-provider` 的 `create_vip_port`（`helper.py:3040`）总是自己建
+      `ovn-lb-vip-<lb_id>` 端口、带 `device_id=lb-<lb_id>`（注释说在镜像 amphora 的保护），
+      **并且忽略 API 传入的 `vip_port_id`**——所以"自己建端口占地址"这条路走不通，
+      实测每次创建都报 `IP address ... already allocated`，已回退（`0f59378`）。
+      **真正的原因**：那三个 LB 是在早先"删了重建"风暴里产生的，**没有 provider 端口**，
+      地址因此无人持有、被重新分配。干净创建的 LB 有端口（实测 `ffdde5d7`）。
+      **处置**：把三个老 LB 删掉重建，四个 LB 现在各自都有 provider 端口。
+      ⚠️ 留给将来：LB 被非正常删除时，其地址会变成无主，下一个 LB 可能抢走——
+      这是"删了重建"类 bug 的放大器，所以那类 bug 要当作数据面事故对待
 - [ ] **Pod 失败原因用 K8s 词汇而不是后端词汇（2026-08-08 发现，小改）**：
       现在写的是 `CapsuleMissing` / `CapsuleStuckCreating`，租户没听说过 capsule。
       K8s 自己有：`ContainerStatusUnknown`（kubelet 判断不出容器结局时用的）、
