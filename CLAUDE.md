@@ -14,6 +14,18 @@ virtual-kubelet provider，把租户的逻辑虚拟节点落到 OpenStack Zun ca
 ## 核心定调速记（详见 DESIGN，此处仅防失忆）
 
 - **Node 是契约非记录**：心跳/执行/回写/kubelet API 四义务 → VK 库履约，Zun 是执行后端。
+- **租户可见文本只有一条禁令：不得点名后端**（`capsule`/`zun`）。其余照实说——
+  `Restarting`/`Paused`/`Created` 本来就是容器世界的通用状态名（Docker 就这套），
+  租户看得懂。⚠️ 2026-08-08 在这上面返工三次，根子是把规则写成了**封闭白名单**
+  （"只能用 kubelet 的词表"），于是不断拿准确性换合规：`Paused` 被映射成
+  `ContainerStatusUnknown`（明明是已知状态）、`Restarting` 被并进
+  `ContainerCreating`（丢掉了"重启"与"首次创建"的区分）。**规则错的时候测试通过是坏消息**
+  ——那个白名单测试每次都是绿的。写约束时先问它禁的是什么，而不是它许可什么。
+- **推理不能代替核实**：同一天里，"节点在抖"（实为 RBAC 缺失）、"端口属于 Octavia 项目"
+  （实为租户自己的）、"K8s 推断不出架构"（实为我们谎报了没硬件的节点）、
+  "Zun 区分 Error/Dead"（CRI 路径根本不产生 Dead）四条都是先下结论、后被证伪。
+  ⚠️ 代价不只是返工：其中两条差点作为"要求对方配合"发给 kubezoo 负责人。
+  **能自己查的别问别人，能自己修的别写进协作请求。**
 - **podIP == capsule OVN IP 不变式**：守住它是必要条件但**不充分**——kubetron 的
   Service reconciler 还要 member 的 subnet ID，而它只从 NetworkPortClaim 取
   （`members.go:100-147`，capsule 无 claim 必报错）。缺口只有这一个字段，见 DESIGN §14.6。
