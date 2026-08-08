@@ -118,11 +118,22 @@ func ParseLBName(tenant, lbName string) (namespace, name string, ok bool) {
 }
 
 // Ours reports whether an Ingress carries this controller's class.
+//
+// Two spellings are accepted: the class as configured, and the class behind
+// the tenant's prefix. The gateway prefixes tenant-owned cluster-scoped names
+// with the tenant id — IngressClass among them — so the tenant writes
+// "knaas" and this process reads "111111-knaas". Matching only the bare name
+// sent every tenant Ingress down the teardown path as not-ours (caught on
+// first deployment).
 func (r *Reconciler) Ours(ing *networkingv1.Ingress) bool {
-	if ing.Spec.IngressClassName != nil && *ing.Spec.IngressClassName == r.ClassName {
-		return true
+	prefixed := r.Tenant + "-" + r.ClassName
+	if cls := ing.Spec.IngressClassName; cls != nil {
+		if *cls == r.ClassName || *cls == prefixed {
+			return true
+		}
 	}
-	return ing.Annotations[LegacyClassAnnotation] == r.ClassName
+	legacy := ing.Annotations[LegacyClassAnnotation]
+	return legacy == r.ClassName || legacy == prefixed
 }
 
 // Reconcile brings one Ingress's load balancer into line with its spec.
@@ -330,8 +341,15 @@ func (r *Reconciler) tearDownByName(ctx context.Context, namespace, name string)
 	if err == service.ErrNotFound {
 		// Nothing was ever created (the common case: an Ingress of another
 		// class deleted, or one we never got to). Barbican might still hold
-		// bundles if the load balancer went first; best-effort them away.
-		return cleanupBarbicanSecrets(ctx, r.KeyManager, lbname+"_tls_", nil)
+		// bundles if the load balancer went first — best-effort ONLY: a
+		// plain-HTTP tenant's credential may lack key-manager access
+		// entirely, and a 403 here retried forever wedges the whole queue
+		// behind an Ingress that owns nothing (caught on first deployment).
+		if err := cleanupBarbicanSecrets(ctx, r.KeyManager, lbname+"_tls_", nil); err != nil {
+			log.G(ctx).WithError(err).WithField("ingress-lb", lbname).
+				Debug("skipping Barbican cleanup for an Ingress that owns no load balancer")
+		}
+		return nil
 	}
 	if err != nil {
 		return err

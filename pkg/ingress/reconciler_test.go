@@ -35,8 +35,10 @@ func TestNameSchemesDoNotCollide(t *testing.T) {
 }
 
 func TestOursHonoursClassAndLegacyAnnotation(t *testing.T) {
-	r := &Reconciler{ClassName: "knaas"}
+	r := &Reconciler{ClassName: "knaas", Tenant: "111111"}
 	cls := "knaas"
+	prefixed := "111111-knaas"
+	foreignPrefixed := "222222-knaas"
 	other := "nginx"
 
 	cases := []struct {
@@ -45,6 +47,11 @@ func TestOursHonoursClassAndLegacyAnnotation(t *testing.T) {
 		want bool
 	}{
 		{"spec class matches", networkingv1.Ingress{Spec: networkingv1.IngressSpec{IngressClassName: &cls}}, true},
+		// The gateway prefixes tenant-owned cluster-scoped names, so what the
+		// tenant wrote as "knaas" reads as "111111-knaas" here. Missing this
+		// sent every tenant Ingress down the teardown path.
+		{"tenant-prefixed class", networkingv1.Ingress{Spec: networkingv1.IngressSpec{IngressClassName: &prefixed}}, true},
+		{"another tenant's prefix", networkingv1.Ingress{Spec: networkingv1.IngressSpec{IngressClassName: &foreignPrefixed}}, false},
 		{"spec class other", networkingv1.Ingress{Spec: networkingv1.IngressSpec{IngressClassName: &other}}, false},
 		{"legacy annotation", networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{
 			Annotations: map[string]string{LegacyClassAnnotation: "knaas"}}}, true},
