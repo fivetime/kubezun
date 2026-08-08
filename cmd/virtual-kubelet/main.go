@@ -45,6 +45,7 @@ type options struct {
 	capacityMem   string
 	capacityPod   string
 	logLevel      string
+	nsSelector    string
 	leaseSeconds  int
 	nodes         nodeSpecList
 	tlsCert       string
@@ -64,7 +65,16 @@ func main() {
 	flag.StringVar(&o.tenant, "tenant", os.Getenv("KUBEZUN_TENANT"),
 		"tenant id; becomes the node's pool label and taint value")
 	flag.StringVar(&o.namespaces, "namespaces", os.Getenv("KUBEZUN_NAMESPACES"),
-		"comma-separated namespaces this node serves; pods from any other namespace are refused")
+		"comma-separated namespaces this node serves. Superseded by "+
+			"--namespace-selector, which tracks the namespaces a tenant creates "+
+			"while this is running; a fixed list leaves a namespace made later "+
+			"with no compute at all and nothing saying why")
+	flag.StringVar(&o.nsSelector, "namespace-selector", os.Getenv("KUBEZUN_NAMESPACE_SELECTOR"),
+		"label selector naming the namespaces this process serves, normally "+
+			"kubezoo.io/tenant=<id>. The gateway writes that label on every "+
+			"namespace it makes for a tenant and refuses a write that changes "+
+			"it, so it is as hard to forge as the namespace name and, unlike a "+
+			"name prefix, can be given to the API server as a selector")
 	flag.StringVar(&o.zone, "zone", os.Getenv("KUBEZUN_ZONE"),
 		"topology zone, mapped onto the Zun availability zone")
 	flag.StringVar(&o.zunAZ, "zun-availability-zone", os.Getenv("KUBEZUN_ZUN_AZ"),
@@ -143,11 +153,13 @@ func run(o options) error {
 		return err
 	}
 	namespaces := splitAndTrim(o.namespaces)
-	if len(namespaces) == 0 {
+	if len(namespaces) == 0 && o.nsSelector == "" {
 		// Serving every namespace would make this node reachable by any pod
-		// whose spec.nodeName names it, which is exactly the boundary the
-		// namespace list exists to enforce.
-		return fmt.Errorf("--namespaces is required: a node must state which namespaces it serves")
+		// whose spec.nodeName names it, which is exactly the boundary this
+		// exists to enforce.
+		return fmt.Errorf(
+			"one of --namespace-selector or --namespaces is required: " +
+				"a node must state which namespaces it serves")
 	}
 
 	logger := logrus.StandardLogger()
@@ -176,9 +188,15 @@ func run(o options) error {
 		return fmt.Errorf("build Kubernetes client: %w", err)
 	}
 
+	var watcher *vkset.Namespaces
+	if o.nsSelector != "" {
+		watcher = vkset.NewNamespaces(client, o.nsSelector)
+	}
+
 	set, err := vkset.NewSet(vkset.SetOptions{
 		Client:               client,
 		Namespaces:           namespaces,
+		NamespaceWatcher:     watcher,
 		Workers:              runtime.NumCPU(),
 		LeaseDurationSeconds: o.leaseSeconds,
 	})
@@ -218,7 +236,7 @@ func run(o options) error {
 			NodeName:         spec.name,
 			ClusterDomain:    o.clusterDomain,
 		}, zunClient, provider.Caches{
-			Pods:    set.Pods(),
+			Pods:    set.PodsForNode(spec.name).Lister(),
 			Objects: set.Objects(),
 		})
 		if err != nil {

@@ -21,6 +21,8 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	corev1informers "k8s.io/client-go/informers/core/v1"
@@ -42,7 +44,10 @@ type Set struct {
 	podFactory informers.SharedInformerFactory
 	scmFactory informers.SharedInformerFactory
 
-	pods       corev1informers.PodInformer
+	// podsByNode holds one pod informer per virtual node, each selecting on
+	// spec.nodeName. A field selector takes a single value, so the narrowing
+	// costs one watch per node — each carrying only that node's pods.
+	podsByNode map[string]corev1informers.PodInformer
 	secrets    corev1informers.SecretInformer
 	configMaps corev1informers.ConfigMapInformer
 	services   corev1informers.ServiceInformer
@@ -52,6 +57,9 @@ type Set struct {
 	// fixed, the list given at startup.
 	namespaces *Namespaces
 	fixed      []string
+
+	resync        time.Duration
+	podFactories  []informers.SharedInformerFactory
 
 	broadcaster   record.EventBroadcaster
 	workers       int
@@ -95,8 +103,8 @@ func NewSet(opts SetOptions) (*Set, error) {
 	if opts.Client == nil {
 		return nil, fmt.Errorf("a Kubernetes client is required")
 	}
-	if len(opts.Namespaces) == 0 {
-		return nil, fmt.Errorf("at least one namespace must be served")
+	if len(opts.Namespaces) == 0 && opts.NamespaceWatcher == nil {
+		return nil, fmt.Errorf("a namespace list or a namespace watcher is required")
 	}
 	if opts.ResyncPeriod == 0 {
 		opts.ResyncPeriod = time.Minute
@@ -105,40 +113,50 @@ func NewSet(opts SetOptions) (*Set, error) {
 		opts.Workers = 1
 	}
 
-	podOpts := []informers.SharedInformerOption{}
-	if len(opts.Namespaces) == 1 {
-		podOpts = append(podOpts, informers.WithNamespace(opts.Namespaces[0]))
+	set := &Set{
+		client:     opts.Client,
+		fixed:      opts.Namespaces,
+		namespaces: opts.NamespaceWatcher,
+		podsByNode: map[string]corev1informers.PodInformer{},
 	}
-	// No spec.nodeName field selector: one informer serves every node in the
-	// process, and each pod controller is given a filter naming its own node
-	// (PodEventFilterFunc, which exists for exactly this).
-	podFactory := informers.NewSharedInformerFactoryWithOptions(
-		opts.Client, opts.ResyncPeriod, podOpts...)
+	served := func() []string { return set.servedNamespaces() }
 
-	// Secrets, configmaps and services are read to resolve a pod's environment,
-	// which can name any object in the pod's own namespace, so this factory is
-	// scoped the same way.
-	scmOpts := []informers.SharedInformerOption{}
-	if len(opts.Namespaces) == 1 {
-		scmOpts = append(scmOpts, informers.WithNamespace(opts.Namespaces[0]))
-	}
+	// The pod watch spans namespaces and is narrowed by the node instead: a pod
+	// this process must act on is one whose spec.nodeName names one of its
+	// nodes, whatever namespace it is in. Selecting on the field rather than on
+	// the namespace is both smaller — a virtual node's pods, not a namespace's
+	// — and correct for a namespace created after this started, which a
+	// namespace-scoped watch would never see.
+	//
+	// One factory per node rather than one shared: a field selector takes a
+	// single value, so this is what buys the narrowing. Each is small.
+	// Services are listed to build the FOO_SERVICE_HOST variables Kubernetes
+	// injects, and endpoint slices drive the load balancers.
 	scmFactory := informers.NewSharedInformerFactoryWithOptions(
-		opts.Client, opts.ResyncPeriod, scmOpts...)
+		opts.Client, opts.ResyncPeriod)
 
-	return &Set{
-		client:        opts.Client,
-		fixed:         opts.Namespaces,
-		namespaces:    opts.NamespaceWatcher,
-		podFactory:    podFactory,
-		scmFactory:    scmFactory,
-		pods:          podFactory.Core().V1().Pods(),
-		secrets:       scmFactory.Core().V1().Secrets(),
-		configMaps:    scmFactory.Core().V1().ConfigMaps(),
-		services:      scmFactory.Core().V1().Services(),
-		slices:        scmFactory.Discovery().V1().EndpointSlices(),
-		workers:       opts.Workers,
-		leaseDuration: opts.LeaseDurationSeconds,
-	}, nil
+	set.resync = opts.ResyncPeriod
+	set.scmFactory = scmFactory
+	set.services = scmFactory.Core().V1().Services()
+	set.slices = scmFactory.Discovery().V1().EndpointSlices()
+	// Read on demand rather than cached: see listers.go for why a cache is the
+	// wrong shape here even though the interface asks for an informer.
+	set.secrets = secretInformerShim{
+		lister: apiSecretLister{client: opts.Client, namespaces: served}}
+	set.configMaps = configMapInformerShim{
+		lister: apiConfigMapLister{client: opts.Client, namespaces: served}}
+	set.workers = opts.Workers
+	set.leaseDuration = opts.LeaseDurationSeconds
+
+	return set, nil
+}
+
+// servedNamespaces is the set this process serves right now.
+func (s *Set) servedNamespaces() []string {
+	if s.namespaces != nil {
+		return s.namespaces.List()
+	}
+	return s.fixed
 }
 
 // EventRecorder returns a recorder for a component sharing this set's
@@ -152,14 +170,28 @@ func (s *Set) EventRecorder(component string) record.EventRecorder {
 		corev1.EventSource{Component: component})
 }
 
-// Pods is the shared pod lister, spanning every node in the process rather than
-// only one node's pods.
-func (s *Set) Pods() corev1listers.PodLister { return s.pods.Lister() }
-
-// ConfigMaps and Secrets are the shared listers a provider reads a pod's file
-// volumes from.
-func (s *Set) ConfigMaps() corev1listers.ConfigMapLister { return s.configMaps.Lister() }
-func (s *Set) Secrets() corev1listers.SecretLister       { return s.secrets.Lister() }
+// PodsForNode returns the pod informer for one virtual node, creating it on
+// first use.
+//
+// One per node, selecting on spec.nodeName. That is what a node's provider
+// should see: its orphan sweep compares the capsules labelled for this node
+// against the pods assigned to it, and a wider view would only offer it pods it
+// must not act on. It is also what the sweep already assumes it has
+// (orphans.go), and what makes a namespace created after startup work — a
+// namespace-scoped watch would never see one.
+func (s *Set) PodsForNode(name string) corev1informers.PodInformer {
+	if inf, ok := s.podsByNode[name]; ok {
+		return inf
+	}
+	factory := informers.NewSharedInformerFactoryWithOptions(s.client, s.resync,
+		informers.WithTweakListOptions(func(o *metav1.ListOptions) {
+			o.FieldSelector = fields.OneTermEqualSelector("spec.nodeName", name).String()
+		}))
+	inf := factory.Core().V1().Pods()
+	s.podsByNode[name] = inf
+	s.podFactories = append(s.podFactories, factory)
+	return inf
+}
 
 // ServiceInformer and EndpointSliceInformer back the Service controller, which
 // runs once per process rather than once per node: load balancers belong to the
@@ -265,13 +297,14 @@ func (s *Set) AddNode(opts NodeOptions) (*Node, error) {
 		PodClient:         s.client.CoreV1(),
 		EventRecorder:     recorder,
 		Provider:          opts.Provider,
-		PodInformer:       s.pods,
+		PodInformer:       s.PodsForNode(name),
 		SecretInformer:    s.secrets,
 		ConfigMapInformer: s.configMaps,
 		ServiceInformer:   s.services,
-		// The shared informer carries every node's pods, so this is what keeps
-		// one node's controller from acting on another's. Without it each node
-		// would try to create a capsule for every pod in the namespace.
+		// Redundant with the informer's field selector and kept anyway: the
+		// selector is what the API server was asked for, this is what the
+		// controller enforces on what it actually received. If the two ever
+		// disagree the cost is a capsule created for another node's pod.
 		PodEventFilterFunc: func(_ context.Context, pod *corev1.Pod) bool {
 			return pod.Spec.NodeName == name
 		},
@@ -294,7 +327,7 @@ func (s *Set) AddNode(opts NodeOptions) (*Node, error) {
 		streamIdleTimeout:     opts.StreamIdleTimeout,
 		streamCreationTimeout: opts.StreamCreationTimeout,
 		provider:              opts.Provider,
-		pods:                  s.pods.Lister(),
+		pods:                  s.PodsForNode(name).Lister(),
 	}
 	s.nodes = append(s.nodes, n)
 	return n, nil
@@ -316,9 +349,21 @@ func (s *Set) Run(ctx context.Context) error {
 		defer s.broadcaster.Shutdown()
 	}
 
-	// Started once for the whole process rather than once per node: that
-	// saving is the reason this package exists.
-	go s.podFactory.Start(ctx.Done())
+	// The namespace watch has to be synced before anything reads the served
+	// set, because that set is the authorization boundary and it fails closed:
+	// a pod controller started against an empty set would refuse every pod
+	// until the watch caught up.
+	if s.namespaces != nil {
+		if err := s.namespaces.Run(ctx); err != nil {
+			return err
+		}
+	}
+
+	// One factory per node for pods, each selecting on that node's name, and
+	// one shared for what belongs to the tenant rather than to a node.
+	for _, f := range s.podFactories {
+		go f.Start(ctx.Done())
+	}
 	go s.scmFactory.Start(ctx.Done())
 
 	errs := make(chan error, len(s.nodes))
