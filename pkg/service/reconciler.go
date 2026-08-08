@@ -228,24 +228,13 @@ func (r *Reconciler) ensureLoadBalancer(ctx context.Context, svc *corev1.Service
 	switch {
 	case err == nil:
 	case err == ErrNotFound:
-		// The address is reserved first, by a port this package owns, and
-		// Octavia is given the port rather than asked to allocate one. See
-		// vipport.go: the provider's own port stops existing shortly after
-		// creation, and an address nothing holds is handed out again.
-		portID, err := ensureVIPPort(ctx, r.Neutron, r.VIPNetworkID, r.VIPSubnetID, name)
-		if err != nil {
-			return nil, err
-		}
 		lb, err = loadbalancers.Create(ctx, r.Octavia, loadbalancers.CreateOpts{
 			Name:        name,
 			Description: fmt.Sprintf("kubezun Service %s/%s", svc.Namespace, svc.Name),
-			VipPortID:   portID,
+			VipSubnetID: r.VIPSubnetID,
 			Provider:    ovnProvider,
 		}).Extract()
 		if err != nil {
-			// The port outlives a failed create on purpose: the next pass
-			// finds it by name and reuses it, so a Service keeps the address
-			// it was given even if the load balancer had to be made twice.
 			return nil, fmt.Errorf("creating load balancer %q on subnet %s: %w",
 				name, r.VIPSubnetID, err)
 		}
@@ -484,20 +473,7 @@ func (r *Reconciler) tearDown(ctx context.Context, namespace, name, id string) e
 
 	log.G(ctx).WithField("service", service).
 		WithField("loadbalancer", id).Info("deleting load balancer")
-	// Cascade takes the listeners and pools with it.
-	if err := DeleteLoadBalancer(ctx, r.Octavia, id); err != nil {
-		return err
-	}
-
-	// The address port is this package's, not Octavia's: it was created here
-	// and handed over, and Octavia does not delete a VIP port it was given
-	// rather than made. Left behind it holds an address on the tenant's subnet
-	// forever, attached to nothing.
-	//
-	// After the load balancer, never before — while it exists the address is
-	// in use and Neutron refuses to delete the port anyway.
-	if err := releaseVIPPort(ctx, r.Neutron, r.lbName(namespace, name)); err != nil {
-		return err
-	}
-	return nil
+	// Cascade takes the listeners, pools and the address port with it, and the
+	// DNS record goes with the port.
+	return DeleteLoadBalancer(ctx, r.Octavia, id)
 }
