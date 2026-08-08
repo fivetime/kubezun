@@ -406,13 +406,17 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       （FIP 计数 4→3，LB 一并删除）。
       ⚠️ 前置条件：**VIP 子网必须接在带外网网关的 router 上**，否则报
       `ExternalGatewayForFloatingIPNotFound`（本环境原先只接了 pod 子网，已补接）
-- [ ] ⚠️ **多集群共用 Designate 会撞 zone 名**（DESIGN §7.5c）：zone 名全局唯一（实测），
-      两个平台各有租户 111111 时同名。需在 zone 名里加集群标识。单集群不暴露，未处理
-- [ ] ⚠️ **DNS 仍有两个待决项**（DESIGN §7.6）：① capsule 的 `resolv.conf` 来自子网
-      `dns_nameservers`（实测 8.8.8.8），**不能直接指 Designate 后端**——那是权威 DNS 不做递归，
-      指过去公网域名全断；需要一个"持有这些 zone 为权威 + 其余递归"的 resolver；
-      ② 单一 resolver 持有全部 zone 时租户间可互查名字（IP 跨租户不可达，属信息泄露非通路），
-      要隔离需 per-tenant view
+- [x] **✅ 定案改为 OVN 数据面 DNS，Designate 不需要（2026-08-08 实测，DESIGN §7.6）**。
+      ML2 dns 扩展把 port 的 `dns_name`/`dns_domain` 写进 **OVN NB DNS 表**，
+      ovn-controller 在每台 hypervisor 本地应答。实测 capsule 内 FQDN 与短名均命中、
+      `wget` 直接可达，公网域名照常（OVN 未命中放行原包到真实解析器）。
+      **一次性消掉了原方案的全部待决项**：不需要 Designate/BIND、不存在 zone 对象、
+      没有全局名字唯一性与多集群撞车、跨租户天生隔离（记录按逻辑交换机作用域）、
+      不需要部署 resolver、无单点。**kubezun 侧代码零改动**。
+      ⚠️ 唯一拓扑要求：**VIP 子网必须与 pod 子网同属一个 Neutron 网络**（同交换机不同子网），
+      实测该配置下东西向流量正常——kubetron 的"VIP 独立子网 dst-MAC 坑"来自不同拓扑，勿套用
+- [ ] 环境中的 Designate/BIND 可停用；**建议先留着**——将来若需对外权威 DNS
+      （把租户服务发布到公网域名）仍会用到，那是另一件事
 - [ ] Octavia health monitor 作为**第二层**（LB 侧自检）是否需要：EndpointSlice 已能
       按 readiness 摘除 member，HM 是冗余保护而非必需；若启用需查 OVN provider 的
       `SUPPORTED_HEALTH_MONITOR_TYPES` 白名单（DESIGN §6）

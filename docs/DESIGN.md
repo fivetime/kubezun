@@ -607,27 +607,48 @@ zone 名是 `<上游 namespace>.svc.cluster.local.`，而 kubezoo 的上游 name
 
 代价：每 Service 多管一张 port。⚠️ 存量 LB 需重建一次才能改用预建 port（VIP 会变）。
 
-### 7.6 租户 DNS：方案空间与当前阻塞（2026-08-07 勘察）
+### 7.6 租户 DNS：**定案 = OVN 数据面 DNS，不需要 Designate**（2026-08-08 实测推翻前案）
 
-§7.5 定案后 DNS 从配套变成**必需**：ClusterIP Service 的可用地址只存在于
-`knaas.io/address` 注解里，应用不读注解，它们用名字。
+⚠️ **本节推翻了 2026-08-07 的 Designate 方案。** 该方案已部署并验证可用，但存在一条
+更简单且严格更优的路径，实测全通。
 
-**一条结构性约束框定了方案空间**：VK 进程按 §7 不得接入租户网络，所以能应答 DNS 的
-只有两类东西——**数据面（OVN 自己）**，或**租户网内的一个 capsule**。
-（kubetron 的做法是渲染 zone 进 ConfigMap **由 kubelet 挂载**给 CoreDNS，我们没有 kubelet。）
+**机制**：ML2 的 dns 扩展把 port 的 `dns_name`/`dns_domain` 写进 **OVN NB 的 DNS 表**，
+ovn-controller 在**每台 hypervisor 的数据面**直接应答。与 Designate 无关，
+`external_dns_driver` 也不需要。
 
-| 方案 | 优势 | 代价 / 阻塞 |
+**实测结果**（capsule 内，`dns_nameservers = 8.8.8.8`）：
+```
+samels.111111-default.svc.cluster.local → 192.168.201.56   OVN 拦截并应答
+samels                                  → 192.168.201.56   短名同样命中
+github.com                              → 20.27.177.113    未命中则放行到真实解析器
+wget http://samels/ 与 http://samels.111111-default.svc.cluster.local/ 均成功
+```
+
+⚠️ **OVN 拦截的是发往 DHCP 通告的那个 resolver 的查询**，未命中时**放行原包**继续送达
+该 resolver。所以子网的 `dns_nameservers` 应直接填一个**真实可用的递归解析器**——
+既得到租户内解析，又不牺牲公网解析，不需要额外组件。
+
+**唯一的拓扑要求**：OVN DNS 按**逻辑交换机**作用域，所以 **VIP 子网必须与 pod 子网在
+同一个 Neutron 网络**（同交换机、不同子网），否则记录落在别的交换机上、capsule 查不到。
+⚠️ 实测该配置下**东西向流量正常**（`wget http://<VIP>/` 成功），kubetron 记录的
+"VIP 独立子网、dst-MAC 坑"在此配置下未出现——它们的结论来自不同拓扑，勿直接套用。
+
+**相对 Designate 方案的优势**（全部是消除而非增加）：
+
+| | Designate 方案 | OVN 数据面 |
 |---|---|---|
-| **A. OVN 内建 DNS**（Neutron dns-integration）⭐ | **零工作负载、零单点**：ovn-controller 在每台 hypervisor 的数据面直接应答；kubezun 只需给 Service 的 VIP port 和 capsule port 设 `dns_name` | ⚠️ **当前被阻塞**：实测 `extension_drivers = port_security,qos`，**DNS 扩展驱动未加载**，`dns_domain`/`dns_name` 静默不生效（API 广播了扩展但 ML2 不存字段）。需改 ML2 配置并重启 neutron-server——**部署级变更，需平台决策**。名字形态（`<svc>.<ns>.svc.cluster.local`）应可经 `dns-domain-ports` 扩展按 port 表达，**未验证** |
-| B. CoreDNS 跑成 capsule | 不改 Neutron | **capsule 不可变**：zone 变更要重建 → 每次 Service 变动都有 DNS 中断窗口。预建 port 可保住 IP（§14.2），但保不住可用性 |
-| C. 平台级 resolver（跨租户，按 view 隔离），kubezun 经 API 推记录 | 无每租户负载、无中断、不改 Neutron | 新增一个平台组件；租户隔离要靠 view/ACL 保证 |
+| 组件 | Designate ×5 服务 + BIND | **无** |
+| zone 对象 | 每 namespace 一个，需开通/回收 | **不存在** |
+| 全局名字唯一性 | ⚠️ 强制唯一，多集群撞车（§7.5c） | **不存在**——记录按交换机隔离 |
+| 跨租户可见性 | 需 per-tenant view | **天生隔离**——只能查到自己交换机上的 |
+| 解析器 | 需部署且租户网可达 | **无**——每台 hypervisor 本地应答 |
+| 单点 | 有 | 无 |
+| 记录生命周期 | 随 port（同） | 随 port（同） |
 
-**建议 A，C 作为 Neutron 变更不被接受时的退路。** A 结构上最正确（在数据面、零负载），
-且它要的配置变更是绝大多数启用 DNS 的 OpenStack 部署的标准做法。
+**kubezun 侧代码零改动**：仍是在 VIP port 上设 `dns_name`/`dns_domain`（已实现）。
 
-⚠️ 无论哪条，都还有一个未定项：**capsule 的 resolv.conf 来自子网的 `dns_nameservers`**
-（Zun CRI 驱动读取并注入 sandbox，实测当前是 8.8.8.8）。租户内解析生效需要把它指向
-对应方案的 resolver，并保留外部解析的转发路径。
+⚠️ 环境中的 Designate 与 BIND 可以停用，但**先留着**——若将来有对外权威 DNS 需求
+（把租户服务发布到公网域名）仍会用到，那是另一件事。
 
 ---
 

@@ -52,6 +52,23 @@ spec:
     # Placement is injected rather than trusted, so a workload does not have to
     # know about pools or taints, and one that tries to name someone else's is
     # overwritten rather than merely rejected.
+    #
+    # ⚠️ Writing spec.tolerations here REPLACES the whole list: PodSpec.Tolerations
+    # is +listType=atomic with no patchMergeKey (k8s core/v1/types.go:4511), so a
+    # strategic merge patch cannot append to it. Everything the pod is supposed to
+    # arrive with has to be restated below, or it is silently dropped.
+    #
+    # What arrives, and would otherwise be lost:
+    #   - DefaultTolerationSeconds (an in-process admission plugin, so it has
+    #     already run by the time this webhook is called) adds not-ready and
+    #     unreachable at 300s. Losing them means a node going NotReady evicts the
+    #     tenant's pods IMMEDIATELY instead of giving the node 5 minutes to
+    #     recover. Confirmed live 2026-08-07: 111111-default's pods had exactly
+    #     one toleration.
+    #   - For DaemonSet pods the DaemonSet controller adds its own set (not-ready
+    #     and unreachable with NO tolerationSeconds, i.e. forever, plus the
+    #     pressure taints). This rule matches those pods too and still truncates
+    #     them to what is listed here — see the note on the DaemonSet policy below.
     - name: inject-tenant-placement
       match:
         any:
@@ -70,6 +87,15 @@ spec:
                 operator: Equal
                 value: "{{ request.namespace | split(@, '-') | [0] }}"
                 effect: NoSchedule
+              # Do not delete: restores what the replace above would drop.
+              - key: node.kubernetes.io/not-ready
+                operator: Exists
+                effect: NoExecute
+                tolerationSeconds: 300
+              - key: node.kubernetes.io/unreachable
+                operator: Exists
+                effect: NoExecute
+                tolerationSeconds: 300
 
     # Kyverno mutates before it validates, so a pod naming another tenant's
     # pool has already been rewritten to its own by the rule above and this
@@ -141,6 +167,18 @@ metadata:
       yields no pod for the virtual node at all, and placement added at the pod
       level contradicts the node affinity the controller writes, leaving pods
       pending on real nodes forever.
+#
+# ⚠️ UNRESOLVED (2026-08-07): this template rule is not the last word on a DaemonSet
+# pod's tolerations. The DaemonSet controller appends its own set to each pod it
+# creates -- not-ready and unreachable with NO tolerationSeconds (tolerate forever,
+# which is what a DaemonSet wants) plus the disk/memory/pid-pressure and
+# unschedulable taints. knaas-tenant-placement's inject-tenant-placement rule then
+# matches those pods and REPLACES the list, so a tenant DaemonSet pod ends up
+# tolerating not-ready for 300s instead of indefinitely, and not tolerating the
+# pressure taints at all. Restating the DaemonSet set here does not fix it, because
+# the truncation happens at the pod level afterwards. The fix belongs in the pod
+# rule -- either exclude pods owned by a DaemonSet, or carry the controller's set
+# through it -- and is a placement decision, not an oversight to patch blind.
 spec:
   validationFailureAction: Enforce
   background: false
