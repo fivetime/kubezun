@@ -16,7 +16,14 @@ import (
 
 func newTestProvider(t *testing.T, namespaces ...string) *Provider {
 	t.Helper()
-	p, err := New(Config{Namespaces: namespaces, NodeName: "111111-node-az1"}, nil, Caches{})
+	served := make(map[string]struct{}, len(namespaces))
+	for _, n := range namespaces {
+		served[n] = struct{}{}
+	}
+	p, err := New(Config{
+		ServesNamespace: func(ns string) bool { _, ok := served[ns]; return ok },
+		NodeName:        "111111-node-az1",
+	}, nil, Caches{})
 	if err != nil {
 		t.Fatalf("new provider: %v", err)
 	}

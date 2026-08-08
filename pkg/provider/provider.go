@@ -26,12 +26,17 @@ import (
 
 // Config describes what one tenant's virtual node runs.
 type Config struct {
-	// Namespaces the node serves. Every entry point checks incoming pods
-	// against this set: the pod controller only filters on spec.nodeName,
-	// which anyone able to create a pod can write, so this check — not any
-	// admission policy — is the boundary that keeps one tenant's pods off
-	// another tenant's node (DESIGN §4).
-	Namespaces []string
+	// ServesNamespace reports whether this node runs pods from a namespace.
+	// Every entry point asks it: the pod controller only filters on
+	// spec.nodeName, which anyone able to create a pod can write, so this
+	// check — not any admission policy — is the boundary that keeps one
+	// tenant's pods off another tenant's node (DESIGN §4).
+	//
+	// A function rather than a fixed set because a tenant creates namespaces
+	// while this is running, and a set fixed at startup means a namespace made
+	// afterwards has no compute: its pods stay Pending forever, silently, since
+	// authorize deliberately cannot distinguish "not served" from "empty".
+	ServesNamespace func(namespace string) bool
 
 	// NetworkID is the tenant Neutron network capsules attach to.
 	NetworkID string
@@ -54,18 +59,16 @@ type Config struct {
 
 // Provider runs pods as Zun capsules for a single tenant.
 type Provider struct {
-	cfg        Config
-	namespaces map[string]struct{}
-	capsules   *zun.CapsuleAPI
+	cfg      Config
+	capsules *zun.CapsuleAPI
 
 	// podLister is the cluster's view of pods, used to tell a capsule whose
 	// pod is gone from one whose pod this process simply has not seen yet.
 	podLister corev1listers.PodLister
 
-	// configMaps and secrets back the pod's file volumes. A capsule has no
-	// kubelet to project them, so their content is read here and sent with it.
-	configMaps corev1listers.ConfigMapLister
-	secrets    corev1listers.SecretLister
+	// objects backs the pod's file volumes. A capsule has no kubelet to project
+	// them, so their content is read here and sent with it.
+	objects ObjectReader
 
 	mu   sync.RWMutex
 	pods map[string]*corev1.Pod // key: namespace/name
@@ -79,30 +82,36 @@ type Provider struct {
 	notify func(*corev1.Pod)
 }
 
-// Caches are the informer-backed views a provider reads. Pods may be nil, which
-// disables orphan cleanup; without ConfigMaps and Secrets a pod with a file
-// volume is refused rather than started without its files.
+// ObjectReader reads one object at a time.
+//
+// Deliberately not a lister. A lister is backed by a cache of every object of
+// its kind the watch covers, and this process serves one tenant: a cache wide
+// enough to answer for every namespace the tenant may create is also wide
+// enough to hold every other tenant's Secrets, which is a copy of their
+// credentials sitting in memory that nothing this process does needs. Volumes
+// are read once, when a capsule is built, so there is nothing to cache for.
+type ObjectReader interface {
+	ConfigMap(ctx context.Context, namespace, name string) (*corev1.ConfigMap, error)
+	Secret(ctx context.Context, namespace, name string) (*corev1.Secret, error)
+}
+
+// Caches are the views a provider reads. Pods may be nil, which disables orphan
+// cleanup; without Objects a pod with a file volume is refused rather than
+// started without its files.
 type Caches struct {
-	Pods       corev1listers.PodLister
-	ConfigMaps corev1listers.ConfigMapLister
-	Secrets    corev1listers.SecretLister
+	Pods    corev1listers.PodLister
+	Objects ObjectReader
 }
 
 // New builds a provider for one tenant.
 func New(cfg Config, client *zun.Client, caches Caches) (*Provider, error) {
-	if len(cfg.Namespaces) == 0 {
-		return nil, fmt.Errorf("at least one namespace must be served")
-	}
-	ns := make(map[string]struct{}, len(cfg.Namespaces))
-	for _, n := range cfg.Namespaces {
-		ns[n] = struct{}{}
+	if cfg.ServesNamespace == nil {
+		return nil, fmt.Errorf("a namespace check is required")
 	}
 	return &Provider{
 		cfg:        cfg,
-		namespaces: ns,
 		podLister:  caches.Pods,
-		configMaps: caches.ConfigMaps,
-		secrets:    caches.Secrets,
+		objects:    caches.Objects,
 		capsules:   zun.NewCapsuleAPI(client),
 		pods:       make(map[string]*corev1.Pod),
 		deleted:    make(map[string]types.UID),
@@ -114,7 +123,7 @@ func New(cfg Config, client *zun.Client, caches Caches) (*Provider, error) {
 // a not-found error rather than a forbidden one so a caller probing for other
 // tenants' pods cannot tell an unauthorized namespace from an empty one.
 func (p *Provider) authorize(namespace string) error {
-	if _, ok := p.namespaces[namespace]; !ok {
+	if !p.cfg.ServesNamespace(namespace) {
 		return errdefs.NotFoundf("namespace %q is not served by node %s",
 			namespace, p.cfg.NodeName)
 	}
@@ -143,7 +152,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 		}
 	}
 
-	files, err := p.resolveFiles(pod)
+	files, err := p.resolveFiles(ctx, pod)
 	if err != nil {
 		return err
 	}

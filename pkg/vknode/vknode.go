@@ -30,6 +30,8 @@ import (
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/record"
+
+	"github.com/fivetime/kubezun/pkg/provider"
 )
 
 // Set holds what every node in the process shares: the client, the informers,
@@ -45,6 +47,11 @@ type Set struct {
 	configMaps corev1informers.ConfigMapInformer
 	services   corev1informers.ServiceInformer
 	slices     discoveryv1informers.EndpointSliceInformer
+
+	// namespaces is the watched set this process serves. Nil falls back to
+	// fixed, the list given at startup.
+	namespaces *Namespaces
+	fixed      []string
 
 	broadcaster   record.EventBroadcaster
 	workers       int
@@ -62,6 +69,9 @@ type SetOptions struct {
 	// node's own event filter plus the provider's namespace check are what keep
 	// other tenants' pods out.
 	Namespaces []string
+	// NamespaceWatcher supplies the served set when it is watched rather than
+	// configured. Nil keeps Namespaces as the whole answer.
+	NamespaceWatcher *Namespaces
 	// ResyncPeriod for the shared informers. Zero means the client-go default.
 	ResyncPeriod time.Duration
 	// Workers per pod controller. Zero means one.
@@ -117,6 +127,8 @@ func NewSet(opts SetOptions) (*Set, error) {
 
 	return &Set{
 		client:        opts.Client,
+		fixed:         opts.Namespaces,
+		namespaces:    opts.NamespaceWatcher,
 		podFactory:    podFactory,
 		scmFactory:    scmFactory,
 		pods:          podFactory.Core().V1().Pods(),
@@ -448,3 +460,23 @@ func (n *Node) runHTTP(ctx context.Context) (func(), error) {
 		l.Close()   //nolint:errcheck
 	}, nil
 }
+
+// Serves reports whether a namespace is one this process runs pods for. It is
+// the provider's authorization boundary, so it is answered from the watched set
+// rather than from anything fixed at startup.
+func (s *Set) Serves(namespace string) bool {
+	if s.namespaces == nil {
+		// No watcher configured: fall back to the fixed list this process was
+		// started with, which is still a closed set.
+		for _, n := range s.fixed {
+			if n == namespace {
+				return true
+			}
+		}
+		return false
+	}
+	return s.namespaces.Serves(namespace)
+}
+
+// Objects reads a pod's ConfigMaps and Secrets on demand, without caching them.
+func (s *Set) Objects() provider.ObjectReader { return objectReader{client: s.client} }

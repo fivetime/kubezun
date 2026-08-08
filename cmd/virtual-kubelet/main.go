@@ -211,16 +211,15 @@ func run(o options) error {
 		nodeObj.Status.Conditions = []corev1.NodeCondition{knode.ReadyCondition()}
 
 		p, err := provider.New(provider.Config{
-			Namespaces:       namespaces,
+			ServesNamespace:  set.Serves,
 			NetworkID:        o.networkID,
 			AvailabilityZone: spec.zunAZ,
 			Architecture:     spec.arch,
 			NodeName:         spec.name,
 			ClusterDomain:    o.clusterDomain,
 		}, zunClient, provider.Caches{
-			Pods:       set.Pods(),
-			ConfigMaps: set.ConfigMaps(),
-			Secrets:    set.Secrets(),
+			Pods:    set.Pods(),
+			Objects: set.Objects(),
 		})
 		if err != nil {
 			return err

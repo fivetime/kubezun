@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -18,7 +19,7 @@ import (
 // container would otherwise start and report Ready with the file its
 // application reads simply absent — a failure that surfaces as application
 // misbehaviour with nothing pointing back here.
-func (p *Provider) resolveFiles(pod *corev1.Pod) (map[string]map[string][]byte, error) {
+func (p *Provider) resolveFiles(ctx context.Context, pod *corev1.Pod) (map[string]map[string][]byte, error) {
 	var out map[string]map[string][]byte
 
 	for _, v := range pod.Spec.Volumes {
@@ -28,9 +29,9 @@ func (p *Provider) resolveFiles(pod *corev1.Pod) (map[string]map[string][]byte, 
 		)
 		switch {
 		case v.ConfigMap != nil:
-			files, err = p.configMapFiles(pod.Namespace, v.ConfigMap)
+			files, err = p.configMapFiles(ctx, pod.Namespace, v.ConfigMap)
 		case v.Secret != nil:
-			files, err = p.secretFiles(pod.Namespace, v.Secret)
+			files, err = p.secretFiles(ctx, pod.Namespace, v.Secret)
 		default:
 			continue
 		}
@@ -51,13 +52,13 @@ func (p *Provider) resolveFiles(pod *corev1.Pod) (map[string]map[string][]byte, 
 	return out, nil
 }
 
-func (p *Provider) configMapFiles(namespace string, src *corev1.ConfigMapVolumeSource) (map[string][]byte, error) {
-	if p.configMaps == nil {
+func (p *Provider) configMapFiles(ctx context.Context, namespace string, src *corev1.ConfigMapVolumeSource) (map[string][]byte, error) {
+	if p.objects == nil {
 		return nil, fmt.Errorf(
-			"volume from ConfigMap %s: this node was started without a ConfigMap cache",
+			"volume from ConfigMap %s: this node was started without a way to read objects",
 			src.Name)
 	}
-	cm, err := p.configMaps.ConfigMaps(namespace).Get(src.Name)
+	cm, err := p.objects.ConfigMap(ctx, namespace, src.Name)
 	if err != nil {
 		if apierrors.IsNotFound(err) && optional(src.Optional) {
 			return nil, nil
@@ -75,13 +76,13 @@ func (p *Provider) configMapFiles(namespace string, src *corev1.ConfigMapVolumeS
 	return selectKeys(all, src.Items, fmt.Sprintf("ConfigMap %s/%s", namespace, src.Name))
 }
 
-func (p *Provider) secretFiles(namespace string, src *corev1.SecretVolumeSource) (map[string][]byte, error) {
-	if p.secrets == nil {
+func (p *Provider) secretFiles(ctx context.Context, namespace string, src *corev1.SecretVolumeSource) (map[string][]byte, error) {
+	if p.objects == nil {
 		return nil, fmt.Errorf(
-			"volume from Secret %s: this node was started without a Secret cache",
+			"volume from Secret %s: this node was started without a way to read objects",
 			src.SecretName)
 	}
-	sec, err := p.secrets.Secrets(namespace).Get(src.SecretName)
+	sec, err := p.objects.Secret(ctx, namespace, src.SecretName)
 	if err != nil {
 		if apierrors.IsNotFound(err) && optional(src.Optional) {
 			return nil, nil
