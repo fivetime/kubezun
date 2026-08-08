@@ -45,6 +45,10 @@ func unsupported(field, why string) error {
 
 // Validate rejects pods whose spec cannot be represented as a capsule.
 func Validate(pod *corev1.Pod) error {
+	if err := validateSecurity(pod); err != nil {
+		return err
+	}
+
 	if pod.Spec.HostNetwork {
 		return unsupported("spec.hostNetwork",
 			"each capsule owns a Neutron port and has no host network to share")
@@ -93,12 +97,6 @@ func Validate(pod *corev1.Pod) error {
 	}
 	for _, cs := range [][]corev1.Container{pod.Spec.Containers, pod.Spec.InitContainers} {
 		for _, c := range cs {
-			if sc := c.SecurityContext; sc != nil {
-				if sc.Privileged != nil && *sc.Privileged {
-					return unsupported("securityContext.privileged",
-						"the capsule API cannot express privileged containers")
-				}
-			}
 			for _, p := range []*corev1.Probe{
 				c.LivenessProbe, c.ReadinessProbe, c.StartupProbe,
 			} {
@@ -161,6 +159,14 @@ type container struct {
 	// path into the container: neither this process nor the compute host can
 	// reach a capsule's address, and a kata sandbox's network namespace holds
 	// only a tap device, so every probe ultimately runs through ExecSync.
+	// Security is what of the pod's securityContext the runtime can be told.
+	// On the container rather than in the capsule's annotations because the API
+	// overwrites a capsule container's name with a generated one, so an
+	// annotation keyed by container name never matches — measured: the
+	// container ran as root with a writable root filesystem and nothing said
+	// so, which is exactly what these fields exist to prevent.
+	Security *containerSecurity `json:"securityContext,omitempty"`
+
 	LivenessProbe  *corev1.Probe `json:"livenessProbe,omitempty"`
 	ReadinessProbe *corev1.Probe `json:"readinessProbe,omitempty"`
 	StartupProbe   *corev1.Probe `json:"startupProbe,omitempty"`
@@ -292,6 +298,7 @@ type TemplateOptions struct {
 	// behind the gateway this is their own resolver, which is the only one that
 	// answers with the names their manifests use.
 	DNSNameservers []string
+
 	// Architecture is the machine this node's capsules must run on. A node
 	// serves one architecture: its kubernetes.io/arch label is what got the
 	// pod scheduled here, and the capsule has to land on a host that matches
@@ -337,14 +344,14 @@ func BuildTemplate(pod *corev1.Pod, opts TemplateOptions) ([]byte, error) {
 	}
 
 	for _, c := range pod.Spec.InitContainers {
-		built, err := buildContainer(c)
+		built, err := buildContainer(pod, c)
 		if err != nil {
 			return nil, err
 		}
 		t.Spec.InitContainers = append(t.Spec.InitContainers, built)
 	}
 	for _, c := range pod.Spec.Containers {
-		built, err := buildContainer(c)
+		built, err := buildContainer(pod, c)
 		if err != nil {
 			return nil, err
 		}
@@ -369,7 +376,7 @@ func BuildTemplate(pod *corev1.Pod, opts TemplateOptions) ([]byte, error) {
 	return json.Marshal(t)
 }
 
-func buildContainer(c corev1.Container) (container, error) {
+func buildContainer(pod *corev1.Pod, c corev1.Container) (container, error) {
 	out := container{
 		Name:    c.Name,
 		Image:   c.Image,
@@ -401,6 +408,10 @@ func buildContainer(c corev1.Container) (container, error) {
 	// here rather than in the pod: what Kubernetes stores stays what its author
 	// wrote, and only the capsule sees the rewritten form.
 	var err error
+	if sec := effectiveSecurity(pod, &c); !sec.empty() {
+		out.Security = &sec
+	}
+
 	if out.LivenessProbe, err = RewriteProbe(c.LivenessProbe, &c); err != nil {
 		return out, err
 	}
