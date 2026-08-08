@@ -349,13 +349,25 @@ func (s *Set) Run(ctx context.Context) error {
 		defer s.broadcaster.Shutdown()
 	}
 
-	// The namespace watch has to be synced before anything reads the served
-	// set, because that set is the authorization boundary and it fails closed:
-	// a pod controller started against an empty set would refuse every pod
-	// until the watch caught up.
+	// The namespace watch is started, and its first sync waited for, but a
+	// failure to sync does not stop the nodes coming up.
+	//
+	// ⚠️ It used to. Blocking here meant that when the watch could not list
+	// namespaces — a missing RBAC rule, measured — the nodes never registered
+	// and never sent a heartbeat, so the taint manager evicted every pod on
+	// them and the ReplicaSets rebuilt the lot. The capsules those pods stood
+	// for were running the whole time and had nothing to do with the watch.
+	//
+	// A node that cannot name the namespaces it serves should refuse new pods,
+	// which the authorization check already does. It should not tell Kubernetes
+	// it is gone, because that is the one answer that destroys what is already
+	// running.
 	if s.namespaces != nil {
-		if err := s.namespaces.Run(ctx); err != nil {
-			return err
+		if err := s.namespaces.Start(ctx); err != nil {
+			log.G(ctx).WithError(err).Error(
+				"could not read the namespaces this process serves; it will " +
+					"refuse new pods until this is fixed, but what is already " +
+					"running is untouched")
 		}
 	}
 

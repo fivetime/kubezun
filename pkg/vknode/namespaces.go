@@ -2,7 +2,9 @@ package vknode
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"time"
 
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	corev1 "k8s.io/api/core/v1"
@@ -139,11 +141,24 @@ func (n *Namespaces) OnChange(f func(added, removed []string)) {
 	}
 }
 
-// Run starts the watch and blocks until its cache has synced.
-func (n *Namespaces) Run(ctx context.Context) error {
+// syncTimeout bounds the first sync. Beyond it the caller is told, and the
+// watch keeps trying in the background: whatever is wrong is usually a
+// permission that someone has to fix, and the nodes should be up and refusing
+// pods while that happens rather than absent.
+const syncTimeout = 30 * time.Second
+
+// Start begins the watch and waits, briefly, for its first sync.
+//
+// An error means the set is not known yet, not that it is empty, and the
+// distinction matters: the caller must not read "no namespaces" as "serves
+// nothing" and act on it.
+func (n *Namespaces) Start(ctx context.Context) error {
 	go n.informer.Run(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), n.informer.HasSynced) {
-		return ctx.Err()
+
+	wait, cancel := context.WithTimeout(ctx, syncTimeout)
+	defer cancel()
+	if !cache.WaitForCacheSync(wait.Done(), n.informer.HasSynced) {
+		return fmt.Errorf("the namespace watch did not sync within %s", syncTimeout)
 	}
 	log.G(ctx).WithField("namespaces", n.List()).Info("serving these namespaces")
 	return nil
