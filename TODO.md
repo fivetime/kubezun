@@ -406,15 +406,33 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       （FIP 计数 4→3，LB 一并删除）。
       ⚠️ 前置条件：**VIP 子网必须接在带外网网关的 router 上**，否则报
       `ExternalGatewayForFloatingIPNotFound`（本环境原先只接了 pod 子网，已补接）
-- [x] **✅ 定案改为 OVN 数据面 DNS，Designate 不需要（2026-08-08 实测，DESIGN §7.6）**。
-      ML2 dns 扩展把 port 的 `dns_name`/`dns_domain` 写进 **OVN NB DNS 表**，
-      ovn-controller 在每台 hypervisor 本地应答。实测 capsule 内 FQDN 与短名均命中、
-      `wget` 直接可达，公网域名照常（OVN 未命中放行原包到真实解析器）。
-      **一次性消掉了原方案的全部待决项**：不需要 Designate/BIND、不存在 zone 对象、
-      没有全局名字唯一性与多集群撞车、跨租户天生隔离（记录按逻辑交换机作用域）、
-      不需要部署 resolver、无单点。**kubezun 侧代码零改动**。
-      ⚠️ 唯一拓扑要求：**VIP 子网必须与 pod 子网同属一个 Neutron 网络**（同交换机不同子网），
-      实测该配置下东西向流量正常——kubetron 的"VIP 独立子网 dst-MAC 坑"来自不同拓扑，勿套用
+- [x] **✅ DNS 定案：租户自己的 CoreDNS，平台不发布任何名字（2026-08-08，与 kubezoo 协同）**。
+      ⚠️ **推翻了本轮全部前案**（Designate、OVN 数据面 DNS、在 VIP port 上设 dns_name）。
+      **推翻的理由**：从租户视角看，Service 在 `default` 命名空间，应用问的是
+      `rsvc.default.svc.cluster.local`；而平台侧存的是 `111111-default`。
+      实测租户 CoreDNS：租户视角的名字有应答，我发布的上游名字 **NXDOMAIN**——
+      **我发布的名字没有任何租户应用会去问**。
+      更关键：`<svc>.default.svc.cluster.local` 每个租户都要指向不同地址，
+      **任何全局 DNS 命名空间都做不到**（Designate 的 zone 全局唯一在此从假设变成现实）。
+      **per-tenant 解析器不是优化，是唯一可行的架构**，而 kubezoo 已经建好了。
+- [x] **kubezun 侧改为读 `pod.Spec.DNSConfig`（2026-08-08，实测）**：网关注入的就是租户视角的
+      search + nameserver，两者一起拿到，顺带解决"谁告诉 capsule 用哪个 resolver"。
+      Zun 侧加 `knaas.io/dns-nameservers` 注解，pod 指定的覆盖子网默认值。
+      ⚠️ **保留按 namespace 拼装作兜底**——resolver 未 serving 时网关 fail-open 不注入，
+      那时 dnsConfig 为空，没有兜底则短名完全不可解析。
+      **实测（租户视角建 pod）**：capsule 内 `search default.svc.cluster.local svc.cluster.local
+      cluster.local` / `nameserver 254.51.215.104`，与网关注入完全一致
+- [ ] **⭐ VIP := ClusterIP（2026-08-08 实测可行，待实现）**——这一步让上面全部成立：
+      在租户网络上建 service-CIDR 子网（254.51.0.0/16，无 DHCP 无网关），
+      建 LB 时传 `vip_address = svc.spec.clusterIP`。
+      **实测：capsule 直接 `wget http://254.51.24.88/`（rsvc 的 ClusterIP）成功**。
+      于是 **ClusterIP 真正可达**，CoreDNS 照常答 ClusterIP 即可、无需任何改动
+      （不用 k8s_external、不用 externalIPs、不用插件）。
+      ⚠️ 同时消除了 `docs/tenant-guide.md` 里"ClusterIP 不可达"那条限制，届时要改文档
+- [ ] **租户 CoreDNS 必须跑成 capsule**（kubezoo 侧已移除落点豁免，2026-08-08）：
+      只有跑在池上它的 pod 才拿到 OVN 地址，才能当 Octavia member；
+      跑在平台 worker 上（Cilium 地址）则 capsule 既够不到它、它也不能作为 member。
+      ✅ 前置条件已实测：capsule → apiserver 走租户 router 通（返回 401 = 到达且无凭据）
 - [ ] 环境中的 Designate/BIND 可停用；**建议先留着**——将来若需对外权威 DNS
       （把租户服务发布到公网域名）仍会用到，那是另一件事
 - [ ] Octavia health monitor 作为**第二层**（LB 侧自检）是否需要：EndpointSlice 已能

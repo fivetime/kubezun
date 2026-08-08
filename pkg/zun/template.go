@@ -232,10 +232,17 @@ type template struct {
 
 // annotationsFor carries settings the capsule needs but has no field for.
 func annotationsFor(opts TemplateOptions) map[string]string {
-	if len(opts.DNSSearches) == 0 {
+	out := map[string]string{}
+	if len(opts.DNSSearches) > 0 {
+		out["knaas.io/dns-searches"] = strings.Join(opts.DNSSearches, ",")
+	}
+	if len(opts.DNSNameservers) > 0 {
+		out["knaas.io/dns-nameservers"] = strings.Join(opts.DNSNameservers, ",")
+	}
+	if len(out) == 0 {
 		return nil
 	}
-	return map[string]string{"knaas.io/dns-searches": strings.Join(opts.DNSSearches, ",")}
+	return out
 }
 
 // knownArchitectures are the machines Zun can place a capsule on. The
@@ -281,6 +288,10 @@ type TemplateOptions struct {
 	// is what lets an application use a Service's short name. Only this side
 	// knows it: it is derived from the pod's namespace.
 	DNSSearches []string
+	// DNSNameservers is which resolver the pod's containers ask. For a tenant
+	// behind the gateway this is their own resolver, which is the only one that
+	// answers with the names their manifests use.
+	DNSNameservers []string
 	// Architecture is the machine this node's capsules must run on. A node
 	// serves one architecture: its kubernetes.io/arch label is what got the
 	// pod scheduled here, and the capsule has to land on a host that matches

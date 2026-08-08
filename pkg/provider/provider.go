@@ -148,13 +148,16 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 		return err
 	}
 
+	searches, nameservers := dnsConfigFor(pod, p.cfg.ClusterDomain)
+
 	tpl, err := zun.BuildTemplate(pod, zun.TemplateOptions{
 		NetworkID:        p.cfg.NetworkID,
 		AvailabilityZone: p.cfg.AvailabilityZone,
 		Architecture:     p.cfg.Architecture,
 		NodeName:         p.cfg.NodeName,
 		Files:            files,
-		DNSSearches:      dnsSearches(pod.Namespace, p.cfg.ClusterDomain),
+		DNSSearches:      searches,
+		DNSNameservers:   nameservers,
 	})
 	if err != nil {
 		return err
@@ -398,10 +401,30 @@ func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, con
 	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
-// dnsSearches is the search list a pod in this namespace should resolve with:
-// the same three entries a kubelet would compose, so a name written for
-// Kubernetes resolves the way its author expected.
-func dnsSearches(namespace, clusterDomain string) []string {
+// dnsConfigFor decides what the pod's resolver is told: which servers to ask,
+// and what to append to a short name.
+//
+// The gateway writes both into the pod as the tenant sees them — searches under
+// the namespace the tenant knows rather than the one this cluster stores, and
+// the address of that tenant's own resolver. Composing them here instead would
+// produce a namespace no application will ever ask for, because a tenant whose
+// namespace is "default" is stored as "<tenant>-default" and writes the former.
+//
+// It falls back to composing them when the pod carries none. The gateway leaves
+// the config empty while the tenant's resolver is not yet serving, and a pod
+// created in that window with no search list at all resolves nothing by short
+// name.
+func dnsConfigFor(pod *corev1.Pod, clusterDomain string) (searches, nameservers []string) {
+	if cfg := pod.Spec.DNSConfig; cfg != nil && len(cfg.Searches) > 0 {
+		return cfg.Searches, cfg.Nameservers
+	}
+	return composeSearches(pod.Namespace, clusterDomain), nil
+}
+
+// composeSearches is the fallback: the three entries a kubelet would compose.
+// It uses the namespace this cluster stores, which for a tenant behind the
+// gateway is not the one their manifests name — hence only a fallback.
+func composeSearches(namespace, clusterDomain string) []string {
 	base := strings.TrimSuffix(clusterDomain, ".")
 	if base == "" {
 		return nil
