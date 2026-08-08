@@ -422,17 +422,50 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       那时 dnsConfig 为空，没有兜底则短名完全不可解析。
       **实测（租户视角建 pod）**：capsule 内 `search default.svc.cluster.local svc.cluster.local
       cluster.local` / `nameserver 254.51.215.104`，与网关注入完全一致
-- [ ] **⭐ VIP := ClusterIP（2026-08-08 实测可行，待实现）**——这一步让上面全部成立：
-      在租户网络上建 service-CIDR 子网（254.51.0.0/16，无 DHCP 无网关），
-      建 LB 时传 `vip_address = svc.spec.clusterIP`。
-      **实测：capsule 直接 `wget http://254.51.24.88/`（rsvc 的 ClusterIP）成功**。
-      于是 **ClusterIP 真正可达**，CoreDNS 照常答 ClusterIP 即可、无需任何改动
-      （不用 k8s_external、不用 externalIPs、不用插件）。
-      ⚠️ 同时消除了 `docs/tenant-guide.md` 里"ClusterIP 不可达"那条限制，届时要改文档
+- [x] **~~VIP := ClusterIP~~ 已否决（2026-08-08，用户否）**：做法是在每个租户网络上建
+      同一个 service-CIDR 子网，让 VIP 落在上游分配的 ClusterIP 上。技术上实测可行
+      （capsule 直接 `wget http://254.51.24.88/` 成功），但**把同一段地址注册进每个
+      租户的网络就等于在 Service 层把租户之间打通了**，OVN 的多租户隔离随之失效。
+      → 改由下面的注解契约解决：地址由数据面决定，网关照抄，不要求两边地址相同
+- [x] **✅ Service 地址契约 `kubezoo.io/cluster-ip`（2026-08-08，kubezun `a0335a8`，
+      kubezoo `1e017f81` 已上线）**：kubezun 把 LB 的真实地址写进 Service 注解，
+      kubezoo 在租户视角把 `spec.clusterIP` 换成它，上游值原样不动。
+      **键用网关的域名而不是我们的**——将来换一种数据面也填同一个键，
+      这里不该假设背后是负载均衡器。
+      写入时机在 `loadbalancers.Create` 返回后、**不等 provisioning 完成**
+      （VIP 那时已定），把租户看到不可达地址的窗口从几十秒压到 **2 秒**；
+      注解被抹掉能在 45 秒内自愈。reconcile 失败时在 Service 上发
+      `AddressNotReady` 事件——否则租户只看到一个不通的地址而原因只在我们日志里。
+      **kubezoo 侧七项验证全过**：租户见 VIP / 上游未动 / CoreDNS 答 VIP /
+      headless 不被覆盖 / apply 幂等 / 租户写注解被剥 / 租户指定地址被拒
+- [x] **⚠️ 修复：LB 被反复删了重建，租户 ClusterIP 一直在漂（2026-08-08，`7b877db`，
+      理由更正 `8caeaa4`）**：`ensureLoadBalancer` 读 LB 的 `vip_port_id`，
+      404 就判定"provider 建失败留下了坏 LB"，于是删掉重建。
+      **但那个端口本来就会消失**——三个 LB 全部 ACTIVE / ONLINE、member ONLINE，
+      而它们记录的 `vip_port_id` 连 admin 都查不到；OVN provider 把地址放在数据面，
+      不依赖一个要长期存在的 port。于是每轮 reconcile 都把三个 LB 删光重建，
+      **每次重建换一个地址**——正是上面那个契约要保住的东西。
+      日志上写着"负载均衡器没有地址端口"，实际坏它的就是这个进程自己。
+      当初写这段时"实验室同时测到三个"的依据，就是这个 bug 自己造出来的。
+      **修法是删掉，不加替代检查**。实测：三个 VIP 连续 3 分钟四次采样不变，
+      `rebuilding` 触发 0 次。
+      ⚠️ 中途我把原因误判为"端口属于 Octavia 项目所以租户看不见"，
+      那个 project id 其实是租户自己的——已更正
 - [ ] **租户 CoreDNS 必须跑成 capsule**（kubezoo 侧已移除落点豁免，2026-08-08）：
       只有跑在池上它的 pod 才拿到 OVN 地址，才能当 Octavia member；
       跑在平台 worker 上（Cilium 地址）则 capsule 既够不到它、它也不能作为 member。
       ✅ 前置条件已实测：capsule → apiserver 走租户 router 通（返回 401 = 到达且无凭据）
+      **⚠️ 2026-08-08 复查，这条被三件事同时挡住，缺一不可**：
+      1. **CoreDNS 还在 Cilium 节点上**（240.24.0.x / incus-node-05,06）。
+         Kyverno 三条策略选的是 `knaas.io/tenant`，而 `111111-kube-system`
+         只有 kubezoo 的 `kubezoo.io/tenant` → 策略不匹配 → 不注入放置
+      2. **kubezun 没有服务 `111111-kube-system`**（`--namespaces` 是静态单值），
+         所以不给 kube-dns 建 LB，注解不出现，kubezoo 只能报上游那个不可达地址
+         → 见下面的 selector 改造
+      3. **CoreDNS 镜像是 distroless**（`registry.k8s.io/coredns/coredns:v1.13.1`，
+         实测 `/bin/sh` 直接 `CreateContainerError`），而它的 readinessProbe 是
+         `httpGet :8181/ready`，我们改写成容器内执行 → 无可执行文件 → 永不 Ready
+         → **永远不能成为 Octavia member** → 见下面的探针 helper
 - [ ] 环境中的 Designate/BIND 可停用；**建议先留着**——将来若需对外权威 DNS
       （把租户服务发布到公网域名）仍会用到，那是另一件事
 - [ ] Octavia health monitor 作为**第二层**（LB 侧自检）是否需要：EndpointSlice 已能
@@ -445,6 +478,35 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       语义差异（ConfigMap 是快照不是投影、探针在容器内跑且 distroless 无 curl 会失败、
       SA token 默认关）、以及"该怎么写"（设 limits、需要架构就写 nodeSelector、
       VM 冷启动慢要设 initialDelaySeconds）。每条都有本轮实测依据
+- [ ] **⭐ 命名空间作用域改为标签 selector（2026-08-08 定，kube-dns 链路的前置项）**：
+      现在是 `--namespaces 111111-default` 静态单值，代价有三——
+      `<tid>-kube-system` 进不来（kube-dns 因此没有 LB）；租户新建命名空间那里
+      **永远 Pending 且静默**（`authorize` 故意不区分"无权"和"空"）；
+      而填两个以上会让 informer **退化成全集群 watch**
+      （`vknode.go:99` 只有 `len==1` 才加 `WithNamespace`），
+      于是这个租户的进程把**所有租户的 Secret 缓存进内存**。
+      改用 `kubezoo.io/tenant=<id>`：kubezoo 强制写、租户改不动
+      （`convert/namespace.go:53` 拒绝改成别人的值，`proxy/apply.go` 防剥离），
+      而且它**能在 watch 层表达**（前缀不能，field selector 不支持前缀）。
+      我们代码里也就不用抄"定长 6 + 第 7 位是 dash"那段算术——那是 kubezoo 的概念。
+      ⚠️ pod/Secret 的 informer 要随这个集合动态建，**不能先加命名空间再说**，
+      否则就是拿跨租户的 Secret 缓存换一个 DNS
+- [ ] **⚠️ NetworkPolicy 完全不生效，而且是静默 fail-open（2026-08-08 发现）**：
+      全仓库 0 处处理 NetworkPolicy / 安全组。租户的 N 个命名空间落进
+      **同一个 project、同一张 OVN 网、同一组安全组**，而租户建第二个命名空间
+      最常见的动机恰恰是隔离（prod/staging）。策略被 apiserver 收下、存起来、
+      `kubectl get netpol` 看得见，**没有任何东西执行它**。
+      这跟 `template.go:38` 已经写下的原则矛盾（"静默丢弃比失败更糟"）——
+      只是 NetworkPolicy 不是 pod 字段，逃掉了那条检查。
+      **先关上**：对 capsule 档租户拒绝 NetworkPolicy，让租户看到明确拒绝
+      而不是虚假的安全感（虚假隔离比没有隔离危险，没有隔离时人会自己小心）。
+      **再实现**：NetworkPolicy → Neutron 安全组挂到 capsule port；
+      基本 `podSelector`+端口能翻译，`namespaceSelector`/`ipBlock`/egress 组合很硬
+- [ ] **Pod 失败原因用 K8s 词汇而不是后端词汇（2026-08-08 发现，小改）**：
+      现在写的是 `CapsuleMissing` / `CapsuleStuckCreating`，租户没听说过 capsule。
+      K8s 自己有：`ContainerStatusUnknown`（kubelet 判断不出容器结局时用的）、
+      `FailedCreatePodSandBox`（sandbox 始终没建起来）。
+      惯例是 **Reason 用标准词、Message 放细节**，capsule UUID 留在我们日志里
 - [ ] **验收**：去特权 fluent-bit DS 在租户节点起一份 capsule；系统 DS 不落虚拟节点；
       真实节点无 Pending 残留；liveness 失败触发重启；HM 摘除未就绪 member（§12）
 
@@ -653,8 +715,19 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
 
 ## P：平台侧配套（代码不在本仓库）
 
-- [ ] Tenant CRD 开通控制器扩展：节点 spec / VK Deployment / appcred / Kyverno 实例 /
-      ResourceQuota（落点大概率 kubezoo-controller）（§11）
+- [ ] **开通控制器：落点定在我们这边，不在 kubezoo（2026-08-08 定）**。
+      理由：建 Keystone project + appcred 要 **Keystone admin**，
+      放进 kubezoo 就等于让所有租户的前门持有 OpenStack admin——
+      它被攻破的爆炸半径现在止步于 K8s，加上这个就直通每个租户的 OpenStack 资源。
+      次要理由：B1 租户根本不需要 OpenStack，他们代码里要为我们这档加分支；
+      我们每改一次开通步骤要等他们发版。
+      **分工**：Tenant 对象做触发器，kubezoo 只加一个标签
+      （`knaas.io/compute: capsule`，不改 CRD、不改代码，B1 不打）；
+      我们 watch Tenant，见到标签就做全套 project → appcred → 网络/子网/路由 →
+      Secret → 拉起 VK → 状态写回 Tenant 注解。**凭据从头到尾不进 kubezoo 进程**。
+      ✅ 顺带解决了开通的时序：CoreDNS 可以先建，Pending 到虚拟节点出现，自愈，无需协调
+      ⚠️ 命名核对过：环境上的项目叫 `knaas-t1`/`knaas-t2`，不是 `knaas-<租户id>`
+- [ ] Tenant CRD 其余扩展：节点 spec / VK Deployment / Kyverno 实例 / ResourceQuota（§11）
 - [ ] kubetron 租户 DNS 分发通道改造：DNS 跑租户网内 capsule、控制器直推 zone
       （无 kubelet 挂 ConfigMap）（§7）
 - [ ] kubetron M8 顺带：Service/DNS 编排半边可独立部署（kubezun-only 形态只拉编排层）（§7）
@@ -670,3 +743,33 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
 - [ ] §14.6 SA token 长期轮换通道（等 F/ExecSync 落地）
 - [ ] §14.7 单进程多节点 informer 共享形态（阶段 2 定）
 - [ ] §14.8 PVC 供给流程（cinder-csi provision-only vs provider 直管；阶段 2 有状态负载需求时定）
+
+---
+
+## 工程卫生（2026-08-08 一次性收拢）
+
+- [x] **两个仓库都收成单条 master，直接在 master 上开发**（kubezun `c20ca4e`，
+      Zun fork `b212c3e2`）。此前 kubezun 的工作挂在 `feat/rewrite-provider` 上
+      **72 个提交**、Zun fork 散成六条，结果是 "master" 这个词在两个仓库里
+      都不再指代任何有意义的东西，"哪份是权威"每次都要重新查。
+      Zun fork 六条里有两条**不是没合、是已被主线重做取代**，用 `-s ours` 记账后删除，
+      历史仍可达、内容不回流。开分支前先想清楚它要跟谁并行——没有并行就不要开
+- [x] **Zun 配置收进 `deploy/zun/`**（`4bf83b1`）：此前只存在于那几台机器的 `/etc/zun`，
+      环境重建一次就没了。凭据全是占位符。记下来的都是丢了要重踩的：
+      `default_cpu/default_memory = 0`（否则 BestEffort pod 被静默限到 512MB 然后
+      OOM，而 K8s 侧看不到任何解释）、`[os_vif_ovs] ovsdb_connection` 的 socket 路径
+      （默认值在容器化 OVS 下无人监听，报成 `binding_failed` 看着像 Neutron 的问题）
+- [x] **二进制可追溯**（`vcs.modified=false` + revision 对上 master）：
+      此前跑的是从 `0c2886b4` 加一堆**未提交改动**编出来的，追溯不到任何提交。
+      现在 `go version -m /usr/local/bin/kubezun | grep vcs.` 一条命令回答。
+      ⚠️ Makefile 不会因源码变化重编（目标无依赖），改代码后要 `rm -f bin/virtual-kubelet`
+- [x] **README 重写 + `docs/bootstrap.md`**（`749cb3d`）：README 原来还是上游那个
+      归档项目的，把**上游 Zun** 写成前置条件、描述一个已不存在的 provider。
+      bootstrap 补上了此前只能靠看机器才知道的东西：一台计算节点上的两个运行时
+      （kubelet→CRI-O / containerd 整实例专属 Zun，containerd 的 CRI 插件硬编码
+      `k8s.io` namespace 所以不能共用）、kata 三 handler 的 drop-in 与开机重建
+      thinpool 的 unit、Keystone 注册、租户的两个子网、Kyverno 选哪个标签。
+      ⚠️ 验证命令实测改过一次：`openstack appcontainer` 在环境上不存在
+      （zunclient 插件没装），改成直接打 `/v1/services`
+- [ ] **配置与代码之外还差一步**：部署仍是手改文件 / scp 二进制，
+      两边一致是**巧合不是机制**。让部署从一个 ref 出发，机器的身份就是一个 commit id
