@@ -63,3 +63,17 @@ func NewNetworkClient(client *zun.Client) (*gophercloud.ServiceClient, error) {
 	return openstack.NewNetworkV2(client.Provider(),
 		gophercloud.EndpointOpts{Region: client.Region()})
 }
+
+// NewKeyManagerClient builds the Barbican client, from the same session, for
+// the TLS bundles a TERMINATED_HTTPS Ingress needs.
+//
+// Absence is not an error: a deployment without Barbican serves plain-HTTP
+// Ingress perfectly well, and the caller keeps a nil client to refuse TLS
+// with a readable message instead.
+func NewKeyManagerClient(client *zun.Client) (*gophercloud.ServiceClient, error) {
+	if client == nil || client.Provider() == nil {
+		return nil, fmt.Errorf("an authenticated OpenStack session is required")
+	}
+	return openstack.NewKeyManagerV1(client.Provider(),
+		gophercloud.EndpointOpts{Region: client.Region()})
+}

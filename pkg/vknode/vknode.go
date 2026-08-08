@@ -27,6 +27,7 @@ import (
 	"k8s.io/client-go/informers"
 	corev1informers "k8s.io/client-go/informers/core/v1"
 	discoveryv1informers "k8s.io/client-go/informers/discovery/v1"
+	networkingv1informers "k8s.io/client-go/informers/networking/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -52,14 +53,15 @@ type Set struct {
 	configMaps corev1informers.ConfigMapInformer
 	services   corev1informers.ServiceInformer
 	slices     discoveryv1informers.EndpointSliceInformer
+	ingresses  networkingv1informers.IngressInformer
 
 	// namespaces is the watched set this process serves. Nil falls back to
 	// fixed, the list given at startup.
 	namespaces *Namespaces
 	fixed      []string
 
-	resync        time.Duration
-	podFactories  []informers.SharedInformerFactory
+	resync       time.Duration
+	podFactories []informers.SharedInformerFactory
 
 	broadcaster   record.EventBroadcaster
 	workers       int
@@ -139,6 +141,7 @@ func NewSet(opts SetOptions) (*Set, error) {
 	set.scmFactory = scmFactory
 	set.services = scmFactory.Core().V1().Services()
 	set.slices = scmFactory.Discovery().V1().EndpointSlices()
+	set.ingresses = scmFactory.Networking().V1().Ingresses()
 	// Read on demand rather than cached: see listers.go for why a cache is the
 	// wrong shape here even though the interface asks for an informer.
 	set.secrets = secretInformerShim{
@@ -200,6 +203,10 @@ func (s *Set) ServiceInformer() corev1informers.ServiceInformer { return s.servi
 func (s *Set) EndpointSliceInformer() discoveryv1informers.EndpointSliceInformer {
 	return s.slices
 }
+
+// IngressInformer backs the ingress controller, which, like the Service
+// controller, runs once per process: load balancers belong to the tenant.
+func (s *Set) IngressInformer() networkingv1informers.IngressInformer { return s.ingresses }
 
 // Node is one virtual node: its node controller, its pod controller, and its
 // kubelet API endpoint.

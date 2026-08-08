@@ -63,6 +63,15 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list", "watch"]
+  # Ingresses are read to build L7 load balancers, annotated with the load
+  # balancer id, and given their address in status — the same contract
+  # Services get at L4.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses/status"]
+    verbs: ["update", "patch"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]

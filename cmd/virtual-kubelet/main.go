@@ -20,6 +20,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apiserver/pkg/server/dynamiccertificates"
 
+	kingress "github.com/fivetime/kubezun/pkg/ingress"
 	knode "github.com/fivetime/kubezun/pkg/node"
 	"github.com/fivetime/kubezun/pkg/provider"
 	kservice "github.com/fivetime/kubezun/pkg/service"
@@ -31,31 +32,33 @@ import (
 var version = "v1.36.3-knaas.1"
 
 type options struct {
-	nodeName      string
-	tenant        string
-	namespaces    string
-	zone          string
-	zunAZ         string
-	arch          string
-	networkID     string
-	kubeconfig    string
-	listenAddr    string
-	internalIP    string
-	capacityCPU   string
-	capacityMem   string
-	capacityPod   string
-	logLevel      string
-	nsSelector    string
-	leaseSeconds  int
-	nodes         nodeSpecList
-	tlsCert       string
-	tlsKey        string
-	clientCA      string
-	vipSubnet     string
-	vipNetwork    string
-	floatingNet   string
-	clusterDomain string
-	publicSvcs    bool
+	nodeName        string
+	tenant          string
+	namespaces      string
+	zone            string
+	zunAZ           string
+	arch            string
+	networkID       string
+	kubeconfig      string
+	listenAddr      string
+	internalIP      string
+	capacityCPU     string
+	capacityMem     string
+	capacityPod     string
+	logLevel        string
+	nsSelector      string
+	ingressProvider string
+	ingressClass    string
+	leaseSeconds    int
+	nodes           nodeSpecList
+	tlsCert         string
+	tlsKey          string
+	clientCA        string
+	vipSubnet       string
+	vipNetwork      string
+	floatingNet     string
+	clusterDomain   string
+	publicSvcs      bool
 }
 
 func main() {
@@ -138,6 +141,16 @@ func main() {
 			"virtual node's health is a process being up rather than a machine "+
 			"still answering, and the cost is how long the scheduler keeps "+
 			"placing pods on one whose process has died")
+	flag.StringVar(&o.ingressProvider, "ingress-provider", os.Getenv("KUBEZUN_INGRESS_PROVIDER"),
+		"Octavia provider for Ingress load balancers (amphora, or incus where its "+
+			"driver serves L7). Empty disables Ingress entirely. Never \"ovn\": that "+
+			"provider is L4-only and refuses every L7 object. Separate from the "+
+			"Service provider on purpose — an L7 load balancer is real instances "+
+			"with real cost, where a Service is OVN flows and free, which is why "+
+			"turning this on is an operator decision rather than a default")
+	flag.StringVar(&o.ingressClass, "ingress-class", envOr("KUBEZUN_INGRESS_CLASS", "knaas"),
+		"ingress class this process answers for; anything else belongs to other "+
+			"controllers")
 	flag.StringVar(&o.logLevel, "log-level", envOr("KUBEZUN_LOG_LEVEL", "info"), "log level")
 	flag.Parse()
 
@@ -308,6 +321,56 @@ func run(o options) error {
 	} else {
 		vklog.G(ctx).Warn("no --vip-subnet-id; Services get no load balancer, " +
 			"and a pod cannot reach a Service by its cluster address")
+	}
+
+	if o.ingressProvider != "" && o.vipSubnet != "" {
+		if o.ingressProvider == "ovn" {
+			return fmt.Errorf("--ingress-provider=ovn cannot work: the OVN provider " +
+				"is L4-only and refuses every L7 object; use amphora, or incus where " +
+				"its driver serves L7")
+		}
+		octavia, err := kservice.NewOctaviaClient(zunClient)
+		if err != nil {
+			return fmt.Errorf("build the load balancer client: %w", err)
+		}
+		neutron, err := kservice.NewNetworkClient(zunClient)
+		if err != nil {
+			return fmt.Errorf("build the network client: %w", err)
+		}
+		// Barbican is optional: without it plain-HTTP Ingress still works and
+		// TLS is refused with a readable error.
+		keymanager, kmErr := kservice.NewKeyManagerClient(zunClient)
+		if kmErr != nil {
+			vklog.G(ctx).WithError(kmErr).Warn(
+				"no key-manager endpoint; TLS Ingress will be refused")
+			keymanager = nil
+		}
+		ingressCtl, err := kingress.NewController(&kingress.Reconciler{
+			Octavia:           octavia,
+			Neutron:           neutron,
+			KeyManager:        keymanager,
+			Ingresses:         set.IngressInformer().Lister(),
+			Services:          set.ServiceInformer().Lister(),
+			Slices:            set.EndpointSliceInformer().Lister(),
+			IngressClient:     client.NetworkingV1(),
+			Secrets:           set.Objects().Secret,
+			Subnets:           kservice.NewCapsuleSubnets(zun.NewCapsuleAPI(zunClient)),
+			VIPSubnetID:       o.vipSubnet,
+			FloatingNetworkID: o.floatingNet,
+			Provider:          o.ingressProvider,
+			ClassName:         o.ingressClass,
+			Tenant:            o.tenant,
+			ServesNamespace:   set.Serves,
+			Namespaces:        set.ServedNamespaces,
+			Events:            set.EventRecorder("ingress-controller"),
+		}, set.IngressInformer(), set.EndpointSliceInformer())
+		if err != nil {
+			return err
+		}
+		go ingressCtl.Run(ctx)
+		go ingressCtl.RunGC(ctx)
+	} else if o.ingressProvider != "" {
+		vklog.G(ctx).Warn("--ingress-provider is set but --vip-subnet-id is not; Ingress stays off")
 	}
 
 	go func() {

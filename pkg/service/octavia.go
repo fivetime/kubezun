@@ -61,8 +61,8 @@ func GetLoadBalancerByName(ctx context.Context, c *gophercloud.ServiceClient, na
 	}
 }
 
-// listLoadBalancers returns every load balancer the credential can see.
-func listLoadBalancers(ctx context.Context, c *gophercloud.ServiceClient) ([]loadbalancers.LoadBalancer, error) {
+// ListLoadBalancers returns every load balancer the credential can see.
+func ListLoadBalancers(ctx context.Context, c *gophercloud.ServiceClient) ([]loadbalancers.LoadBalancer, error) {
 	pages, err := loadbalancers.List(c, loadbalancers.ListOpts{}).AllPages(ctx)
 	if err != nil {
 		return nil, err

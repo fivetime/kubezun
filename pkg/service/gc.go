@@ -47,7 +47,7 @@ func (c *Controller) sweep(ctx context.Context) {
 		return
 	}
 
-	all, err := listLoadBalancers(ctx, r.Octavia)
+	all, err := ListLoadBalancers(ctx, r.Octavia)
 	if err != nil {
 		log.G(ctx).WithError(err).Warn("load balancer sweep skipped: could not list them")
 		return
@@ -107,6 +107,15 @@ func (r *Reconciler) parseLBName(name string) (namespace, service string, ok boo
 		return "", "", false
 	}
 	rest := strings.TrimPrefix(name, prefix)
+	// ⚠️ Ingress load balancers share the tenant prefix with an extra "ing"
+	// segment ("kubezun_<tenant>_ing_<ns>_<name>"). Splitting on the first
+	// underscore would read "ing" as a namespace here, find no such Service,
+	// and this sweep would delete every Ingress load balancer as an orphan.
+	// Segment count is the discriminator: a namespace cannot contain an
+	// underscore, so a Service name splits into exactly two parts.
+	if strings.HasPrefix(rest, "ing_") {
+		return "", "", false
+	}
 	// A namespace cannot contain an underscore and a Service name cannot
 	// either, so one split recovers both.
 	namespace, service, found := strings.Cut(rest, "_")
