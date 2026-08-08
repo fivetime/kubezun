@@ -248,7 +248,7 @@ func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) (err error) {
 	}
 	terminated := tracked.DeepCopy()
 	terminated.Status.Phase = corev1.PodSucceeded
-	terminated.Status.Reason = "CapsuleDeleted"
+	terminated.Status.Reason = "Completed"
 	terminated.Status.Conditions = zun.PodConditions("Deleted", false, now)
 	if len(terminated.Status.ContainerStatuses) == 0 {
 		for _, c := range terminated.Spec.Containers {
@@ -261,7 +261,10 @@ func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) (err error) {
 		terminated.Status.ContainerStatuses[i].Ready = false
 		terminated.Status.ContainerStatuses[i].State = corev1.ContainerState{
 			Terminated: &corev1.ContainerStateTerminated{
-				Reason:     "CapsuleDeleted",
+				// The pod was deleted, so the containers were stopped without
+				// their own exit being observed. This is the word kubelet uses
+				// when it cannot report a container's outcome.
+				Reason:     "ContainerStatusUnknown",
 				FinishedAt: now,
 			},
 		}

@@ -22,11 +22,11 @@ func TestFailContainersReplacesWaitingState(t *testing.T) {
 			Terminated: &corev1.ContainerStateTerminated{Reason: "Error", ExitCode: 137}}},
 	}}}
 
-	failContainers(pod, "CapsuleStuckCreating", "no compute node claimed it",
+	failContainers(pod, "FailedCreatePodSandBox", "no machine claimed this pod",
 		metav1.NewTime(time.Now()))
 
 	got := pod.Status.ContainerStatuses[0]
-	if got.State.Terminated == nil || got.State.Terminated.Reason != "CapsuleStuckCreating" {
+	if got.State.Terminated == nil || got.State.Terminated.Reason != "FailedCreatePodSandBox" {
 		t.Errorf("waiting container was not failed: %+v", got.State)
 	}
 	if got.State.Terminated != nil && got.State.Terminated.ExitCode == 0 {

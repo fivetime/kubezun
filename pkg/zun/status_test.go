@@ -196,8 +196,10 @@ func TestContainerStatusesReportUnschedulableCapsule(t *testing.T) {
 	if w == nil {
 		t.Fatalf("container is not waiting: %+v", got[0].State)
 	}
-	if w.Reason != "CapsuleUnschedulable" {
-		t.Errorf("reason = %q, want CapsuleUnschedulable", w.Reason)
+	// Kubelet's own word, not Zun's: a tenant reads this, and nothing they own
+	// knows how to act on a reason that names the service behind the node.
+	if w.Reason != "UnexpectedAdmissionError" {
+		t.Errorf("reason = %q, want UnexpectedAdmissionError", w.Reason)
 	}
 	if w.Message != "There are not enough hosts available." {
 		t.Errorf("message = %q, want Zun's reason", w.Message)
@@ -218,7 +220,10 @@ func TestContainerStatusesLeavePlacedCapsulesAlone(t *testing.T) {
 		// test: a terminated container would never reach it.
 		Containers: []Container{{UUID: "u", Status: "Creating"}},
 	}
-	if w := ContainerStatuses(pod, cap)[0].State.Waiting; w == nil || w.Reason != "Creating" {
+	// ContainerCreating, which is what a starting container reads as in
+	// Kubernetes — and specifically not the placement failure, which is the
+	// override this guards against.
+	if w := ContainerStatuses(pod, cap)[0].State.Waiting; w == nil || w.Reason != "ContainerCreating" {
 		t.Errorf("waiting state was overwritten for a capsule that had a host: %+v", w)
 	}
 }
@@ -249,5 +254,78 @@ func TestContainerStatusesReportRestarts(t *testing.T) {
 	cap.Containers[0].Healthcheck = nil
 	if got := ContainerStatuses(pod, cap)[0].RestartCount; got != 0 {
 		t.Errorf("RestartCount = %d for a container with no probe state, want 0", got)
+	}
+}
+
+// Nothing a tenant reads may name the service running their pods. They asked
+// for a pod and they get a pod: the reasons in `kubectl describe` have to be the
+// ones a kubelet would write, so a runbook or a tool built for Kubernetes reads
+// them correctly. A word like Rebuilding or Dead means nothing to a tenant and
+// nothing they own knows how to act on it.
+//
+// Guarding the whole vocabulary rather than the cases fixed once, because the
+// leak is easy to reintroduce: every Zun status is a string that looks
+// presentable, and passing one straight through reads as harmless.
+func TestNoBackendVocabularyReachesTheTenant(t *testing.T) {
+	// Every status Zun can report, per the comment at the top of status.go.
+	zunStatuses := []string{
+		"Error", "Running", "Stopped", "Paused", "Unknown", "Creating",
+		"Created", "Deleted", "Deleting", "Rebuilding", "Dead", "Restarting",
+	}
+	// Words that would tell a tenant which service is behind their node, or
+	// that Kubernetes has no meaning for.
+	foreign := map[string]bool{
+		"Rebuilding": true, "Dead": true, "Paused": true, "Deleting": true,
+		"Deleted": true, "Created": true, "Restarting": true, "Creating": true,
+		"Unknown": true,
+	}
+
+	kubeletVocabulary := map[string]bool{
+		"ContainerCreating": true, "ContainerStatusUnknown": true,
+		"PodInitializing": true, "Completed": true, "Error": true,
+		"ContainersNotReady": true, "ContainersNotInitialized": true,
+		"NetworkNotReady": true, "CrashLoopBackOff": true,
+		"UnexpectedAdmissionError": true, "RunContainerError": true,
+		"FailedCreatePodSandBox": true, "": true,
+	}
+
+	for _, status := range zunStatuses {
+		for _, got := range []string{
+			waitingReason(status),
+			terminatedReason(status),
+		} {
+			if foreign[got] {
+				t.Errorf("status %q produced %q, which names the compute backend "+
+					"or has no Kubernetes meaning", status, got)
+			}
+			if !kubeletVocabulary[got] {
+				t.Errorf("status %q produced %q, which is not a reason a kubelet "+
+					"writes; add it to the vocabulary deliberately or map it", status, got)
+			}
+		}
+
+		for _, c := range PodConditions(status, false, metav1.Now()) {
+			if foreign[c.Reason] {
+				t.Errorf("status %q gave condition %s the reason %q, which names "+
+					"the compute backend", status, c.Type, c.Reason)
+			}
+			if !kubeletVocabulary[c.Reason] {
+				t.Errorf("status %q gave condition %s the reason %q, which is not "+
+					"a reason a kubelet writes", status, c.Type, c.Reason)
+			}
+		}
+
+		st := ContainerState(&Container{Status: status})
+		var reason string
+		switch {
+		case st.Waiting != nil:
+			reason = st.Waiting.Reason
+		case st.Terminated != nil:
+			reason = st.Terminated.Reason
+		}
+		if foreign[reason] {
+			t.Errorf("status %q became container reason %q, which names the "+
+				"compute backend", status, reason)
+		}
 	}
 }

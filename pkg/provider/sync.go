@@ -92,10 +92,10 @@ func (p *Provider) syncOnce(ctx context.Context) error {
 			if pod.Status.Phase == corev1.PodPending || pod.Status.Phase == corev1.PodRunning {
 				p.updateStatus(pod, func(pod *corev1.Pod) {
 					pod.Status.Phase = corev1.PodFailed
-					pod.Status.Reason = "CapsuleMissing"
+					pod.Status.Reason = "ContainerStatusUnknown"
 					pod.Status.Conditions = zun.PodConditions("Error", false, now)
-					failContainers(pod, "CapsuleMissing",
-						"the capsule backing this pod no longer exists", now)
+					failContainers(pod, "ContainerStatusUnknown",
+						"the containers are gone and their outcome cannot be determined", now)
 				})
 			}
 			continue
@@ -111,10 +111,10 @@ func (p *Provider) syncOnce(ctx context.Context) error {
 				Warn("capsule never left Creating; failing the pod so it can be replaced")
 			p.updateStatus(pod, func(pod *corev1.Pod) {
 				pod.Status.Phase = corev1.PodFailed
-				pod.Status.Reason = "CapsuleStuckCreating"
+				pod.Status.Reason = "FailedCreatePodSandBox"
 				pod.Status.Conditions = zun.PodConditions("Error", false, now)
-				failContainers(pod, "CapsuleStuckCreating",
-					"the capsule never left Creating; no compute node ever claimed it", now)
+				failContainers(pod, "FailedCreatePodSandBox",
+					"the sandbox never finished being created; no machine claimed this pod", now)
 			})
 			continue
 		}

@@ -9,6 +9,43 @@ import (
 // Error, Running, Stopped, Paused, Unknown, Creating, Created, Deleted,
 // Deleting, Rebuilding, Dead, Restarting.
 
+// waitingReason and terminatedReason translate a capsule's status into the word
+// Kubernetes uses for the same thing.
+//
+// ⭐ Nothing a tenant reads should name the service running their pods. They
+// asked for a pod and they get a pod: `kubectl describe` shows the reasons a
+// kubelet would show, and a tool or a runbook written against Kubernetes reads
+// them correctly. Sending Zun's own vocabulary — Rebuilding, Dead, or a reason
+// with "capsule" in it — puts a word in front of the tenant that means nothing
+// to them and that nothing they own knows how to act on.
+//
+// The detail still exists; it goes in the message and in this process's log,
+// where the platform's operators are the audience.
+func waitingReason(status string) string {
+	switch status {
+	case "Creating", "Created", "Rebuilding", "Restarting":
+		// kubelet's word for a container that has not started yet.
+		return "ContainerCreating"
+	case "Paused", "Deleting", "Deleted", "Unknown":
+		// Kubernetes has no way to say any of these about a container, and
+		// naming one of its own states would be a claim that is not true. This
+		// is its word for "the outcome cannot be determined", which is exactly
+		// what a caller can act on here.
+		return "ContainerStatusUnknown"
+	}
+	return "ContainerStatusUnknown"
+}
+
+func terminatedReason(status string) string {
+	switch status {
+	case "Stopped":
+		return "Completed"
+	}
+	// Error and Dead both mean it stopped badly, which is what kubelet reports
+	// for a container that exited non-zero.
+	return "Error"
+}
+
 // PodPhase maps a capsule status onto a pod phase.
 func PodPhase(status string) corev1.PodPhase {
 	switch status {
@@ -48,13 +85,16 @@ func PodConditions(status string, ready bool, t metav1.Time) []corev1.PodConditi
 		}
 	case "Creating", "Created", "Rebuilding", "Restarting":
 		return []corev1.PodCondition{
-			{Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: status, LastTransitionTime: t},
-			{Type: corev1.PodInitialized, Status: corev1.ConditionFalse, Reason: status, LastTransitionTime: t},
+			{Type: corev1.PodReady, Status: corev1.ConditionFalse,
+				Reason: "ContainersNotReady", LastTransitionTime: t},
+			{Type: corev1.PodInitialized, Status: corev1.ConditionFalse,
+				Reason: "ContainersNotInitialized", LastTransitionTime: t},
 			scheduled,
 		}
 	}
 	return []corev1.PodCondition{
-		{Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: status, LastTransitionTime: t},
+		{Type: corev1.PodReady, Status: corev1.ConditionFalse,
+			Reason: "ContainersNotReady", LastTransitionTime: t},
 		scheduled,
 	}
 }
@@ -84,7 +124,7 @@ func ContainerState(c *Container) corev1.ContainerState {
 		return corev1.ContainerState{
 			Terminated: &corev1.ContainerStateTerminated{
 				ExitCode:   exitCode(c),
-				Reason:     c.Status,
+				Reason:     terminatedReason(c.Status),
 				Message:    c.StatusDetail,
 				StartedAt:  started,
 				FinishedAt: metav1.NewTime(c.UpdatedAt.Time),
@@ -93,7 +133,7 @@ func ContainerState(c *Container) corev1.ContainerState {
 	default:
 		return corev1.ContainerState{
 			Waiting: &corev1.ContainerStateWaiting{
-				Reason:  c.Status,
+				Reason:  waitingReason(c.Status),
 				Message: c.StatusReason,
 			},
 		}
@@ -170,10 +210,15 @@ func capsuleFailure(cap *Capsule) (reason, message string, failed bool) {
 		return "", "", false
 	}
 	if cap.Host == "" {
-		return "CapsuleUnschedulable", capsuleReasonOr(cap,
-			"no compute host could satisfy this pod's placement requirements"), true
+		// Kubelet's own word for a pod its node accepted and then could not
+		// admit for a reason it cannot categorise, which is this exactly: the
+		// node took the pod, and nothing behind it could run the pod's
+		// placement requirements.
+		return "UnexpectedAdmissionError", capsuleReasonOr(cap,
+			"no machine behind this node could satisfy the pod's placement requirements"), true
 	}
-	return "CapsuleFailed", capsuleReasonOr(cap, "the capsule failed"), true
+	return "RunContainerError", capsuleReasonOr(cap,
+		"the pod's containers could not be run"), true
 }
 
 func capsuleReasonOr(cap *Capsule, fallback string) string {
