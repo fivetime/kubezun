@@ -9,42 +9,50 @@ import (
 // Error, Running, Stopped, Paused, Unknown, Creating, Created, Deleted,
 // Deleting, Rebuilding, Dead, Restarting.
 
-// waitingReason and terminatedReason translate a capsule's status into the word
-// Kubernetes uses for the same thing.
+// waitingReason and terminatedReason turn a capsule's status into what a tenant
+// should read.
 //
-// ⭐ Nothing a tenant reads should name the service running their pods. They
-// asked for a pod and they get a pod: `kubectl describe` shows the reasons a
-// kubelet would show, and a tool or a runbook written against Kubernetes reads
-// them correctly. Sending Zun's own vocabulary — Rebuilding, Dead, or a reason
-// with "capsule" in it — puts a word in front of the tenant that means nothing
-// to them and that nothing they own knows how to act on.
+// ⭐ What must not survive is a word that names the service behind the node.
+// A reason like CapsuleMissing describes Zun's object model, which a tenant has
+// no way to act on and no reason to know about.
 //
-// The detail still exists; it goes in the message and in this process's log,
-// where the platform's operators are the audience.
-func waitingReason(status string) string {
+// ⚠️ That is the only rule. A container reason is a free string — kubelet has
+// its own set and every operator invents more — so a state Kubernetes has no
+// word for is fine to describe in plain terms. An earlier version of this
+// mapped Paused, Deleting and Deleted onto ContainerStatusUnknown to stay
+// inside kubelet's vocabulary, which was worse: the state is perfectly well
+// known, and reporting "cannot be determined" threw away the one useful thing
+// there was to say.
+//
+// So where kubelet has a word for the same thing, use it — a tenant's tooling
+// already knows ContainerCreating. Where it does not, say what is true.
+// tenantReason is the single table, so no input can produce a word that names
+// the backend — including a status reaching the function that does not normally
+// handle it, which is how two of Zun's own words slipped through a fallback.
+func tenantReason(status string) string {
 	switch status {
 	case "Creating", "Created", "Rebuilding", "Restarting":
-		// kubelet's word for a container that has not started yet.
+		// kubelet's own word for a container that has not started yet, and it
+		// means the same thing here. Rebuilding is Zun's name for recreating
+		// one, which is this from a tenant's side.
 		return "ContainerCreating"
-	case "Paused", "Deleting", "Deleted", "Unknown":
-		// Kubernetes has no way to say any of these about a container, and
-		// naming one of its own states would be a claim that is not true. This
-		// is its word for "the outcome cannot be determined", which is exactly
-		// what a caller can act on here.
-		return "ContainerStatusUnknown"
-	}
-	return "ContainerStatusUnknown"
-}
-
-func terminatedReason(status string) string {
-	switch status {
 	case "Stopped":
 		return "Completed"
+	case "Error", "Dead":
+		// Both mean it stopped badly. Error is what kubelet reports for a
+		// container that exited non-zero, and Dead says nothing more.
+		return "Error"
+	case "Unknown":
+		// Here the state really is unknown, which is what kubelet's word says.
+		return "ContainerStatusUnknown"
 	}
-	// Error and Dead both mean it stopped badly, which is what kubelet reports
-	// for a container that exited non-zero.
-	return "Error"
+	// Paused, Deleting, Deleted: no Kubernetes equivalent, and each describes
+	// itself in terms a tenant reads without knowing anything about Zun.
+	return status
 }
+
+func waitingReason(status string) string    { return tenantReason(status) }
+func terminatedReason(status string) string { return tenantReason(status) }
 
 // PodPhase maps a capsule status onto a pod phase.
 func PodPhase(status string) corev1.PodPhase {

@@ -1,6 +1,7 @@
 package zun
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -257,75 +258,75 @@ func TestContainerStatusesReportRestarts(t *testing.T) {
 	}
 }
 
-// Nothing a tenant reads may name the service running their pods. They asked
-// for a pod and they get a pod: the reasons in `kubectl describe` have to be the
-// ones a kubelet would write, so a runbook or a tool built for Kubernetes reads
-// them correctly. A word like Rebuilding or Dead means nothing to a tenant and
-// nothing they own knows how to act on it.
+// Nothing a tenant reads may name the service running their pods. A reason like
+// CapsuleMissing describes Zun's object model, which a tenant cannot act on and
+// has no reason to know about.
 //
-// Guarding the whole vocabulary rather than the cases fixed once, because the
-// leak is easy to reintroduce: every Zun status is a string that looks
-// presentable, and passing one straight through reads as harmless.
+// ⚠️ That is the whole rule, and an earlier version of this test enforced a
+// stricter one — every reason had to be a word kubelet itself writes. That was
+// wrong twice over: a container reason is a free string that operators extend
+// all the time, and the whitelist forced Paused and Deleting to be reported as
+// ContainerStatusUnknown, which threw away a state that was perfectly well
+// known. Testing for the leak, not for membership of a vocabulary.
 func TestNoBackendVocabularyReachesTheTenant(t *testing.T) {
 	// Every status Zun can report, per the comment at the top of status.go.
 	zunStatuses := []string{
 		"Error", "Running", "Stopped", "Paused", "Unknown", "Creating",
 		"Created", "Deleted", "Deleting", "Rebuilding", "Dead", "Restarting",
 	}
-	// Words that would tell a tenant which service is behind their node, or
-	// that Kubernetes has no meaning for.
-	foreign := map[string]bool{
-		"Rebuilding": true, "Dead": true, "Paused": true, "Deleting": true,
-		"Deleted": true, "Created": true, "Restarting": true, "Creating": true,
-		"Unknown": true,
+	// Words that name Zun's own model rather than describing a container.
+	// Rebuilding is here because it is Zun's name for recreating a container,
+	// and Dead because Kubernetes says Error; neither tells a tenant anything
+	// their tooling understands.
+	backendWords := map[string]bool{
+		"Rebuilding": true, "Dead": true, "Created": true,
 	}
 
-	kubeletVocabulary := map[string]bool{
-		"ContainerCreating": true, "ContainerStatusUnknown": true,
-		"PodInitializing": true, "Completed": true, "Error": true,
-		"ContainersNotReady": true, "ContainersNotInitialized": true,
-		"NetworkNotReady": true, "CrashLoopBackOff": true,
-		"UnexpectedAdmissionError": true, "RunContainerError": true,
-		"FailedCreatePodSandBox": true, "": true,
+	leaks := func(where, reason string) {
+		if backendWords[reason] {
+			t.Errorf("%s produced %q, which is the backend's word for it", where, reason)
+		}
+		for _, term := range []string{"capsule", "Capsule", "zun", "Zun"} {
+			if strings.Contains(reason, term) {
+				t.Errorf("%s produced %q, which names the compute backend", where, reason)
+			}
+		}
 	}
 
 	for _, status := range zunStatuses {
-		for _, got := range []string{
-			waitingReason(status),
-			terminatedReason(status),
-		} {
-			if foreign[got] {
-				t.Errorf("status %q produced %q, which names the compute backend "+
-					"or has no Kubernetes meaning", status, got)
-			}
-			if !kubeletVocabulary[got] {
-				t.Errorf("status %q produced %q, which is not a reason a kubelet "+
-					"writes; add it to the vocabulary deliberately or map it", status, got)
-			}
-		}
+		leaks("waitingReason("+status+")", waitingReason(status))
+		leaks("terminatedReason("+status+")", terminatedReason(status))
 
 		for _, c := range PodConditions(status, false, metav1.Now()) {
-			if foreign[c.Reason] {
-				t.Errorf("status %q gave condition %s the reason %q, which names "+
-					"the compute backend", status, c.Type, c.Reason)
-			}
-			if !kubeletVocabulary[c.Reason] {
-				t.Errorf("status %q gave condition %s the reason %q, which is not "+
-					"a reason a kubelet writes", status, c.Type, c.Reason)
-			}
+			leaks("condition "+string(c.Type)+" for "+status, c.Reason)
 		}
 
 		st := ContainerState(&Container{Status: status})
-		var reason string
 		switch {
 		case st.Waiting != nil:
-			reason = st.Waiting.Reason
+			leaks("container waiting for "+status, st.Waiting.Reason)
 		case st.Terminated != nil:
-			reason = st.Terminated.Reason
+			leaks("container terminated for "+status, st.Terminated.Reason)
 		}
-		if foreign[reason] {
-			t.Errorf("status %q became container reason %q, which names the "+
-				"compute backend", status, reason)
+	}
+}
+
+// A state Kubernetes has no word for is reported as it is, rather than flattened
+// into something vaguer. Reporting "cannot be determined" about a container that
+// is simply paused loses the only useful thing there was to say.
+func TestStatesKubernetesCannotExpressAreStillDescribed(t *testing.T) {
+	for _, status := range []string{"Paused", "Deleting", "Deleted"} {
+		if got := waitingReason(status); got != status {
+			t.Errorf("waitingReason(%q) = %q; a known state was replaced with something vaguer",
+				status, got)
 		}
+	}
+	// And where a kubelet word means the same thing, it wins: a tenant's tooling
+	// already knows this one.
+	if got := waitingReason("Creating"); got != "ContainerCreating" {
+		t.Errorf("waitingReason(Creating) = %q, want ContainerCreating", got)
+	}
+	if got := waitingReason("Unknown"); got != "ContainerStatusUnknown" {
+		t.Errorf("waitingReason(Unknown) = %q, want ContainerStatusUnknown", got)
 	}
 }
