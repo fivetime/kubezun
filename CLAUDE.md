@@ -118,5 +118,9 @@ capsule 无 claim 必报错，缺口仅此一字段，DESIGN §14.6）；`pkg/co
   实例 + fork socket 配置项**（DESIGN §7 共节点约束，TODO F 门槛项）。
 - 阶段 0 PoC 不依赖 Kata：网络/LB/DNS/restart 保 IP 验证走 runc 同样成立，Kata 只影响
   隔离性，PoC 通过后再补。
-- 现有 745 行旧代码（zun.go/types.go/config.go/cmd/）基于已归档 node-cli + go1.12：
-  仅状态映射（zun.go:447-536）计划迁移保留，其余按 DESIGN §11 重写，勿在旧骨架上继续搭。
+- 那 745 行旧代码（zun.go/types.go/config.go，基于已归档 node-cli + go1.12）已按 DESIGN §11
+  重写完毕，只有状态映射迁移保留了下来；master 上就是重写后的代码，旧骨架不复存在。
+- **两个仓库都只有一条 master 分支，直接在 master 上开发**（2026-08-08 定，kubezun 与
+  Zun fork 同时收拢）。之前 kubezun 的工作挂在 `feat/rewrite-provider` 上挂了 72 个提交、
+  Zun fork 散成六条，结果是 master 这个词在两个仓库里都不再指代任何有意义的东西，
+  "哪份是权威"每次都要重新查。开分支前先想清楚它要跟谁并行——没有并行就不要开。
