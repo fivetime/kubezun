@@ -546,13 +546,31 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       `_schedule_next` 永不写 `_next` → 永远不到期**。容器整个生命周期不就绪且日志里什么都没有
       （不执行的探针无法失败）。而 `docs/tenant-guide.md` 恰恰**建议租户设 initialDelaySeconds**
       （Kata 冷启动慢），所以它专打我们让人写的那种 pod。已改为回退到 `created_at`
-- [ ] **⚠️ CoreDNS 跑成 capsule 会反复建删（2026-08-08 未解决，已回滚保服务）**：
-      打上 `knaas.io/tenant` 后 CoreDNS 确实落到虚拟节点并**拿到租户网络地址**
-      （192.168.100.x），但 capsule 反复 `Creating → CapsuleDeleted`。
-      线索：kubezun 日志里 `pod ... not found in pod lister` + `deletePodsFromKubernetes`
-      被触发——即上游的 dangling 删除。`111111-default` 的 pod 正常，只有
-      `111111-kube-system` 的抖，怀疑与每节点 pod informer 的覆盖/同步有关。
-      **已回滚**（去标签 + CoreDNS 回集群节点），租户解析器恢复正常
+- [x] **✅ CoreDNS 跑成 capsule 的两层根因全部查清（2026-08-08，均非 kubezun 代码）**：
+      打标签后 CoreDNS 落到虚拟节点、拿到租户网络地址，但 capsule 每 ~60s 被删。
+      我先后猜了五次全错（节点心跳/informer 覆盖/kubezoo 对账/模板来回切/上游 VK 删除），
+      派 ultracode 全仓库摸排 + 对抗验证才定位。**两层**：
+      1. **cilium-operator 的 unmanaged-pod GC**（`cilium/operator/unmanagedpods/`）：
+         每 15s 删除 `phase=Running` 且带 `k8s-app=kube-dns`、无 CiliumEndpoint 的 pod。
+         capsule 不经 Cilium 数据面 → 永远没有 CiliumEndpoint → 永远"未管理" → 永删。
+         5 分钟冷却按 `namespace/name` 记，而 RS 每次换随机后缀，保险丝永不匹配。
+         **实测坐实**：operator 日志 `"Restarting unmanaged pod" ...unmanaged-pods-gc`
+         + pod 名一一对上 + `timeSincePodStarted≈44s`。
+         **解法**：kubezoo 把 CoreDNS 的 `k8s-app` 从 `kube-dns` 改成 `core-dns`
+         （Service 选择器 + RS 选择器同步），改后 **6 分钟纹丝不动**
+      2. **租户 router 的 SNAT 吞掉东西向 LB 流量**（数据面，非 kubezun 代码）：
+         改标签后 CoreDNS 稳定了，但 capsule 经 VIP 仍不通（连之前以为可用的
+         TCP Service 也超时——**整套 Service 数据面从没真正承载过流量**）。
+         `ovn-trace` 完整展开定位：capsule→VIP 经 router 时命中
+         `lr_out_snat: ct_snat(10.128.32.158)`，源被改成外网口，CoreDNS 应答回不来。
+         直连 pod 通是因为同子网纯 L2 不经 router。
+         **实测坐实**：删掉 router 的 SNAT 规则后，capsule 立即解析成功、经 VIP
+         wget 真的返回 HTML、短名/全名全通。
+         **解法已写进 `docs/bootstrap.md` §4**：pod 子网与 VIP 子网同一 address scope，
+         Neutron 就不装 SNAT（东西向不 NAT、出外网才 NAT）。
+         ⚠️ address-scope 消除 SNAT 是基于 Neutron 语义的推荐，**本环境只验证了
+         "删 SNAT 后通"**，文档里给了 operator 自测步骤。
+      ⚠️ 实验环境当前 SNAT 是我手删的临时状态（Neutron 可能自动同步加回），待恢复/重配
 - [ ] **⚠️ arm64 虚拟节点没有硬件却照样上报容量（2026-08-08 发现）**：
       CoreDNS 先被调度到 `111111-node-arm64`，全部 `CapsuleUnschedulable`（Placement 拒绝）。
       这正是"节点上报的 capacity 是承诺不是库存"的实例——虚拟节点按配额镜像容量，

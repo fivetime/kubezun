@@ -167,10 +167,20 @@ lab, tenant `111111` is project `knaas-t1`:
 
 ```sh
 openstack project create knaas-t1
+
+# Two subnets carved from one address scope, so the router does not NAT between
+# them -- see "Why the address scope" below, which is not optional.
+openstack address scope create --ip-version 4 knaas-t1-scope
+openstack subnet pool create knaas-t1-pool \
+  --address-scope knaas-t1-scope --pool-prefix 192.168.0.0/16
+
 openstack network create t1-net
-openstack subnet create t1-subnet --network t1-net --subnet-range 192.168.100.0/24
+openstack subnet create t1-subnet --network t1-net \
+  --subnet-pool knaas-t1-pool --prefix-length 24          # -> 192.168.100.0/24
 openstack network create t1-vip-net
-openstack subnet create t1-vip-subnet --network t1-vip-net --subnet-range 192.168.200.0/24
+openstack subnet create t1-vip-subnet --network t1-vip-net \
+  --subnet-pool knaas-t1-pool --prefix-length 24          # -> 192.168.200.0/24
+
 openstack router create t1-router
 openstack router set t1-router --external-gateway public
 openstack router add subnet t1-router t1-subnet
@@ -180,6 +190,49 @@ openstack router add subnet t1-router t1-vip-subnet
 Two subnets, not one: capsules take addresses from `t1-subnet` and Service load
 balancers from `t1-vip-subnet`. Keeping them apart means a Service address is
 never mistaken for a pod address and the router sits in front of both.
+
+### Why the address scope, and why it is not optional
+
+Both subnets come from one subnet pool inside one address scope. Without that,
+a Service is reachable in the control plane -- the load balancer is ACTIVE, its
+members ONLINE, the OVN `Load_Balancer` row correct -- and **not reachable from
+a capsule at all**. This was measured, and it took an `ovn-trace` to see why.
+
+A capsule reaching a Service VIP is east-west traffic that crosses the router:
+the client is on the pod subnet, the VIP on the VIP subnet. The load balancer
+DNATs the VIP to a member and the packet hairpins back out the router's internal
+port -- and on the way out it hits the router's SNAT rule, which rewrites the
+source to the router's external address. The member (CoreDNS, say) then replies
+to the router's external address instead of the capsule, and the reply never
+comes back. The request arrives; the answer is lost. `ovn-trace` on its own
+reports the path as delivered, because it simulates one direction to `output`
+and stops before the reply that never happens.
+
+A router with an external gateway SNATs every internal subnet by default. When
+the internal subnets and the external network share an address scope, Neutron
+treats their addresses as routable and installs **no** SNAT rule for them, so
+the hairpin is never rewritten. That is the whole reason the scope is here.
+
+⚠️ **The external network must be in the same address scope** for this to hold
+(`openstack network set --address-scope knaas-t1-scope <external-net>`, an
+operator action on the shared external network, done once). If it is not, or if
+the subnets are created without the pool, the SNAT rule comes back and Services
+go dark from inside capsules while looking healthy from everywhere else.
+
+What is verified and what is inferred: that the SNAT rule is the cause is
+measured -- deleting it made a capsule resolve a Service through the VIP
+immediately, where it had timed out for hours. That the address scope is the
+right way to remove it rather than a blunt `--disable-snat` is read from
+Neutron's semantics, not yet run end to end here. **Confirm it with the check at
+the end of this section after provisioning a tenant**, rather than trusting it.
+
+If a tenant's capsules never need to reach the external network on their own
+(they are reached, via floating IPs on Services, rather than reaching out), the
+blunt alternative also works and is simpler: `openstack router set t1-router
+--disable-snat --external-gateway public`. It removes the same rule. The cost is
+that nothing behind the router can open a connection outward, which for a
+serverless compute tier may be acceptable or may not -- a product decision, not
+a default to fall into.
 
 Then a credential the virtual kubelet will authenticate with:
 
@@ -194,6 +247,28 @@ credential goes on disk.
 
 The network ids from the steps above are what `--network-id`, `--vip-network-id`
 and `--vip-subnet-id` name in the unit file.
+
+### Confirming a Service is actually reachable, not just healthy
+
+Every layer above can be green while a capsule reaches nothing, so check from
+inside one. Once the tenant has a Service and a running capsule:
+
+```sh
+# From a capsule, resolve and reach a Service through its VIP.
+kubectl exec <a-capsule-pod> -- nslookup <svc>.<ns>.svc.cluster.local
+kubectl exec <a-capsule-pod> -- wget -qO- http://<svc>/
+```
+
+A timeout here with the load balancer showing ACTIVE and members ONLINE is the
+SNAT signature above, not a load balancer fault. Confirm it directly:
+
+```sh
+openstack router show t1-router -c external_gateway_info   # enable_snat should be false
+ovn-nbctl lr-nat-list neutron-<t1-router-id> | grep snat   # no rule for the pod subnet
+```
+
+If a SNAT rule for the pod subnet is present, the address scope did not take —
+recheck that the external network carries it.
 
 ## 5. Admission policy
 
@@ -231,5 +306,18 @@ shipper or a CNI agent, and they will try forever.
 
 NetworkPolicy is not enforced for capsules and a tenant's policies silently do
 nothing. Serving certificates for the kubelet API have no issuing mechanism here
-(`deploy/serving-cert.md` covers the shape, not the issuer). Probes fail on
-distroless images. `TODO.md` is the current list.
+(`deploy/serving-cert.md` covers the shape, not the issuer). `TODO.md` is the
+current list.
+
+Two things that bite a tenant's own workloads are worth naming here because they
+are not this project's code and an operator will meet them:
+
+- **CoreDNS as a capsule and cilium-operator.** cilium-operator's unmanaged-pod
+  GC deletes, every 15s, any `Running` pod labelled `k8s-app=kube-dns` that has
+  no CiliumEndpoint. A capsule never touches the Cilium datapath, so it never has
+  one, so a tenant's CoreDNS is deleted and recreated forever. The tenant's
+  CoreDNS must carry a different `k8s-app` value (its Service selector and the
+  ReplicaSet selector move with it). Diagnosed by reading the operator log:
+  `"Restarting unmanaged pod" module=...unmanaged-pods-gc`.
+- **Router SNAT and Service reachability** — the address scope above. Without it
+  a capsule reaches no Service VIP while every status reads healthy.
