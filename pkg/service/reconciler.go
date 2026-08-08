@@ -185,25 +185,24 @@ func (r *Reconciler) ensureLoadBalancer(ctx context.Context, svc *corev1.Service
 	if id := svc.Annotations[lbIDAnnotation]; id != "" {
 		lb, err := GetLoadBalancerByID(ctx, r.Octavia, id)
 		if err == nil {
-			lb, err = WaitActive(ctx, r.Octavia, lb.ID)
-			if err != nil {
-				return nil, err
-			}
-			if r.addressPortMissing(ctx, lb) {
-				// The provider deletes its address port when a create fails and
-				// leaves the load balancer pointing at an id that no longer
-				// resolves. Such a load balancer cannot be named or given a
-				// public address, and nothing repairs it in place, so it is
-				// replaced rather than carried forward.
-				log.G(ctx).WithField("service", svc.Namespace+"/"+svc.Name).
-					WithField("loadbalancer", lb.ID).
-					Warn("load balancer has no address port; rebuilding it")
-				if err := DeleteLoadBalancer(ctx, r.Octavia, lb.ID); err != nil {
-					return nil, err
-				}
-			} else {
-				return lb, nil
-			}
+			// Returned as it is, never replaced. A load balancer this process
+			// finds by id is the tenant's address, and Kubernetes does not
+			// change a Service's address while it exists — so there is no
+			// condition observable from here that justifies building another
+			// one and moving the tenant onto it.
+			//
+			// ⚠️ There was such a condition here: the address port was read
+			// from Neutron and a 404 taken to mean the provider had discarded
+			// it. Neutron answers 404 for a port in another project as well as
+			// for one that is absent, and the address port belongs to
+			// Octavia's project rather than the tenant's, so the check was
+			// true on every healthy load balancer. Every reconcile deleted all
+			// three of the lab's and rebuilt them, and each rebuild gave the
+			// tenant a new address — the fault reads as "the load balancer is
+			// broken" in the log while the load balancer is fine and it is
+			// this process breaking it. Nothing here holds a credential that
+			// can see that port, so nothing here can make that judgement.
+			return WaitActive(ctx, r.Octavia, lb.ID)
 		} else if err != ErrNotFound {
 			return nil, fmt.Errorf("reading load balancer %s: %w", id, err)
 		}
@@ -253,21 +252,6 @@ func (r *Reconciler) ensureLoadBalancer(ctx context.Context, svc *corev1.Service
 // recordLoadBalancerID writes the id onto the Service. Done immediately after
 // creation: if this process dies before it, the next pass finds the load
 // balancer by name, and the annotation only has to survive a rename.
-// addressPortMissing reports whether the load balancer's address port is gone.
-//
-// It happens when a create fails: the provider removes the port it made and the
-// load balancer keeps the id. The load balancer still carries traffic, so
-// nothing else notices, but there is no port to hang a name or a public address
-// on — measured in the lab on three load balancers at once.
-func (r *Reconciler) addressPortMissing(ctx context.Context, lb *loadbalancers.LoadBalancer) bool {
-	if r.Neutron == nil || lb.VipPortID == "" {
-		return false
-	}
-	var body struct{}
-	_, err := r.Neutron.Get(ctx, r.Neutron.ServiceURL("ports", lb.VipPortID), &body, nil)
-	return gophercloud.ResponseCodeIs(err, 404)
-}
-
 func (r *Reconciler) recordLoadBalancerID(ctx context.Context, svc *corev1.Service, id string) error {
 	if svc.Annotations[lbIDAnnotation] == id {
 		return nil

@@ -57,11 +57,13 @@ func ensurePortDNS(ctx context.Context, neutron *gophercloud.ServiceClient, port
 	}
 	if _, err := neutron.Get(ctx, neutron.ServiceURL("ports", portID), &current, nil); err != nil {
 		if gophercloud.ResponseCodeIs(err, 404) {
-			// Either the port is gone, or it never existed: a load balancer
-			// provider may record a port id for an address that lives only in
-			// the data plane. Both mean there is nothing to name, and neither
-			// is this code's to fix.
-			return fmt.Errorf("port %s does not exist, so %s.%s cannot be published: %w",
+			// ⚠️ Not evidence the port is gone. Neutron answers 404 for a port
+			// in another project just as it does for one that does not exist,
+			// and a load balancer's address port belongs to Octavia's project,
+			// not the tenant's — so this is the ordinary answer for a healthy
+			// one. It is reported rather than acted on: the caller only warns,
+			// and the Service keeps working at its address without a name.
+			return fmt.Errorf("port %s cannot be read with this credential, so %s.%s was not published: %w",
 				portID, name, domain, err)
 		}
 		return fmt.Errorf("reading port %s: %w", portID, err)
