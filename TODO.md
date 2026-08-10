@@ -640,11 +640,30 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
          而 drift 比较里埋了同一个假设（把无规则读回成 `/`），于是自我掩盖：
          reconcile 永远判"无漂移"，症状只剩 503，Octavia 侧一切看起来健康（member ONLINE）。
          已修 `ba1d36a`。**实测**：`/` → ROOT-BACKEND 200，`/web` → WEB-PATH 200
+- [x] **capsule 拿不到集群 DNS（2026-08-10 修，`00d1947`）**——症状是"租户 DNS 全挂"，
+      但 CoreDNS 一直在跑、可达、记录也对，**只是没有任何 capsule 问过它**：
+      pod 绝大多数不带 `dnsConfig`（`dnsPolicy` 默认 ClusterFirst，本该由 kubelet 补全），
+      我们不补 → capsule 用了 Neutron 子网的解析器（公网 DNS）→ 集群内名字全 NXDOMAIN。
+      搜索域同向错误：用的是**存储态命名空间** `111111-default`，而租户的 CoreDNS 透过
+      网关看世界、只认 `default`。⚠️ 解析器地址必须取 Service 的 `kubezoo.io/cluster-ip`
+      注解（= Octavia VIP），**不是 `spec.clusterIP`**——后者是网关给租户看的虚地址，
+      租户网络上无人路由，实测从 capsule 问它必超时
 - [ ] **把"放行 L7 worker → capsule"做进开通流程**（当前是实验床手工规则，重建租户即丢）：
       capsule 端口用项目 default SG，只认同组来源；Ingress 的 L7 worker 在 VIP 子网上，
       必须显式放行。**按 VIP 子网 CIDR 加一条规则，不要每 pod 一个 SG**——用户已明确
       OVN 下安全组数量的代价（TODO 行 512 同一约束）。落点大概率是 provisioner 建租户
       网络时一并写入，与 §14.6 的 member subnet 归在同一处
+- [ ] **实验床的 SNAT 豁免是手工 OVN 改动，重建租户即丢**（2026-08-10）：
+      为让 capsule 访问 VIP 而删掉的 router SNAT，代价是**租户所有出网都没了**——
+      CoreDNS 连不上 apiserver（kubeconfig 指向 `10.224.18.51:6443`），
+      `kubernetes` 插件永不就绪 → `/ready` 503 → 探针如实上报 → Deployment 挂在
+      `0/2 available` 好几个小时，而 DNS 链路本身**哪里都没错**。
+      现用 OVN `NAT.exempted_ext_ips` 恢复 SNAT 并豁免东西向。⚠️ **豁免集必须同时含
+      pod 子网和 VIP 子网**：OVN 先做 LB 的 DNAT，比对豁免时目的地已经是成员的 pod IP
+      不是 VIP；只豁免 VIP 子网实测的结果是出网恢复、L7 Ingress 正常（worker 是真实例
+      不发夹）、而**所有 L4 Service VIP 全黑**。正解仍是 docs/bootstrap.md 的地址域
+      （天然覆盖两个子网，不用推理 NAT 次序），但 Neutron 不允许把已存在的子网并入
+      subnet pool，所以实验床只能补 OVN
 - [x] **Zun 拒绝单字符容器名**（K8s 合法、Zun schema `minLength:2` 且 pattern 自带第二字符
       要求）→ 容器名为 `c` 的 pod 直接 ProviderFailed。已修 Zun fork `6c2d7404`
 - [ ] **TLS 分工（§7.5b）已实现，待端到端验**：`ensureTLS` + `barbican.go` 的内容哈希命名
