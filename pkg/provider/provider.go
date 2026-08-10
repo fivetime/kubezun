@@ -457,13 +457,6 @@ func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, con
 	if !tracked {
 		return nil, errdefs.NotFoundf("pod %s/%s is not running on this node", namespace, podName)
 	}
-	if opts.Follow {
-		// Zun returns the whole log at once rather than a stream. Polling for
-		// more would repeat lines at every boundary, so this says what it
-		// cannot do instead of appearing to follow.
-		return nil, errNotImplemented("following logs needs a streaming endpoint Zun does not serve")
-	}
-
 	logOpts := zun.LogOptions{
 		Tail:       opts.Tail,
 		Timestamps: opts.Timestamps,
@@ -479,6 +472,13 @@ func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, con
 	if index < 0 {
 		return nil, errdefs.NotFoundf(
 			"pod %s/%s has no container named %s", namespace, podName, containerName)
+	}
+
+	if opts.Follow {
+		// Zun has no streaming endpoint, so this reads the log repeatedly and
+		// emits only what is new. Exact rather than approximate: see
+		// followLogs for why the runtime's per-line timestamps make it so.
+		return p.followLogs(ctx, string(pod.UID), index, logOpts), nil
 	}
 
 	data, err := p.capsules.LogsForPod(ctx, string(pod.UID), index, logOpts)
