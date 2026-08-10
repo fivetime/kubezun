@@ -629,13 +629,24 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       只匹配裸名会把每个租户 Ingress 判成"非我的"而走进 teardown；而那条 teardown 的
       Barbican 清理是无条件调用的，租户没有 key-manager 权限时 403 无限重试卡死整个队列。
       已修：`Ours` 认前缀 + 无 LB 时的 Barbican 清理改 best-effort
-- [ ] **⚠️ L7 数据面 503：断点在 incus octavia provider，不在 kubezun（2026-08-08 隔离实测）**：
-      capsule 访问 Ingress VIP 返回 503；**同一个 capsule、同一个 member、同一个 VIP 子网**
-      访问 L4 Service VIP（ovn provider）返回正常 HTML。member 在 Octavia 里是 ONLINE
-      （worker→member 的健康检查是通的），但 incus provider 的 L7 worker（haproxy）
-      没把请求转给 backend。**kubezun 建的 Octavia 对象全部正确**，断点在 provider
-      把对象翻成 haproxy 配置那一层。生产用 amphora provider 可能不同。
-      下一步：查 incus provider 的 worker 配置，或换 amphora 验一遍以确认对象无误
+- [x] **L7 数据面 503 已解决（2026-08-10）——两个独立成因，都不在 incus provider**
+      （此前"断点在 provider"的判断是错的：provider 侧对象翻译一直正常）：
+      1. **capsule 端口只在项目 default 安全组里，入站规则只有"同组来源"**。
+         同租户 pod 互访、以及 L4 的 ovn provider Service 都不受影响（DNAT 后源仍是同组
+         capsule），但 L7 的 worker 是**另一组的独立实例**，报文全被丢在 capsule 端口上。
+         `traceroute` 打到 `192.168.200.1` 后即止。补一条"放行 VIP 子网 → capsule"
+         的入站规则后 `/web` 立刻 200。⚠️ **实验床目前是手工加的规则，见下一项**
+      2. **`/` 路径的 l7policy 一条规则都没有**（Octavia 按规则匹配，无规则=永不匹配），
+         而 drift 比较里埋了同一个假设（把无规则读回成 `/`），于是自我掩盖：
+         reconcile 永远判"无漂移"，症状只剩 503，Octavia 侧一切看起来健康（member ONLINE）。
+         已修 `ba1d36a`。**实测**：`/` → ROOT-BACKEND 200，`/web` → WEB-PATH 200
+- [ ] **把"放行 L7 worker → capsule"做进开通流程**（当前是实验床手工规则，重建租户即丢）：
+      capsule 端口用项目 default SG，只认同组来源；Ingress 的 L7 worker 在 VIP 子网上，
+      必须显式放行。**按 VIP 子网 CIDR 加一条规则，不要每 pod 一个 SG**——用户已明确
+      OVN 下安全组数量的代价（TODO 行 512 同一约束）。落点大概率是 provisioner 建租户
+      网络时一并写入，与 §14.6 的 member subnet 归在同一处
+- [x] **Zun 拒绝单字符容器名**（K8s 合法、Zun schema `minLength:2` 且 pattern 自带第二字符
+      要求）→ 容器名为 `c` 的 pod 直接 ProviderFailed。已修 Zun fork `6c2d7404`
 - [ ] **TLS 分工（§7.5b）已实现，待端到端验**：`ensureTLS` + `barbican.go` 的内容哈希命名
       （续期→哈希变→新 ref→reconcile 自然跟上，不比对有效期、不关心谁签的）；
       `spec.tls` 存在时自动建 TERMINATED_HTTPS listener，陈旧 bundle 在 listener 指向
