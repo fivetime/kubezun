@@ -666,18 +666,36 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       subnet pool，所以实验床只能补 OVN
 - [x] **Zun 拒绝单字符容器名**（K8s 合法、Zun schema `minLength:2` 且 pattern 自带第二字符
       要求）→ 容器名为 `c` 的 pod 直接 ProviderFailed。已修 Zun fork `6c2d7404`
-- [ ] **TLS 分工（§7.5b）已实现，待端到端验**：`ensureTLS` + `barbican.go` 的内容哈希命名
+- [x] **TLS / host 规则 / FIP 端到端实测通过（2026-08-10）**：
+      自签证书 → `kubernetes.io/tls` Secret → `spec.tls` → Octavia
+      **TERMINATED_HTTPS listener :443**；从 capsule `--resolve` 访问
+      `https://web.knaas.test/` → ROOT-BACKEND 200、`/web/` → WEB-PATH 200，
+      握手证书正是我们签的（`subject: CN=web.knaas.test`）；**host 不匹配返回 503
+      而不是误路由**。FIP：`octavia.ingress.kubernetes.io/internal=false` → 分配
+      `10.128.32.139` 并回写 ADDRESS，**从租户网络外**访问 HTTPS/HTTP 均 200；
+      改回 `true` → FIP 被**删除**（不是仅解绑）、ADDRESS 回落 VIP，无计费泄漏。
+      归属标记确实写在 FIP description 上（⚠️ `openstack floating ip list` 不返回
+      description 列，只有 `show` 才看得到，别据此以为没写）
+- [ ] **开通必须给租户 `creator` 角色，否则 TLS Ingress 全线不可用**（2026-08-10 实测）：
+      Barbican 建/列 secret 需要 `creator`，租户 appcred 原本只有 `member`+`reader`
+      → reconcile 卡在 `listing Barbican secrets ...: 403`，listener :443 永远建不出来。
+      ⚠️ **给用户加角色不会改已签发的 appcred**——appcred 的角色在签发时固化，必须
+      重发一张；且 appcred 只能由**该用户自己**签（admin 签出来的是 admin 项目的，
+      正是设计明令禁止的东西）。实验床已重发（`841ad224…`，roles=creator,member,reader）
+- [ ] **TLS 续期（内容哈希换 ref）尚未实测**：`ensureTLS` + `barbican.go` 的内容哈希命名
       （续期→哈希变→新 ref→reconcile 自然跟上，不比对有效期、不关心谁签的）；
       `spec.tls` 存在时自动建 TERMINATED_HTTPS listener，陈旧 bundle 在 listener 指向
       新 ref **之后**才删（顺序反了会把两种 provider 卡在 PENDING_UPDATE）。
-      ⚠️ 本轮测的是纯 HTTP Ingress，尚未用真证书跑一遍
+      ⚠️ 首次签发已实测（见上一项）；**换证书这条路径还没跑过**——把 Secret 里的
+      证书换掉，确认哈希变 → 新 Barbican ref → listener 指过去 → 旧 bundle 才被删
 
 ---
 
 ## 阶段 4：生产化（§12）
 
-- [ ] Zun capsule 容器名 minLength=2，K8s 允许单字符容器名 → 租户写 `name: c` 得到一个
-      看不懂的 400。fork 侧放宽 schema，或 provider 侧改写并在状态里映射回原名
+- [x] Zun capsule 容器名 minLength=2，K8s 允许单字符容器名 → 租户写 `name: c` 得到一个
+      看不懂的 400。已在 fork 侧放宽 schema（`6c2d7404`，minLength 与 pattern 都要改：
+      原 pattern `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$` 自带第二字符要求，只改 minLength 不够）
 - [ ] kubectl logs 通路：对接 fork 的 GET /capsules/{id}/logs；exec 返回 errdefs 明确错误（§10）
 - [ ] Barbican KMS：barbican-kms-plugin（CPO 现成）做 etcd 加密后端（§8.1）。
       ⚠️ **与 kubetron 的 Barbican 是两回事**（2026-08-07 查证）：kubetron 的
