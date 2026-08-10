@@ -4,6 +4,10 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
 	"github.com/fivetime/kubezun/pkg/zun"
 )
 
@@ -102,5 +106,50 @@ func TestReadingsForDepartedPodsAreDropped(t *testing.T) {
 	}
 	if _, ok := r.last["ns/here/c"]; !ok {
 		t.Error("a pod still running lost its reading; its next rate would be missed")
+	}
+}
+
+// On restart the in-memory map is empty, so the node controller calls
+// CreatePod for every pod already running here. Resetting their status then
+// publishes "not ready" for the whole node: the EndpointSlice controller
+// empties the Services, the reconcilers write empty member sets, and the
+// tenant's traffic stops until the sync loop puts it back a few seconds later.
+func TestAdoptingAPodKeepsItsPublishedStatus(t *testing.T) {
+	p := &Provider{pods: map[string]*corev1.Pod{}, deleted: map[string]types.UID{}}
+
+	running := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "web", UID: "u1"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+			PodIP: "10.0.0.5",
+		},
+	}
+	p.adoptPod(running)
+
+	got := p.pods["ns/web"]
+	if got.Status.Phase != corev1.PodRunning {
+		t.Errorf("phase = %q, want Running", got.Status.Phase)
+	}
+	if got.Status.PodIP != "10.0.0.5" {
+		t.Errorf("address lost: %q", got.Status.PodIP)
+	}
+	var ready corev1.ConditionStatus
+	for _, c := range got.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			ready = c.Status
+		}
+	}
+	if ready != corev1.ConditionTrue {
+		t.Error("readiness was dropped; every Service on this node would lose its endpoints")
+	}
+
+	// A pod nothing was ever published for has no readiness to keep.
+	fresh := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "new", UID: "u2"}}
+	p.adoptPod(fresh)
+	if p.pods["ns/new"].Status.Phase != corev1.PodPending {
+		t.Errorf("phase = %q, want Pending", p.pods["ns/new"].Status.Phase)
 	}
 }

@@ -167,8 +167,8 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 	if existing, err := p.capsules.ListManaged(ctx); err == nil {
 		if c, ok := existing[key]; ok && c.PodUID() == string(pod.UID) {
 			log.G(ctx).WithField("pod", key).WithField("capsule", c.Name()).
-				Info("capsule already exists for this pod; not creating another")
-			p.trackPod(pod, corev1.PodPending, "Creating")
+				Info("capsule already exists for this pod; adopting it")
+			p.adoptPod(pod)
 			return nil
 		}
 	}
@@ -363,6 +363,43 @@ func (p *Provider) NotifyPods(ctx context.Context, cb func(*corev1.Pod)) {
 	} else {
 		log.G(ctx).Warn("orphan cleanup disabled: no pod cache was provided")
 	}
+}
+
+// adoptPod takes over a pod whose capsule is already running, keeping the
+// status it already has.
+//
+// This is what every pod on the node goes through when the process restarts:
+// the in-memory map starts empty, so the node controller believes nothing is
+// running and calls CreatePod for each, which finds the capsule and lands
+// here. Resetting the status to Pending/ContainerCreating -- what this used to
+// do -- publishes "not ready" for every pod on the node, and the EndpointSlice
+// controller does the obvious thing with that: it empties the Services. The
+// Service and Ingress reconcilers then write empty member sets, and the
+// tenant's traffic stops. Seconds later the sync loop reads the capsules and
+// puts it all back, so the only trace is a dip nobody was watching for.
+//
+// The status here is the one the API server already holds, which is the last
+// thing this process published before it stopped -- accurate until proven
+// otherwise, and the sync loop proves it either way within a few seconds.
+func (p *Provider) adoptPod(pod *corev1.Pod) {
+	key := zun.PodKey(pod.Namespace, pod.Name)
+	adopted := pod.DeepCopy()
+	if adopted.Status.Phase == "" {
+		// Nothing was ever published for it: a capsule made by a create that
+		// died before it could record one. Pending is right, and there is no
+		// readiness to lose.
+		now := metav1.NewTime(time.Now())
+		adopted.Status.Phase = corev1.PodPending
+		adopted.Status.Reason = "Creating"
+		adopted.Status.Conditions = zun.PodConditions("Creating", false, now)
+	}
+
+	p.mu.Lock()
+	p.pods[key] = adopted
+	delete(p.deleted, key)
+	p.mu.Unlock()
+	// Deliberately not notified: nothing changed. The sync loop publishes the
+	// first reading that differs from what is already there.
 }
 
 func (p *Provider) trackPod(pod *corev1.Pod, phase corev1.PodPhase, reason string) {
