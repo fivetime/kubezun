@@ -702,7 +702,7 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       ⚠️ **给用户加角色不会改已签发的 appcred**——appcred 的角色在签发时固化，必须
       重发一张；且 appcred 只能由**该用户自己**签（admin 签出来的是 admin 项目的，
       正是设计明令禁止的东西）。实验床已重发（`841ad224…`，roles=creator,member,reader）
-- [ ] **TLS 续期（内容哈希换 ref）尚未实测**：`ensureTLS` + `barbican.go` 的内容哈希命名
+- [x] **TLS 续期已实测（2026-08-10）**：`ensureTLS` + `barbican.go` 的内容哈希命名
       （续期→哈希变→新 ref→reconcile 自然跟上，不比对有效期、不关心谁签的）；
       `spec.tls` 存在时自动建 TERMINATED_HTTPS listener，陈旧 bundle 在 listener 指向
       新 ref **之后**才删（顺序反了会把两种 provider 卡在 PENDING_UPDATE）。
@@ -710,6 +710,38 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       证书换掉，确认哈希变 → 新 Barbican ref → listener 指过去 → 旧 bundle 才被删
 
 ---
+
+## 本轮补齐的功能面（2026-08-10）
+
+- [x] **ServiceAccount token（`1ddf9f3` + Zun `cc36dca3`）**：以前直接拒绝带 token 卷的
+      pod，理由是"capsule 无法刷新绑定 token"——那是事实，但不是拒绝的理由，是该去做
+      刷新的理由。现在三件套(token/ca.crt/namespace)随 capsule 带进去，token 经
+      TokenRequest 铸造并**绑定到 pod**（pod 没了 token 立刻失效，不是长期 SA Secret）。
+      续期走 Zun 新端点**原地改写文件卷**，⚠️ **不能用 exec**：distroless 镜像没有 shell，
+      实测报 `the file ls was not found`——最该照顾的镜像恰恰是它够不到的那批。
+      `namespace` 文件写租户视角的名字（存储态会让网关再加一次前缀，问的是
+      `<tid>-<tid>-default`，与 DNS 搜索域同一个错）。**实测**：三个文件都在、token 认证
+      通过、用它列 pod 得到 403（认证通过、被正确拒绝）
+- [ ] ⚠️ **租户 `kube-root-ca.crt` 与网关证书不同源(kubezoo 侧)**：ConfigMap 里是上游集群
+      CA(`CN=kubernetes` 自签)，而 capsule 实际访问的 10.224.18.51 出示的是 **KubeZoo 自己的
+      CA**(`O=KubeZoo`)。租户按投影进去的 CA 校验必失败(`-k` 才通)。我们这边无法凭空造出
+      正确的 CA——发给租户的那个 ConfigMap 必须装它签的东西
+- [x] **`kubectl top` / HPA 的数据面（`53204a9` + Zun `c6f85263`）**：以前 capsule 是黑盒。
+      Zun 侧新增 capsule stats（CRI `ListContainerStats`，按容器给），kubezun 侧同时实现
+      `/stats/summary` **和** `/metrics/resource`——只做前者的话现代 metrics-server 抓不到，
+      `kubectl top` 仍是空的。⚠️ CPU 记的是累计计数器，速率要两次读数之差，而**容器重启会
+      把计数器清零**，按名字记会算出一个天文数字的速率——正是让 HPA 给空闲负载扩容的那种
+      输入，所以游标同时带容器 id。实测：节点/每 pod 的 CPU 与内存都出真实值
+- [x] **重启不再摘流量（`b586179`）**：进程重启后内存里 pod 表是空的 → VK 对每个 pod 调
+      CreatePod → 发现 capsule 已在 → **旧代码把状态重置成 Pending/not-ready**，
+      EndpointSlice 随即清空、两个 reconciler 各写一次空成员集，租户流量断掉；几秒后
+      sync 循环再补回来，所以一直没人注意到。现在是**认领**：沿用 API server 上已有的状态。
+      实测 Ready 的 lastTransitionTime 重启前后完全一致
+- [x] **节点启动前置检查（`53204a9`）**：AZ 不存在的节点照样注册、照样收 pod，然后每个 pod
+      被 Zun 逐个拒成 "no valid host"——读起来像集群满了而不是配置写错。⚠️ 这个检查第一版
+      **自己把能工作的节点拒了**（读了 `name` 字段而响应里是 `availability_zone`，得到一串
+      空名字），现在只在**确实读到了名字**时才拒绝。架构无法核实：Zun 的 hosts API 是
+      admin-only，而我们持租户凭据——拼写错能挡，"拼对了但没这硬件"归开通管
 
 ## 阶段 4：生产化（§12）
 
@@ -719,9 +751,15 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 - [x] kubectl logs / exec 已通（板子上这条一直是过期的，2026-08-10 核实）：fork 侧
       `capsules.py` 的 `logs`/`execute` 端点在，kubezun 侧 `GetContainerLogs`/
       `RunInContainer` 对接完毕，**本轮排障全程在用**（ingtest 的 curl 都是 kubectl exec）
-- [ ] **logs `--follow` 与 exec `-t` 仍不支持**：Zun 一次性返回全部输出，没有流式端点。
-      现在是明确报错而不是假装支持（follow 轮询会在每个边界重复行；给个连不上的
-      终端会让调用方一直等）。要补得先在 fork 里加流式端点
+- [x] **logs `--follow` 已支持（2026-08-10，`ebcbb12`）**——不需要流式端点：
+      运行时给每行都写了 RFC3339Nano 时间戳，那就是游标。始终向 Zun 要带时间戳的
+      输出，记住最后一行的时间戳，下一轮只发它之后的，再按调用方意愿把时间戳去掉。
+      **重复不是"不太可能"而是不可能**。实测：每 2 秒一行的 pod，连续输出、零重复行
+- [ ] **exec `-t`（交互终端）仍不支持**：这条和 follow 不是一类问题，轮询解决不了——
+      需要能承载会话的传输。CRI 的 `Exec` RPC 会返回运行时自己流式服务器的 URL，
+      那个服务器**本来就说 kubectl 要的 remotecommand 协议**；难点在从我们这边能不能
+      够到它（它监听在计算节点上，通常只对本机开放），属于部署问题。
+      ⚠️ Zun 现有的交互式 attach 只有 docker driver 有（走 websocket 代理），CRI 路径没有
 - [ ] Barbican KMS：barbican-kms-plugin（CPO 现成）做 etcd 加密后端（§8.1）。
       ⚠️ **与 kubetron 的 Barbican 是两回事**（2026-08-07 查证）：kubetron 的
       `pkg/ingress/barbican.go` 是把 K8s TLS Secret 镜像成 PKCS12 供 Octavia 做
