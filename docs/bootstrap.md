@@ -226,13 +226,43 @@ right way to remove it rather than a blunt `--disable-snat` is read from
 Neutron's semantics, not yet run end to end here. **Confirm it with the check at
 the end of this section after provisioning a tenant**, rather than trusting it.
 
-If a tenant's capsules never need to reach the external network on their own
-(they are reached, via floating IPs on Services, rather than reaching out), the
-blunt alternative also works and is simpler: `openstack router set t1-router
---disable-snat --external-gateway public`. It removes the same rule. The cost is
-that nothing behind the router can open a connection outward, which for a
-serverless compute tier may be acceptable or may not -- a product decision, not
-a default to fall into.
+The blunt alternative -- `openstack router set t1-router --disable-snat
+--external-gateway public` -- removes the same rule and is simpler. **Do not
+reach for it.** It was tried here, and the cost is not the theoretical one the
+sentence "nothing behind the router can open a connection outward" suggests: the
+tenant's own CoreDNS is behind that router and watches the API server at an
+address outside the tenant network. With SNAT gone it could not reach it, its
+`kubernetes` plugin never became ready, `/ready` answered 503, and the readiness
+probe reported exactly that -- so the Deployment sat at 0/2 available with two
+pods Running, for hours, with nothing in the DNS path itself wrong. Anything a
+tenant runs that talks to the API server fails the same way.
+
+The scope is the fix; there is no version of this where egress is optional.
+
+If the subnets already exist outside a pool (Neutron will not move an existing
+subnet into one), OVN can be told directly what the scope would have told it:
+
+```sh
+# Exempt tenant-internal destinations from the router's SNAT rule.
+as=$(ovn-nbctl create Address_Set name=knaas_t1_east_west \
+       addresses=\"192.168.100.0/24\",\"192.168.200.0/24\")
+ovn-nbctl lr-nat-add neutron-<t1-router-id> snat <router-external-ip> 192.168.100.0/24
+nat=$(ovn-nbctl --bare --columns=_uuid find NAT logical_ip='"192.168.100.0/24"')
+ovn-nbctl set NAT $nat exempted_ext_ips=$as
+```
+
+⚠️ **Both subnets must be in the exemption, not just the VIP subnet.** OVN
+evaluates the load balancer's DNAT before NAT, so by the time the exemption is
+checked the destination is no longer the VIP -- it is the member's address on
+the pod subnet. Exempting only the VIP subnet was measured here: external egress
+came back and the L7 Ingress kept working (its worker is a real instance, so no
+hairpin), while every L4 Service VIP went dark. This is also why the address
+scope is the better answer where it is available: it covers both subnets by
+construction, and nothing has to reason about NAT ordering.
+
+This is a repair, not a design. It lives in OVN's northbound database rather
+than in Neutron, so a Neutron resync can undo it and a rebuilt tenant will not
+have it. Provision new tenants with the pool.
 
 Then a credential the virtual kubelet will authenticate with:
 
@@ -269,6 +299,20 @@ ovn-nbctl lr-nat-list neutron-<t1-router-id> | grep snat   # no rule for the pod
 
 If a SNAT rule for the pod subnet is present, the address scope did not take —
 recheck that the external network carries it.
+
+Check the other direction in the same breath, because the two are one setting
+and fixing either one alone breaks the other:
+
+```sh
+# Out: an unauthenticated 401 is the right answer -- it means reachable.
+kubectl exec <a-capsule-pod> -- curl -sk -o /dev/null -w '%{http_code}\n' \
+  https://<apiserver>:6443/healthz
+```
+
+A tenant whose Services answer but whose CoreDNS never reaches Ready has this
+half missing. The symptom appears nowhere near its cause: DNS pods sit Running
+and not Ready, their Deployment reports 0 available, and every layer in between
+looks correct.
 
 ## 5. Admission policy
 
