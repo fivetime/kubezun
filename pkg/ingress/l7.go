@@ -283,7 +283,14 @@ func rulesFor(d desiredPolicy) []l7policies.CreateRuleOpts {
 			Value:       d.Host,
 		})
 	}
-	if d.Path != "" && d.Path != "/" {
+	// "/" gets a rule of its own like any other path. Skipping it leaves a
+	// policy with no rules, and a policy with no rules matches nothing: every
+	// request to "/" fell through to a listener with no default pool and came
+	// back 503, while the longer paths on the same Ingress served fine.
+	// STARTS_WITH "/" matches every request path, which is what "/" means --
+	// and because policies are ordered longest-path-first it is consulted
+	// last, so it catches only what nothing more specific claimed.
+	if d.Path != "" {
 		compare := l7policies.CompareTypeStartWith
 		if d.PathType == networkingv1.PathTypeExact {
 			compare = l7policies.CompareTypeEqual
@@ -317,11 +324,12 @@ func existingSignature(ctx context.Context, octavia *gophercloud.ServiceClient, 
 			}
 		}
 	}
-	// A desired "/"-Prefix path renders no path rule (matches everything), so
-	// a live policy without one reads back as "/" Prefix.
-	if got.Path == "" {
-		got.Path, got.PathType = "/", networkingv1.PathTypePrefix
-	}
+	// No compensation for a missing path rule. This used to read a ruleless
+	// policy back as "/" Prefix, to match the create path's habit of rendering
+	// no rule for "/" -- which meant the drift check agreed with the bug and
+	// hid it: policies that matched nothing looked correct forever, and the
+	// only visible symptom was a 503. A policy with no path rule now differs
+	// from a desired "/" and is rebuilt.
 	return got.signature(), nil
 }
 

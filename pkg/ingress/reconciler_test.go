@@ -3,6 +3,7 @@ package ingress
 import (
 	"testing"
 
+	"github.com/gophercloud/gophercloud/v2/openstack/loadbalancer/v2/l7policies"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -91,6 +92,47 @@ func TestPoliciesOrderMostSpecificFirst(t *testing.T) {
 	if got[0].Path != "/api/v2" || got[1].Path != "/api" || got[2].Path != "/" {
 		t.Errorf("policies out of order: %q %q %q — a request to /api/v2 would hit the wrong pool",
 			got[0].Path, got[1].Path, got[2].Path)
+	}
+}
+
+// Every policy must carry at least one rule. Octavia matches a policy by its
+// rules, so a policy with none matches nothing -- "/" was skipped on the theory
+// that it needs no rule, and every request to it came back 503 while the longer
+// paths of the same Ingress served.
+func TestEveryPolicyHasAMatchingRule(t *testing.T) {
+	exact := networkingv1.PathTypeExact
+	prefix := networkingv1.PathTypePrefix
+	cases := []desiredPolicy{
+		{Path: "/", PathType: prefix},
+		{Path: "/api", PathType: prefix},
+		{Path: "/health", PathType: exact},
+		{Host: "app.example.com", Path: "/", PathType: prefix},
+	}
+	for _, d := range cases {
+		rules := rulesFor(d)
+		if len(rules) == 0 {
+			t.Errorf("host=%q path=%q produced no rules: the policy would never match", d.Host, d.Path)
+			continue
+		}
+		var hasPath bool
+		for _, r := range rules {
+			if r.RuleType == l7policies.TypePath {
+				hasPath = true
+				want := l7policies.CompareTypeStartWith
+				if d.PathType == exact {
+					want = l7policies.CompareTypeEqual
+				}
+				if r.CompareType != want {
+					t.Errorf("path %q: compare type %v, want %v", d.Path, r.CompareType, want)
+				}
+				if r.Value != d.Path {
+					t.Errorf("path %q: rule value %q", d.Path, r.Value)
+				}
+			}
+		}
+		if !hasPath {
+			t.Errorf("host=%q path=%q produced no path rule", d.Host, d.Path)
+		}
 	}
 }
 
