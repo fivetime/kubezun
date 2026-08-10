@@ -30,3 +30,9 @@ func (r objectReader) ConfigMap(ctx context.Context, namespace, name string) (*c
 func (r objectReader) Secret(ctx context.Context, namespace, name string) (*corev1.Secret, error) {
 	return r.client.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
 }
+
+// Service reads one Service, for the resolver address a capsule is given. Same
+// reasoning as above: one read when a capsule is built, nothing to cache.
+func (r objectReader) Service(ctx context.Context, namespace, name string) (*corev1.Service, error) {
+	return r.client.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
+}

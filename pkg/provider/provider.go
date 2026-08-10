@@ -21,6 +21,7 @@ import (
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 
+	"github.com/fivetime/kubezun/pkg/service"
 	"github.com/fivetime/kubezun/pkg/zun"
 )
 
@@ -55,6 +56,22 @@ type Config struct {
 	// pods' resolver search list, which is what lets an application written for
 	// Kubernetes use a Service's short name.
 	ClusterDomain string
+
+	// Tenant is the gateway's prefix on this tenant's namespaces. A capsule's
+	// search list has to name namespaces the way the tenant's own resolver
+	// serves them -- the resolver watches through the gateway and so knows
+	// "default", never "111111-default".
+	Tenant string
+
+	// ClusterDNS pins the resolver capsules are given, the way kubelet's
+	// --cluster-dns does. Left empty, it is looked up from DNSService, which is
+	// the usual case: the address is an Octavia VIP that does not exist until
+	// this process builds it.
+	ClusterDNS []string
+
+	// DNSService names the Service whose address is the tenant's resolver, as
+	// "namespace/name" in the tenant's own terms (kube-system/kube-dns).
+	DNSService string
 }
 
 // Provider runs pods as Zun capsules for a single tenant.
@@ -93,6 +110,7 @@ type Provider struct {
 type ObjectReader interface {
 	ConfigMap(ctx context.Context, namespace, name string) (*corev1.ConfigMap, error)
 	Secret(ctx context.Context, namespace, name string) (*corev1.Secret, error)
+	Service(ctx context.Context, namespace, name string) (*corev1.Service, error)
 }
 
 // Caches are the views a provider reads. Pods may be nil, which disables orphan
@@ -157,7 +175,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 		return err
 	}
 
-	searches, nameservers := dnsConfigFor(pod, p.cfg.ClusterDomain)
+	searches, nameservers := p.dnsConfigFor(ctx, pod)
 
 	tpl, err := zun.BuildTemplate(pod, zun.TemplateOptions{
 		NetworkID:        p.cfg.NetworkID,
@@ -432,16 +450,95 @@ func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, con
 // the config empty while the tenant's resolver is not yet serving, and a pod
 // created in that window with no search list at all resolves nothing by short
 // name.
-func dnsConfigFor(pod *corev1.Pod, clusterDomain string) (searches, nameservers []string) {
-	if cfg := pod.Spec.DNSConfig; cfg != nil && len(cfg.Searches) > 0 {
-		return cfg.Searches, cfg.Nameservers
+// dnsConfigFor decides what a capsule's resolver is told, following the pod's
+// dnsPolicy the way a kubelet would.
+//
+// Getting the nameserver here is not a detail: without it a capsule falls back
+// to whatever the Neutron subnet hands out, which is a public resolver that has
+// never heard of the cluster domain. Every in-cluster name then fails, and
+// nothing in the DNS path looks wrong -- the tenant's CoreDNS is running,
+// answering, and serving correct records that no capsule ever asks it for.
+func (p *Provider) dnsConfigFor(ctx context.Context, pod *corev1.Pod) (searches, nameservers []string) {
+	cfg := pod.Spec.DNSConfig
+
+	switch pod.Spec.DNSPolicy {
+	case corev1.DNSNone:
+		// The pod took the decision itself; give it exactly what it asked for.
+		if cfg != nil {
+			return cfg.Searches, cfg.Nameservers
+		}
+		return nil, nil
+	case corev1.DNSDefault:
+		// "Whatever the infrastructure resolves with" -- here the subnet's.
+		return nil, nil
 	}
-	return composeSearches(pod.Namespace, clusterDomain), nil
+
+	// ClusterFirst, and the zero value, which is what an unset dnsPolicy
+	// arrives as.
+	searches = composeSearches(p.tenantNamespace(pod.Namespace), p.cfg.ClusterDomain)
+	nameservers = p.clusterDNS(ctx)
+	if cfg != nil {
+		searches = append(searches, cfg.Searches...)
+		if len(cfg.Nameservers) > 0 {
+			nameservers = cfg.Nameservers
+		}
+	}
+	return searches, nameservers
 }
 
-// composeSearches is the fallback: the three entries a kubelet would compose.
-// It uses the namespace this cluster stores, which for a tenant behind the
-// gateway is not the one their manifests name — hence only a fallback.
+// tenantNamespace turns the namespace this cluster stores into the one the
+// tenant wrote. The gateway prefixes every namespace with the tenant id, and
+// the tenant's resolver watches through the gateway -- so it serves
+// "web.default.svc.cluster.local" and knows nothing of "111111-default".
+// Searching the stored name yields NXDOMAIN for every Service the tenant has.
+func (p *Provider) tenantNamespace(namespace string) string {
+	if p.cfg.Tenant == "" {
+		return namespace
+	}
+	return strings.TrimPrefix(namespace, p.cfg.Tenant+"-")
+}
+
+// clusterDNS resolves the address capsules are given as their resolver: the
+// configured one, else the tenant Service's.
+//
+// The Service's own clusterIP is not it. That address is the gateway's fiction
+// for the tenant's benefit and nothing on the tenant network routes it; the
+// address that answers is the load balancer this process built, which the
+// Service carries in the cluster-ip annotation (the contract in pkg/service).
+// A capsule handed the clusterIP times out on every lookup.
+func (p *Provider) clusterDNS(ctx context.Context) []string {
+	if len(p.cfg.ClusterDNS) > 0 {
+		return p.cfg.ClusterDNS
+	}
+	if p.cfg.DNSService == "" || p.objects == nil {
+		return nil
+	}
+	ns, name, ok := strings.Cut(p.cfg.DNSService, "/")
+	if !ok {
+		return nil
+	}
+	if p.cfg.Tenant != "" {
+		ns = p.cfg.Tenant + "-" + ns
+	}
+	svc, err := p.objects.Service(ctx, ns, name)
+	if err != nil {
+		// A pod created before the resolver's load balancer exists gets the
+		// subnet's resolver rather than no pod at all. Its controller replaces
+		// it soon enough, and by then the address is there.
+		log.G(ctx).WithError(err).WithField("service", p.cfg.DNSService).
+			Warn("no resolver address for this capsule: the DNS Service could not be read")
+		return nil
+	}
+	if addr := svc.Annotations[service.AddressAnnotation]; addr != "" {
+		return []string{addr}
+	}
+	log.G(ctx).WithField("service", p.cfg.DNSService).
+		Warn("the DNS Service has no reachable address yet; this capsule gets the subnet's resolver")
+	return nil
+}
+
+// composeSearches builds the three entries a kubelet would, against the
+// namespace as the tenant knows it.
 func composeSearches(namespace, clusterDomain string) []string {
 	base := strings.TrimSuffix(clusterDomain, ".")
 	if base == "" {

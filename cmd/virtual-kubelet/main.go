@@ -58,6 +58,8 @@ type options struct {
 	vipNetwork      string
 	floatingNet     string
 	clusterDomain   string
+	clusterDNS      string
+	dnsService      string
 	publicSvcs      bool
 }
 
@@ -112,6 +114,15 @@ func main() {
 		"suffix a Service's name resolves under. A Service's usable address is its "+
 			"load balancer's, not the ClusterIP, so the name is how a pod reaches "+
 			"one. Empty disables naming")
+	flag.StringVar(&o.clusterDNS, "cluster-dns", os.Getenv("KUBEZUN_CLUSTER_DNS"),
+		"resolver addresses capsules are given, comma separated, as kubelet's "+
+			"--cluster-dns. Normally left empty: the address is a load balancer "+
+			"this process builds and cannot be known in advance, so it is read "+
+			"from --dns-service instead")
+	flag.StringVar(&o.dnsService, "dns-service", envOr("KUBEZUN_DNS_SERVICE", "kube-system/kube-dns"),
+		"Service whose address capsules resolve through, named as the tenant "+
+			"writes it. Empty leaves capsules with the subnet's resolver, which "+
+			"knows no in-cluster name")
 	flag.StringVar(&o.floatingNet, "floating-network-id", os.Getenv("KUBEZUN_FLOATING_NETWORK_ID"),
 		"external network public Service addresses are allocated from")
 	flag.BoolVar(&o.publicSvcs, "public-services-by-default", false,
@@ -248,6 +259,9 @@ func run(o options) error {
 			Architecture:     spec.arch,
 			NodeName:         spec.name,
 			ClusterDomain:    o.clusterDomain,
+			Tenant:           o.tenant,
+			ClusterDNS:       splitList(o.clusterDNS),
+			DNSService:       o.dnsService,
 		}, zunClient, provider.Caches{
 			Pods:    set.PodsForNode(spec.name).Lister(),
 			Objects: set.Objects(),
@@ -520,4 +534,16 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// splitList reads a comma-separated flag, dropping empties so a trailing comma
+// or an unset variable does not become an address of "".
+func splitList(v string) []string {
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
