@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/gophercloud/gophercloud/v2/openstack/loadbalancer/v2/pools"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -159,5 +160,55 @@ func TestBuildMembersIgnoresSlicesWithoutThePort(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("got %+v, want nothing until the slice carries the named port", got)
+	}
+}
+
+// A batch update with nothing to change is still a write: Octavia moves the
+// pool and its load balancer to PENDING_UPDATE, which is the state in which it
+// refuses every other change. Reconciles are frequent, so an unchanged set has
+// to be recognised or the load balancer is almost never writable.
+func TestUnchangedMembersAreRecognised(t *testing.T) {
+	subnet := "subnet-1"
+	desired := []pools.BatchUpdateMemberOpts{
+		{Address: "10.0.0.1", ProtocolPort: 80, SubnetID: &subnet},
+		{Address: "10.0.0.2", ProtocolPort: 80, SubnetID: &subnet},
+	}
+	current := []pools.Member{
+		// Order differs on purpose: Octavia does not promise one.
+		{Address: "10.0.0.2", ProtocolPort: 80, SubnetID: subnet},
+		{Address: "10.0.0.1", ProtocolPort: 80, SubnetID: subnet},
+	}
+	if !sameMembers(current, desired) {
+		t.Error("an unchanged set was reported as changed; every reconcile would write")
+	}
+
+	for _, tc := range []struct {
+		name    string
+		current []pools.Member
+	}{
+		{"one fewer", current[:1]},
+		{"different address", []pools.Member{
+			{Address: "10.0.0.9", ProtocolPort: 80, SubnetID: subnet},
+			{Address: "10.0.0.1", ProtocolPort: 80, SubnetID: subnet},
+		}},
+		{"different port", []pools.Member{
+			{Address: "10.0.0.2", ProtocolPort: 8080, SubnetID: subnet},
+			{Address: "10.0.0.1", ProtocolPort: 80, SubnetID: subnet},
+		}},
+		// The subnet is what lets a worker-based provider reach the member at
+		// all, so a member that gained or lost one is not the same member.
+		{"different subnet", []pools.Member{
+			{Address: "10.0.0.2", ProtocolPort: 80, SubnetID: "subnet-2"},
+			{Address: "10.0.0.1", ProtocolPort: 80, SubnetID: subnet},
+		}},
+	} {
+		if sameMembers(tc.current, desired) {
+			t.Errorf("%s: reported as unchanged; the pool would never be corrected", tc.name)
+		}
+	}
+
+	// An empty pool that should stay empty must not be written either.
+	if !sameMembers(nil, nil) {
+		t.Error("two empty sets differ")
 	}
 }

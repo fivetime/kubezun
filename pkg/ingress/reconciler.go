@@ -7,6 +7,7 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/loadbalancer/v2/loadbalancers"
+	"github.com/gophercloud/gophercloud/v2/openstack/loadbalancer/v2/providers"
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -35,7 +36,94 @@ const (
 	InternalAnnotation       = "octavia.ingress.kubernetes.io/internal"
 	FloatingIPAnnotation     = "octavia.ingress.kubernetes.io/floatingip"
 	KeepFloatingIPAnnotation = "octavia.ingress.kubernetes.io/keep-floatingip"
+
+	// ProviderAnnotation picks the Octavia provider for one Ingress, over the
+	// deployment's default. Without it the provider is a process-level setting,
+	// so a tenant could not have one Ingress on a provider that terminates TLS
+	// in software and another on one that does not -- they differ in what they
+	// can do and in what they cost, and that is a per-Ingress decision.
+	//
+	// Effectively create-time: Octavia has no operation that moves a live load
+	// balancer between providers, so a changed value is refused rather than
+	// quietly ignored. See providerMatches.
+	ProviderAnnotation = "knaas.io/ingress-provider"
+
+	// ovnProvider is named here only to refuse it. pkg/service builds every
+	// Service on it deliberately -- layer 4 is all a ClusterIP needs, and it
+	// costs nothing but OVN flows. An Ingress is the one thing it cannot do.
+	ovnProvider = "ovn"
 )
+
+// resolveProvider returns the Octavia provider for one Ingress: what it asks
+// for, else this deployment's default.
+//
+// "ovn" is refused outright. It is the provider every Service here uses, so it
+// is the one a tenant is most likely to reach for -- and it is L4-only: it
+// answers UnsupportedOptionError to the TERMINATED_HTTPS listener and every
+// l7policy this builds. Accepting it would produce a load balancer with no
+// listener and a failure several API calls away from the annotation that
+// caused it.
+func (r *Reconciler) resolveProvider(ing *networkingv1.Ingress) (string, error) {
+	provider := strings.TrimSpace(ing.Annotations[ProviderAnnotation])
+	if provider == "" {
+		return r.Provider, nil
+	}
+	if provider == ovnProvider {
+		return "", fmt.Errorf("%s=%s: the ovn provider is layer 4 only and cannot serve an Ingress (it refuses TERMINATED_HTTPS listeners and l7policies); name a provider that terminates HTTP, such as amphora",
+			ProviderAnnotation, provider)
+	}
+	return provider, nil
+}
+
+// checkProviderInstalled turns a name this deployment does not have into a
+// message that says so and lists what it does have.
+//
+// Without it a typo becomes a load balancer create that fails somewhere inside
+// Octavia, retried forever, with the tenant's only clue an error naming the
+// string they already wrote. Only called when an Ingress asked for a specific
+// provider and no load balancer exists yet, so it costs one call on a path
+// taken once.
+func checkProviderInstalled(ctx context.Context, octavia *gophercloud.ServiceClient, want string) error {
+	pages, err := providers.List(octavia, providers.ListOpts{}).AllPages(ctx)
+	if err != nil {
+		// Not being able to ask is not evidence the provider is missing; let
+		// the create attempt be the judge.
+		return nil
+	}
+	all, err := providers.ExtractProviders(pages)
+	if err != nil || len(all) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(all))
+	for i := range all {
+		if all[i].Name == want {
+			return nil
+		}
+		names = append(names, all[i].Name)
+	}
+	return fmt.Errorf("%s=%s: this deployment has no such Octavia provider; it offers %s",
+		ProviderAnnotation, want, strings.Join(names, ", "))
+}
+
+// providerMatches refuses to reconcile an Ingress whose provider changed under
+// a load balancer that already exists.
+//
+// Octavia cannot move one, so there are only bad options and this picks the
+// loud one. Carrying on would leave the Ingress served by the provider its
+// annotation no longer names, with everything reporting healthy. Recreating it
+// silently would drop the VIP and any floating IP bound to it -- addresses a
+// tenant has published, deleted by an annotation edit.
+//
+// A live load balancer with no provider reported (older Octavia omits it) is
+// treated as a match: refusing on missing information would strand every
+// Ingress on such a deployment.
+func providerMatches(lb *loadbalancers.LoadBalancer, want string) error {
+	if lb.Provider == "" || want == "" || lb.Provider == want {
+		return nil
+	}
+	return fmt.Errorf("load balancer %s serves this Ingress on provider %q and %q is now requested: Octavia cannot move a load balancer between providers. Delete the Ingress and create it again to move it -- its address, and any floating IP on it, will change",
+		lb.ID, lb.Provider, want)
+}
 
 // Reconciler turns one tenant's Ingresses into Octavia L7 load balancers.
 //
@@ -236,9 +324,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, namespace, name string) erro
 // ensureLoadBalancer gets-or-creates the Ingress load balancer: by recorded
 // id, then by name, then create — pkg/service's shape with the L7 provider.
 func (r *Reconciler) ensureLoadBalancer(ctx context.Context, ing *networkingv1.Ingress) (*loadbalancers.LoadBalancer, error) {
+	provider, err := r.resolveProvider(ing)
+	if err != nil {
+		return nil, err
+	}
+
 	if id := ing.Annotations[lbIDAnnotation]; id != "" {
 		lb, err := service.GetLoadBalancerByID(ctx, r.Octavia, id)
 		if err == nil {
+			if err := providerMatches(lb, provider); err != nil {
+				return nil, err
+			}
 			return service.WaitActive(ctx, r.Octavia, lb.ID)
 		}
 		if err != service.ErrNotFound {
@@ -251,15 +347,23 @@ func (r *Reconciler) ensureLoadBalancer(ctx context.Context, ing *networkingv1.I
 	lb, err := service.GetLoadBalancerByName(ctx, r.Octavia, name)
 	switch {
 	case err == nil:
+		if err := providerMatches(lb, provider); err != nil {
+			return nil, err
+		}
 	case err == service.ErrNotFound:
+		if ing.Annotations[ProviderAnnotation] != "" {
+			if err := checkProviderInstalled(ctx, r.Octavia, provider); err != nil {
+				return nil, err
+			}
+		}
 		lb, err = loadbalancers.Create(ctx, r.Octavia, loadbalancers.CreateOpts{
 			Name:        name,
 			Description: fmt.Sprintf("kubezun Ingress %s/%s", ing.Namespace, ing.Name),
 			VipSubnetID: r.VIPSubnetID,
-			Provider:    r.Provider,
+			Provider:    provider,
 		}).Extract()
 		if err != nil {
-			return nil, fmt.Errorf("creating load balancer %q (provider=%s): %w", name, r.Provider, err)
+			return nil, fmt.Errorf("creating load balancer %q (provider=%s): %w", name, provider, err)
 		}
 	default:
 		return nil, err

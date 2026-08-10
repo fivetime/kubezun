@@ -359,8 +359,22 @@ func gcStalePools(ctx context.Context, octavia *gophercloud.ServiceClient, lbID,
 // tuning annotations) is applied in place.
 func ensureListener(ctx context.Context, octavia *gophercloud.ServiceClient, lbID, lbname string, tlsRefs []string, defaultPoolID string, tuning *listenerTuning) (*listeners.Listener, error) {
 	proto, port, name := listeners.ProtocolHTTP, 80, fmt.Sprintf("%s_http_80", lbname)
+	stale := fmt.Sprintf("%s_https_443", lbname)
 	if len(tlsRefs) > 0 {
 		proto, port, name = listeners.ProtocolTerminatedHTTPS, 443, fmt.Sprintf("%s_https_443", lbname)
+		stale = fmt.Sprintf("%s_http_80", lbname)
+	}
+
+	// The listener this Ingress no longer wants has to go, and it is named
+	// rather than inferred because it is not otherwise reachable from here.
+	// Adding TLS to a live Ingress used to leave the plain HTTP listener in
+	// place with its own copy of the l7policies: never reconciled again, so it
+	// went on serving whatever it held the moment TLS arrived, on a port the
+	// Ingress no longer declares. It looked correct from the outside -- port 80
+	// answered -- which is the reason it survived. Deleting the listener takes
+	// its policies with it.
+	if err := deleteListenerByName(ctx, octavia, lbID, stale); err != nil {
+		return nil, err
 	}
 
 	listener, err := service.GetListenerByName(ctx, octavia, lbID, name)

@@ -1,9 +1,11 @@
 package ingress
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/gophercloud/gophercloud/v2/openstack/loadbalancer/v2/l7policies"
+	"github.com/gophercloud/gophercloud/v2/openstack/loadbalancer/v2/loadbalancers"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -198,3 +200,65 @@ func ptr[T any](v T) *T { return &v }
 // List(nil) panics inside the lister — caught live on first deployment: every
 // EndpointSlice event crashed the process. The selector must always be
 // labels.Everything(); this pins the fan-out path with a real lister.
+
+// The provider is per-Ingress, so one tenant can run an Ingress on a provider
+// that does what they need and another on the cheaper one.
+func TestProviderAnnotationOverridesTheDefault(t *testing.T) {
+	r := &Reconciler{Provider: "incus"}
+
+	got, err := r.resolveProvider(&networkingv1.Ingress{})
+	if err != nil || got != "incus" {
+		t.Errorf("unset = %q, %v; want the deployment default", got, err)
+	}
+
+	got, err = r.resolveProvider(&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{ProviderAnnotation: "amphora"}}})
+	if err != nil || got != "amphora" {
+		t.Errorf("annotated = %q, %v; want what the Ingress asked for", got, err)
+	}
+
+	// Whitespace is a typo, not a provider name.
+	got, err = r.resolveProvider(&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{ProviderAnnotation: "  amphora  "}}})
+	if err != nil || got != "amphora" {
+		t.Errorf("padded = %q, %v", got, err)
+	}
+}
+
+// ovn serves every Service here, so it is the name a tenant reaches for first —
+// and it is the one provider that cannot serve an Ingress at all.
+func TestOVNIsRefusedForIngress(t *testing.T) {
+	r := &Reconciler{Provider: "incus"}
+	_, err := r.resolveProvider(&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{ProviderAnnotation: "ovn"}}})
+	if err == nil {
+		t.Fatal("ovn was accepted; it would build a load balancer that refuses every listener")
+	}
+	if !strings.Contains(err.Error(), "layer 4") {
+		t.Errorf("the error should say why, got: %v", err)
+	}
+}
+
+// Octavia cannot move a load balancer between providers. Reconciling on anyway
+// serves the Ingress from a provider its spec no longer names, with everything
+// reporting healthy; recreating it silently drops a published address.
+func TestAChangedProviderIsRefusedNotAppliedSilently(t *testing.T) {
+	live := &loadbalancers.LoadBalancer{ID: "lb-1", Provider: "incus"}
+
+	if err := providerMatches(live, "incus"); err != nil {
+		t.Errorf("same provider should reconcile: %v", err)
+	}
+	err := providerMatches(live, "amphora")
+	if err == nil {
+		t.Fatal("a changed provider was accepted")
+	}
+	if !strings.Contains(err.Error(), "amphora") || !strings.Contains(err.Error(), "incus") {
+		t.Errorf("the error should name both providers, got: %v", err)
+	}
+
+	// Older Octavia omits the provider. Refusing on missing information would
+	// strand every Ingress on such a deployment.
+	if err := providerMatches(&loadbalancers.LoadBalancer{ID: "lb-2"}, "amphora"); err != nil {
+		t.Errorf("an unreported provider should not block a reconcile: %v", err)
+	}
+}

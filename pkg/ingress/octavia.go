@@ -66,6 +66,25 @@ func deletePool(ctx context.Context, c *gophercloud.ServiceClient, lbID, poolID 
 	return err
 }
 
+// deleteListenerByName removes a listener if it is there, and is quiet when it
+// is not — the usual case, since it is called on every reconcile to sweep the
+// protocol this Ingress no longer serves on.
+func deleteListenerByName(ctx context.Context, c *gophercloud.ServiceClient, lbID, name string) error {
+	listener, err := service.GetListenerByName(ctx, c, lbID, name)
+	if err == service.ErrNotFound {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("looking up listener %q: %w", name, err)
+	}
+	if err := listeners.Delete(ctx, c, listener.ID).ExtractErr(); err != nil &&
+		!gophercloud.ResponseCodeIs(err, 404) {
+		return fmt.Errorf("deleting listener %q: %w", name, err)
+	}
+	_, err = service.WaitActive(ctx, c, lbID)
+	return err
+}
+
 // updateListener applies an update and waits for the load balancer to settle.
 func updateListener(ctx context.Context, c *gophercloud.ServiceClient, lbID, listenerID string, opts listeners.UpdateOpts) error {
 	if _, err := listeners.Update(ctx, c, listenerID, opts).Extract(); err != nil {

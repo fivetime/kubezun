@@ -179,12 +179,60 @@ func CreateHealthMonitor(ctx context.Context, c *gophercloud.ServiceClient, lbID
 //
 // The call is a full-set PUT, which is why callers must pass the complete
 // desired list: anything left out is removed from the pool, not left alone.
+//
+// A batch update with nothing to change is still a write. Octavia moves the
+// pool and its load balancer to PENDING_UPDATE and hands the provider real
+// work; every reconcile did this, so a load balancer whose members had not
+// moved in hours spent most of its life not ACTIVE -- which is also the state
+// in which Octavia refuses every other change to it, with "immutable". So the
+// set is compared first and an unchanged one is left alone.
 func SetPoolMembers(ctx context.Context, c *gophercloud.ServiceClient, lbID, poolID string, members []pools.BatchUpdateMemberOpts) error {
+	current, err := listPoolMembers(ctx, c, poolID)
+	if err == nil && sameMembers(current, members) {
+		return nil
+	}
 	if err := pools.BatchUpdateMembers(ctx, c, poolID, members).ExtractErr(); err != nil {
 		return err
 	}
-	_, err := WaitActive(ctx, c, lbID)
+	_, err = WaitActive(ctx, c, lbID)
 	return err
+}
+
+func listPoolMembers(ctx context.Context, c *gophercloud.ServiceClient, poolID string) ([]pools.Member, error) {
+	pages, err := pools.ListMembers(c, poolID, pools.ListMembersOpts{}).AllPages(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return pools.ExtractMembers(pages)
+}
+
+// sameMembers reports whether a pool already holds exactly the desired set.
+//
+// Compared on what this controller sets and Octavia echoes back: where the
+// member is, and which subnet it is reached through. Weight is not compared --
+// nothing here sets it, so a batch update would send Octavia's own default
+// back to it and the comparison would be against a value we never chose.
+func sameMembers(current []pools.Member, desired []pools.BatchUpdateMemberOpts) bool {
+	if len(current) != len(desired) {
+		return false
+	}
+	key := func(address string, port int, subnet string) string {
+		return fmt.Sprintf("%s|%d|%s", address, port, subnet)
+	}
+	have := make(map[string]struct{}, len(current))
+	for i := range current {
+		have[key(current[i].Address, current[i].ProtocolPort, current[i].SubnetID)] = struct{}{}
+	}
+	for i := range desired {
+		subnet := ""
+		if desired[i].SubnetID != nil {
+			subnet = *desired[i].SubnetID
+		}
+		if _, ok := have[key(desired[i].Address, desired[i].ProtocolPort, subnet)]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // DeleteLoadBalancer removes a load balancer and everything under it.
