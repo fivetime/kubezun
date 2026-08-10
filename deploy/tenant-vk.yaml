@@ -41,6 +41,17 @@ rules:
   - apiGroups: [""]
     resources: ["pods/status"]
     verbs: ["update", "patch"]
+  # Minting the token a pod finds at
+  # /var/run/secrets/kubernetes.io/serviceaccount. There is no kubelet here to
+  # project it, so this process asks for it and carries it into the capsule.
+  #
+  # The token it asks for is bound to the pod, so it stops working when the pod
+  # does. This permission is still the strongest one here: it can mint a
+  # credential for any ServiceAccount in a namespace it serves, which is what a
+  # kubelet can do for the pods on its node, and no more.
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
   # Which namespaces this process serves. Watched rather than configured: a
   # tenant creates namespaces while this is running, and a fixed list leaves one
   # made afterwards with no compute and nothing saying why.

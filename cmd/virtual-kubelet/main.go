@@ -17,7 +17,9 @@ import (
 	vklog "github.com/virtual-kubelet/virtual-kubelet/log"
 	logruslogger "github.com/virtual-kubelet/virtual-kubelet/log/logrus"
 	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
+	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/server/dynamiccertificates"
 
 	kingress "github.com/fivetime/kubezun/pkg/ingress"
@@ -273,6 +275,11 @@ func run(o options) error {
 			Tenant:           o.tenant,
 			ClusterDNS:       splitList(o.clusterDNS),
 			DNSService:       o.dnsService,
+			Tokens: func(ctx context.Context, namespace, account string,
+				req *authv1.TokenRequest) (*authv1.TokenRequest, error) {
+				return client.CoreV1().ServiceAccounts(namespace).
+					CreateToken(ctx, account, req, metav1.CreateOptions{})
+			},
 		}, zunClient, provider.Caches{
 			Pods:    set.PodsForNode(spec.name).Lister(),
 			Objects: set.Objects(),

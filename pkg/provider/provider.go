@@ -70,6 +70,9 @@ type Config struct {
 	// DNSService names the Service whose address is the tenant's resolver, as
 	// "namespace/name" in the tenant's own terms (kube-system/kube-dns).
 	DNSService string
+
+	// Tokens mints ServiceAccount tokens for pods that ask for one.
+	Tokens TokenMinter
 }
 
 // Provider runs pods as Zun capsules for a single tenant.
@@ -99,6 +102,13 @@ type Provider struct {
 	// cpuRates remembers each container's last CPU counter so the next reading
 	// becomes a rate. Zun reports a cumulative count, as the runtime does.
 	cpuRates *rates
+
+	// tokens mints a ServiceAccount token bound to one pod. Nil means this
+	// node hands out none, and a pod that wants one is refused rather than
+	// started without the credential its application will look for.
+	tokens TokenMinter
+	// tokenExpiries is when each pod's token runs out, guarded by mu.
+	tokenExpiries map[string]tokenExpiry
 }
 
 // ObjectReader reads one object at a time.
@@ -137,6 +147,9 @@ func New(cfg Config, client *zun.Client, caches Caches) (*Provider, error) {
 		deleted:   make(map[string]types.UID),
 		notify:    func(*corev1.Pod) {},
 		cpuRates:  newRates(),
+		tokens:    cfg.Tokens,
+
+		tokenExpiries: make(map[string]tokenExpiry),
 	}, nil
 }
 
@@ -358,6 +371,9 @@ func (p *Provider) NotifyPods(ctx context.Context, cb func(*corev1.Pod)) {
 	p.notify = cb
 	p.mu.Unlock()
 	go p.syncLoop(ctx)
+	if p.tokens != nil {
+		go p.tokenLoop(ctx)
+	}
 	if p.podLister != nil {
 		go p.orphanLoop(ctx)
 	} else {

@@ -2,6 +2,8 @@ package zun
 
 import (
 	"context"
+	"encoding/base64"
+	"net/url"
 
 	"github.com/gophercloud/gophercloud/v2"
 )
@@ -43,4 +45,23 @@ func (a *CapsuleAPI) Stats(ctx context.Context, id string) ([]ContainerStats, er
 		return nil, translate(err)
 	}
 	return body.Stats, nil
+}
+
+// UpdateFile replaces the contents of one of a capsule's file volumes, in
+// place, without restarting anything.
+//
+// The one thing that needs this is a service account token: it expires while
+// the workload runs, and a capsule is otherwise built once and never changed.
+func (a *CapsuleAPI) UpdateFile(ctx context.Context, id, containerPath string, contents []byte) error {
+	q := url.Values{}
+	q.Set("path", containerPath)
+	q.Set("contents", base64.StdEncoding.EncodeToString(contents))
+
+	var body any
+	_, err := a.client.ServiceClient().Post(ctx, a.url(id, "update_file")+"?"+q.Encode(),
+		nil, &body, &gophercloud.RequestOpts{OkCodes: []int{200, 202}})
+	if err != nil {
+		return translate(err)
+	}
+	return nil
 }

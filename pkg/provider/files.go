@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -32,6 +33,15 @@ func (p *Provider) resolveFiles(ctx context.Context, pod *corev1.Pod) (map[strin
 			files, err = p.configMapFiles(ctx, pod.Namespace, v.ConfigMap)
 		case v.Secret != nil:
 			files, err = p.secretFiles(ctx, pod.Namespace, v.Secret)
+		case serviceAccountVolume(&v):
+			if !wantsServiceAccountToken(pod) {
+				continue
+			}
+			var expiry time.Time
+			files, expiry, err = p.serviceAccountFiles(ctx, pod)
+			if err == nil {
+				p.trackTokenExpiry(pod, v.Name, expiry)
+			}
 		default:
 			continue
 		}

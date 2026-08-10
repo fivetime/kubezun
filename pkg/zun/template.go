@@ -81,9 +81,10 @@ func Validate(pod *corev1.Pod) error {
 					!*pod.Spec.AutomountServiceAccountToken {
 					continue
 				}
-				return unsupported("the service account token volume",
-					"a capsule cannot refresh a bound token; set "+
-						"automountServiceAccountToken: false on the pod")
+				// Carried in as files, like a configMap or secret, and
+				// renewed in place before it expires. See
+				// pkg/provider/satoken.go.
+				continue
 			}
 			return unsupported("spec.volumes[].projected",
 				"projected volumes need a kubelet to refresh their contents")
