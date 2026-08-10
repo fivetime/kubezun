@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	dto "github.com/prometheus/client_model/go"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
@@ -19,7 +18,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	corev1listers "k8s.io/client-go/listers/core/v1"
-	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 
 	"github.com/fivetime/kubezun/pkg/service"
 	"github.com/fivetime/kubezun/pkg/zun"
@@ -97,6 +95,10 @@ type Provider struct {
 	deleted map[string]types.UID
 
 	notify func(*corev1.Pod)
+
+	// cpuRates remembers each container's last CPU counter so the next reading
+	// becomes a rate. Zun reports a cumulative count, as the runtime does.
+	cpuRates *rates
 }
 
 // ObjectReader reads one object at a time.
@@ -134,6 +136,7 @@ func New(cfg Config, client *zun.Client, caches Caches) (*Provider, error) {
 		pods:      make(map[string]*corev1.Pod),
 		deleted:   make(map[string]types.UID),
 		notify:    func(*corev1.Pod) {},
+		cpuRates:  newRates(),
 	}, nil
 }
 
@@ -619,14 +622,6 @@ func (p *Provider) PortForward(ctx context.Context, namespace, pod string, port 
 		return err
 	}
 	return errNotImplemented("port-forward is not supported on a KNaaS virtual node")
-}
-
-func (p *Provider) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summary, error) {
-	return nil, errNotImplemented("stats are not collected on a KNaaS virtual node")
-}
-
-func (p *Provider) GetMetricsResource(ctx context.Context) ([]*dto.MetricFamily, error) {
-	return nil, errNotImplemented("metrics are not collected on a KNaaS virtual node")
 }
 
 // errNotImplemented reports a capability this node does not serve. The

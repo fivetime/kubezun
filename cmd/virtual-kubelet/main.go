@@ -236,6 +236,17 @@ func run(o options) error {
 		go certs.Run(ctx)
 	}
 
+	// Ask Zun once, before any node registers, whether the zones these nodes
+	// claim are real. A node whose zone does not exist still registers and
+	// still accepts pods; each one is then refused by Zun's scheduler as "no
+	// valid host", which reads like a full cluster rather than a typo in a
+	// flag. Refusing to start says which zone and which ones exist.
+	for _, spec := range specs {
+		if err := zunClient.CheckAvailabilityZone(ctx, spec.zunAZ); err != nil {
+			return fmt.Errorf("node %q: %w", spec.name, err)
+		}
+	}
+
 	for _, spec := range specs {
 		nodeObj := knode.Build(knode.Options{
 			Name:       spec.name,
