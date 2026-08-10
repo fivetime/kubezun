@@ -716,7 +716,12 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 - [x] Zun capsule 容器名 minLength=2，K8s 允许单字符容器名 → 租户写 `name: c` 得到一个
       看不懂的 400。已在 fork 侧放宽 schema（`6c2d7404`，minLength 与 pattern 都要改：
       原 pattern `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$` 自带第二字符要求，只改 minLength 不够）
-- [ ] kubectl logs 通路：对接 fork 的 GET /capsules/{id}/logs；exec 返回 errdefs 明确错误（§10）
+- [x] kubectl logs / exec 已通（板子上这条一直是过期的，2026-08-10 核实）：fork 侧
+      `capsules.py` 的 `logs`/`execute` 端点在，kubezun 侧 `GetContainerLogs`/
+      `RunInContainer` 对接完毕，**本轮排障全程在用**（ingtest 的 curl 都是 kubectl exec）
+- [ ] **logs `--follow` 与 exec `-t` 仍不支持**：Zun 一次性返回全部输出，没有流式端点。
+      现在是明确报错而不是假装支持（follow 轮询会在每个边界重复行；给个连不上的
+      终端会让调用方一直等）。要补得先在 fork 里加流式端点
 - [ ] Barbican KMS：barbican-kms-plugin（CPO 现成）做 etcd 加密后端（§8.1）。
       ⚠️ **与 kubetron 的 Barbican 是两回事**（2026-08-07 查证）：kubetron 的
       `pkg/ingress/barbican.go` 是把 K8s TLS Secret 镜像成 PKCS12 供 Octavia 做
