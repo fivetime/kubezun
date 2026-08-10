@@ -676,6 +676,26 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       改回 `true` → FIP 被**删除**（不是仅解绑）、ADDRESS 回落 VIP，无计费泄漏。
       归属标记确实写在 FIP description 上（⚠️ `openstack floating ip list` 不返回
       description 列，只有 `show` 才看得到，别据此以为没写）
+- [x] **每 Ingress 选 provider（照 kubetron，`58038c3`）**：注解 `knaas.io/ingress-provider`，
+      不填即部署默认（`-ingress-provider`）。**改已有 Ingress 的 provider 直接拒绝**——
+      Octavia 没有"迁移 provider"这个操作，硬来要么让 Ingress 继续跑在旧 provider 上而
+      一切显示健康，要么静默重建、把租户已经公布出去的 VIP/FIP 弄丢。另外两道在
+      **创建任何东西之前**就挡下：`ovn` 按名拒（L4-only，它是租户最可能顺手写的那个，
+      因为所有 Service 都用它）；本部署没装的 provider 直接报错并列出装了哪些。
+      实测三条报错文案 + amphora 与 incus 同租户并存（LB 建在 amphora 上、Octavia 一路
+      驱动到起 amphora 虚机，**本实验床 nova-incus 起不来那台虚机**，断点在计算层不在我们）
+- [ ] **实验床 amphora provider 起不来**：`ComputeWaitTimeoutException`，amphora 镜像在
+      nova-incus（lxd hypervisor）上引导不起来。不影响 kubezun，但 L7 只剩 incus 一种
+      可选，**provider 并存只验到了控制面**
+- [x] **两个被 provider 测试顺带挖出来的缺陷（`58038c3`，与 provider 无关）**：
+      ① `SetPoolMembers` 无条件 `BatchUpdateMembers`——成员没变也是一次写，Octavia 把
+      pool 和 LB 推进 PENDING_UPDATE，而那正是它拒绝其他一切改动（"immutable"）的状态。
+      实测改前每 ~30 秒写一次、几乎从不 ACTIVE，改后两分钟零写入。⚠️ pkg/service 共用
+      同一函数，**Service 侧一直在同样空转**；
+      ② 给运行中的 Ingress 加 TLS 会把 :80 listener 连同它那份 l7policy 遗留下来，
+      **再也不被 reconcile**，于是继续按 TLS 到达那一刻的配置服务一个 Ingress 已经不再
+      声明的端口。它能藏住正是因为"80 端口有响应"。现在切换协议时删掉不要的那个
+      listener（policy 随之级联删除）。⚠️ **kubetron 同源同病**（`pkg/ingress/l7.go:362`）
 - [ ] **开通必须给租户 `creator` 角色，否则 TLS Ingress 全线不可用**（2026-08-10 实测）：
       Barbican 建/列 secret 需要 `creator`，租户 appcred 原本只有 `member`+`reader`
       → reconcile 卡在 `listing Barbican secrets ...: 403`，listener :443 永远建不出来。
