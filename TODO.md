@@ -790,6 +790,11 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       **记账未抄**:nova-incus 的 share journal(挂载 crash 恢复——本次部署的 NameError
       窗口恰好泄漏了一个它专治的孤儿挂载,已手工清)、CephFS secretfile(per-share
       凭据的现成模板,留给"有凭据后端"生产化项)
+- [x] **provision 竞态泄漏(`fcf2803`,用户问"改好了吗"复查时抓到)**:informer 缓存
+      滞后 → 同一 claim 两次 provision 各建一个卷;PV 只有一个赢家,输家在 AlreadyExists
+      分支直接返回,**它刚建的卷无人记录**——winner 的 PV 记的是 winner 的 ID,sweep
+      永远认不出这个孤儿,漏成账单。现在输家在收养 winner 的 PV 前先删掉自己建的存储。
+      实测:新 claim 恰好 1 个卷,删除后归零
 - [ ] 孤儿 share 挂载清扫:volmap 已删但挂载还在(进程在 mount 与记录之间死掉)。
       Zun 式做法是周期任务对比 /proc/mounts 与 volmap 表,不必抄 journal
 - [ ] 跨节点 RWX 未被调度触发(两 pod 落同节点,授权集=1 个 /32);机制是按节点的,
