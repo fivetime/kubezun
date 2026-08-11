@@ -576,7 +576,13 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       这正是"节点上报的 capacity 是承诺不是库存"的实例——虚拟节点按配额镜像容量，
       与该架构背后有没有主机无关。暂时用 `nodeSelector: kubernetes.io/arch=amd64` 绕开。
       真修法待定：某架构无可用主机时该不该上报可调度容量
-- [ ] **⚠️ securityContext 大部分字段被静默丢弃（2026-08-08 发现）**：
+- [x] **✅ 已修（2026-08-08，fork 侧补齐 CRI security_context 传递；走的是路线 ①）**：
+      runAsUser/runAsGroup/fsGroup/readOnlyRootFilesystem/allowPrivilegeEscalation/
+      capabilities/seccompProfile 全部落到运行时。
+      ⚠️ 它存在 `healthcheck` 列里,不是 capsule 的 annotations——API 会用生成名覆盖
+      capsule 容器的名字,按名字做键永远匹配不上,于是每个容器都以 root 跑且根文件系统
+      可写,**静默地**。实测 `id` 回 `uid=1001 gid=2001 groups=2001,3001`。
+      原始记录（保留备查）：**⚠️ securityContext 大部分字段被静默丢弃（2026-08-08 发现）**：
       Zun 的 CRI 驱动只传一个字段——`LinuxContainerSecurityContext(privileged=...)`
       （`driver.py:262`），而我们的 `unsupported()` 也只拦 `privileged`。于是租户写的
       这些**全部无声消失**：
@@ -842,6 +848,56 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       lvmdriver-1 时卷直接 error)、`KUBEZUN_SHARE_TYPE`、计算节点 ceph-common+配置、
       nfs-common、RBAC pvc(读)/pv(写删)
 
+## 双驱动：Container API 跑在 CRI 上（2026-08-11，定案见 fork `FORK.md` §4）
+
+**为什么**：zun-ui / Horizon 那条"容器即虚机 + 终端"的产品线服务不懂 K8s 的用户，
+不该因为我们把重心放在 capsule 上就消失。而 `container_driver = docker` 虽然零开发，
+代价是两套镜像存储、两套 kata sandbox、VMM 各起各的、**资源账分裂**——CRI 的
+`ListContainerStats` 看不见 moby 里的容器，计费就少一半数据。
+
+- [x] **CriDriver 实现 ContainerDriver**（`b2f9af06` / `54beaf58` / `a5de1b94`）。
+      在 CRI 上一个"容器"就是只有一个容器的 capsule——不是复用代码的技巧，是 CRI
+      **没有 sandbox 之外的容器**这个概念。
+      已实现并实测：create/delete/start/stop/show/list/attach/镜像 +
+      reboot/update/stats/top + pause/unpause/带信号的 kill。
+- [x] **契约测试**：按 **zun-ui 实际调用的 19 个方法**（`zun_ui/api/client.py`）打，
+      不是 api-ref 的 28 个端点；凭据用租户 appcred（admin 令牌会让 `list` 失去意义）。
+      23 项 4 失败，全部预期内（2 项做不到 + 2 项租户策略 403）。
+- [x] **DockerDriver 未被破坏**：文件整个 fork 期间零改动，分派机制没动。
+      ⚠️ 但共享代码上踩过一次（`b460f222`）：为 CRI 改 wsproxy 时把 TLS 证书来源从
+      `CONF.docker.*` 挪成构造参数、又无条件下发运行时的子协议，**两处只有 docker
+      那条路会疼**，而我们不跑 dockerd 所以永远测不出来。现按 URL 判别对端。
+      **改共享代码时要问的不是"我这条路对不对"，而是"另一条路还在不在"。**
+
+### 做不到的（写在这里，别再当成"还没做"重提）
+
+- **`resize`（tty 尺寸）**：尺寸**已经**能改（流内第五通道，`exec -it` 实测好使）。
+  够不到的是**从流外面改**——REST 是另一条连接，proxy 没有会话表把它和开着的流对上。
+  要做 = 给 wsproxy 加会话跟踪，架构改动。现在明确报错说明原因，不返回 500。
+- **`network_attach` / `network_detach`**：沙箱的网络创建时定死。kata 内部有
+  `Sandbox.AddInterface`（`virtcontainers/sandbox.go:1245`），但 **shim 管理接口
+  不暴露它**，CRI 也不会对运行中的 sandbox 重跑 CNI。
+
+### 语义不等价（产品要知道）
+
+- ⚠️ **pause 不释放任何东西**。freezer cgroup，而且冻结发生在 **guest 内部**——
+  宿主机毫不知情，VMM 照旧持有整块 guest RAM，Placement claim 一动不动。
+  **UI 文案不能让它读起来像"暂停就不计费"。**
+- ⚠️ **stop/start 与 reboot 丢掉可写层**（docker 的 restart 保得住）。地址保住了，
+  因为地址属于沙箱。marker 文件实测。
+
+### 未决
+
+- [ ] **zun-ui 要求创建时 `interactive=true` 才显示终端**
+      （`console.controller.js:42`）。要么 UI 默认勾上，要么 `get_websocket_url`
+      不依赖该标志。**产品决定，不是技术问题。**
+- [ ] **UI 上隐藏 pause / 窗口大小同步**，或给出明确说明——否则用户点了没反应。
+- [ ] **计费：ceilometer central pollster**（~250-300 行，全部在 ceilometer 侧，
+      Zun 不用动）。参照 `ceilometer/load_balancer/octavia.py`。数据源是 capsule
+      stats，CPU 本来就是累计值，正好对上 cumulative 样本类型。
+- [ ] ⚠️ **契约测试有真实偶发性**：有一轮失败的检查后面两轮原样重跑全过，中间什么
+      都没改。**单独一轮全绿不算证据**，查偶发之前先确认自己看的是不是同一个东西。
+
 ## 阶段 4：生产化（§12）
 
 - [x] Zun capsule 容器名 minLength=2，K8s 允许单字符容器名 → 租户写 `name: c` 得到一个
@@ -854,11 +910,13 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       运行时给每行都写了 RFC3339Nano 时间戳，那就是游标。始终向 Zun 要带时间戳的
       输出，记住最后一行的时间戳，下一轮只发它之后的，再按调用方意愿把时间戳去掉。
       **重复不是"不太可能"而是不可能**。实测：每 2 秒一行的 pod，连续输出、零重复行
-- [ ] **exec `-t`（交互终端）仍不支持**：这条和 follow 不是一类问题，轮询解决不了——
-      需要能承载会话的传输。CRI 的 `Exec` RPC 会返回运行时自己流式服务器的 URL，
-      那个服务器**本来就说 kubectl 要的 remotecommand 协议**；难点在从我们这边能不能
-      够到它（它监听在计算节点上，通常只对本机开放），属于部署问题。
-      ⚠️ Zun 现有的交互式 attach 只有 docker driver 有（走 websocket 代理），CRI 路径没有
+- [x] **exec `-t`（交互终端）已支持**（2026-08-11，kubezun `3d83658` + fork `2de1c48d`）：
+      走 Zun 原生模式。CRI 的 `Exec` 返回运行时自己流式服务器的 URL，那个服务器
+      本来就说 `v4.channel.k8s.io`（五通道：stdin/stdout/stderr/error/resize）。
+      ⚠️ 它监听 `127.0.0.1:随机端口` **且自身无认证**——URL 里的一次性 token 就是全部
+      凭据，所以不暴露它：`zun-wsproxy` 跑在每台计算节点上，对外只给 token 认证的
+      websocket。实测 `stty size` 随窗口变化（30 100 → 55 200）。
+      ⚠️ **代理地址必须由承载节点自报**——API 主机配置里的那个 proxy 什么都不服务
 - [ ] Barbican KMS：barbican-kms-plugin（CPO 现成）做 etcd 加密后端（§8.1）。
       ⚠️ **与 kubetron 的 Barbican 是两回事**（2026-08-07 查证）：kubetron 的
       `pkg/ingress/barbican.go` 是把 K8s TLS Secret 镜像成 PKCS12 供 Octavia 做
