@@ -776,6 +776,22 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       share 一把钥匙)或 guest 内挂载(§8.2 P3:挂载动作进 Kata VM,客户端身份=capsule
       OVN port IP,授权单元与租户边界重合;代价:存储网对租户网可路由的拓扑反转 +
       guest 内核 NFS client + Zun→Kata direct-volume 通道)
+- [x] **与 nova-incus 的 Manila 实现对比后硬化（fork `447a3a59`）**——抄了四处:
+      ①挂载带 `nosuid,nodev`(租户控制 share 全部内容且挂在宿主机上);②mount 加 60s
+      超时(NFS 服务端不可达时裸 mount 卡几分钟,zun-compute 是单进程 greenthread——
+      又是心跳饿死那个形状);③已有挂载校验 source==export(旧挂载静默顶替=给 capsule
+      一个它没要的文件系统);④**per-share 锁修真竞态**:两 capsule 同时释放最后两个
+      挂载,各自 umount 后都看到对方的还在 → 双双跳过 revoke → 授权永久泄漏。
+      实测:同时删两 pod → 三节点 0 挂载、授权清单 0 条。
+      **保留的差异**:授权留在 driver、用租户请求 token——nova 在上层用服务凭据授权,
+      分层更净但要一份近 admin 的 Manila 服务用户;Zun 无 conductor 层、cinder 路径
+      本来就在节点上用请求上下文,且租户 token 意味着节点只能操作它正在放置的租户的
+      share,权限严格更小。
+      **记账未抄**:nova-incus 的 share journal(挂载 crash 恢复——本次部署的 NameError
+      窗口恰好泄漏了一个它专治的孤儿挂载,已手工清)、CephFS secretfile(per-share
+      凭据的现成模板,留给"有凭据后端"生产化项)
+- [ ] 孤儿 share 挂载清扫:volmap 已删但挂载还在(进程在 mount 与记录之间死掉)。
+      Zun 式做法是周期任务对比 /proc/mounts 与 volmap 表,不必抄 journal
 - [ ] 跨节点 RWX 未被调度触发(两 pod 落同节点,授权集=1 个 /32);机制是按节点的,
       多节点时各自加一条,下次多 pod 实验顺带验
 - [ ] 开通清单新增:`KUBEZUN_VOLUME_TYPE`(必须映射到在跑的后端——默认类型指向没跑的
