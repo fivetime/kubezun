@@ -60,7 +60,8 @@ func buildFileVolumes(pod *corev1.Pod, files map[string]map[string][]byte,
 						vol.Cinder = &cinderData{VolumeID: resolved.VolumeID,
 							FSGroup: fsGroupOf(pod)}
 					case "nfs":
-						vol.NFS = &nfsData{Export: resolved.Export}
+						vol.NFS = &nfsData{Export: resolved.Export,
+							ShareID: resolved.VolumeID, FSGroup: fsGroupOf(pod)}
 					default:
 						return nil, nil, fmt.Errorf(
 							"volume %s: claim %s resolves to unknown storage %q",

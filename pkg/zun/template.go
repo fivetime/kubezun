@@ -244,6 +244,11 @@ type cinderData struct {
 // nfsData is where a shared filesystem is mounted from.
 type nfsData struct {
 	Export string `json:"export"`
+	// ShareID lets the node mounting this grant itself access with the
+	// request's own token -- the tenant's, so a node can only manage access
+	// to shares of the tenant whose capsule it is placing.
+	ShareID string `json:"shareID,omitempty"`
+	FSGroup int64  `json:"fsGroup,omitempty"`
 }
 
 // emptyDirData is the pod's emptyDir, passed through as it was written.
