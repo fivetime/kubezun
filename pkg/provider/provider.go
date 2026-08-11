@@ -571,7 +571,7 @@ func (p *Provider) securityGroupsFor(ctx context.Context, pod *corev1.Pod) ([]st
 	if p.policies == nil {
 		return nil, nil
 	}
-	groups, err := p.policies.GroupsFor(pod)
+	groups, err := p.policies.GroupsFor(ctx, pod)
 	if err != nil {
 		// Refusing to place the pod is the safe direction. Creating it with
 		// the default group would give a pod its policy says is isolated the

@@ -44,6 +44,11 @@ type Peer struct {
 	// SelectorKey identifies a pod set, whose addresses live in an address
 	// group. Empty when CIDR is set.
 	SelectorKey string
+	// Selector is that same pod set, resolved. ⚠️ Carried rather than derived
+	// later: the key is a hash, and nothing can be recovered from it. A
+	// pipeline that keeps only the key discovers this at the point where it
+	// has to list the pods and cannot.
+	Selector PeerSelector
 }
 
 // Port is one allowed port range and protocol.
@@ -168,7 +173,12 @@ func translateRule(ns string, dir Direction, index int, peers []networkingv1.Net
 				refused = append(refused, Refusal{Field: at, Reason: err.Error()})
 				continue
 			}
-			rule.Peers = append(rule.Peers, Peer{SelectorKey: key})
+			sel, err := resolvePeer(ns, peer.NamespaceSelector, peer.PodSelector)
+			if err != nil {
+				refused = append(refused, Refusal{Field: at, Reason: err.Error()})
+				continue
+			}
+			rule.Peers = append(rule.Peers, Peer{SelectorKey: key, Selector: sel})
 		default:
 			refused = append(refused, Refusal{
 				Field:  at,
@@ -262,6 +272,29 @@ func SelectorKey(policyNamespace string, nsSel, podSel *metav1.LabelSelector) (s
 		pods = s.String()
 	}
 	return scope + ";pods=" + pods, nil
+}
+
+// resolvePeer turns a peer's two selectors into something that can list pods.
+func resolvePeer(policyNamespace string, nsSel, podSel *metav1.LabelSelector) (PeerSelector, error) {
+	out := PeerSelector{Pods: labels.Everything()}
+	if podSel != nil {
+		s, err := metav1.LabelSelectorAsSelector(podSel)
+		if err != nil {
+			return out, err
+		}
+		out.Pods = s
+	}
+	if nsSel == nil {
+		// ⚠️ The policy's own namespace, not every namespace.
+		out.Namespace = policyNamespace
+		return out, nil
+	}
+	s, err := metav1.LabelSelectorAsSelector(nsSel)
+	if err != nil {
+		return out, err
+	}
+	out.Namespaces = s
+	return out, nil
 }
 
 // IsolationOf reports which directions a pod is put into default-deny by the

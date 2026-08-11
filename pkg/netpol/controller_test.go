@@ -1,6 +1,7 @@
 package netpol
 
 import (
+	"context"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -40,7 +41,7 @@ func TestRemovingAPolicyGivesTheGroupsBack(t *testing.T) {
 
 	withPolicy := reconciler(t, isolating)
 	withPolicy.Pods = podLister(t, web)
-	got, err := withPolicy.GroupsFor(web)
+	got, err := withPolicy.GroupsFor(context.Background(), web)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +52,7 @@ func TestRemovingAPolicyGivesTheGroupsBack(t *testing.T) {
 	// The same pod, once the policy is gone.
 	without := reconciler(t)
 	without.Pods = podLister(t, web)
-	got, err = without.GroupsFor(web)
+	got, err = without.GroupsFor(context.Background(), web)
 	if err != nil {
 		t.Fatal(err)
 	}

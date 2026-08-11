@@ -170,7 +170,7 @@ func (r *Reconciler) ReconcilePod(ctx context.Context, key string) error {
 		return nil
 	}
 
-	want, err := r.GroupsFor(pod)
+	want, err := r.GroupsFor(ctx, pod)
 	if err != nil {
 		return err
 	}

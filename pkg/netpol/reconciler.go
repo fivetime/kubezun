@@ -66,7 +66,7 @@ func (r *Reconciler) BaselineGroups() []string {
 // own default is the opposite. A policy naming Ingress takes the ingress group
 // away, and nothing else changes -- which is why there are two groups and not
 // one.
-func (r *Reconciler) GroupsFor(pod *corev1.Pod) ([]string, error) {
+func (r *Reconciler) GroupsFor(ctx context.Context, pod *corev1.Pod) ([]string, error) {
 	if r.baseline.ingress == "" || r.baseline.egress == "" || r.baseline.denyAll == "" {
 		return nil, fmt.Errorf("the baseline security groups have not been resolved yet")
 	}
@@ -77,6 +77,13 @@ func (r *Reconciler) GroupsFor(pod *corev1.Pod) ([]string, error) {
 	isolated, err := IsolationOf(pod, policies)
 	if err != nil {
 		return nil, err
+	}
+	if len(isolated) == 0 {
+		// No policy selects it, so there is nothing to allow and nothing to
+		// deny. Skipping the rule-set work here is not an optimisation: it is
+		// what keeps a tenant with no policies from creating security group
+		// objects, which is the expensive event in the whole design.
+		return []string{r.baseline.denyAll, r.baseline.ingress, r.baseline.egress}, nil
 	}
 	// ⚠️ Always present, so the list is never empty. Neutron reads a port with
 	// no groups as "use the project default", which is permissive -- so a pod
@@ -89,8 +96,66 @@ func (r *Reconciler) GroupsFor(pod *corev1.Pod) ([]string, error) {
 	if len(isolated[Egress]) == 0 {
 		groups = append(groups, r.baseline.egress)
 	}
+
+	allowed, err := r.ruleSetFor(ctx, pod, policies)
+	if err != nil {
+		return nil, err
+	}
+	if allowed != "" {
+		groups = append(groups, allowed)
+	}
 	sort.Strings(groups)
 	return groups, nil
+}
+
+// ruleSetFor makes sure the group carrying this pod's allowances exists, along
+// with the peer sets its rules refer to, and returns its id.
+//
+// Returns "" when the policies allow nothing, which is the deny-all case: the
+// anchor group already says that, and creating an empty group to say it again
+// would cost a cloud-wide northd recompute for no effect.
+func (r *Reconciler) ruleSetFor(ctx context.Context, pod *corev1.Pod, policies []*networkingv1.NetworkPolicy) (string, error) {
+	var translated []*Translated
+	for _, p := range policies {
+		t, err := Translate(p)
+		if err != nil {
+			return "", err
+		}
+		if !t.Subject.Matches(labels.Set(pod.Labels)) {
+			continue
+		}
+		translated = append(translated, t)
+	}
+	set := EffectiveRules(pod, translated)
+	if set.Empty() {
+		return "", nil
+	}
+
+	// The peer sets first: a rule naming an address group that does not exist
+	// is refused, and a refusal in the middle leaves the pod holding half a
+	// policy.
+	keys := make([]string, 0, len(set.Peers))
+	for key := range set.Peers {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	peers := make(map[string]string, len(set.Peers))
+	for _, key := range keys {
+		id, err := r.Neutron.EnsureAddressGroup(ctx, AddressGroupName(key))
+		if err != nil {
+			return "", err
+		}
+		addresses, err := r.AddressesFor(key, set.Peers[key])
+		if err != nil {
+			return "", err
+		}
+		if err := r.Neutron.SyncAddresses(ctx, id, addresses); err != nil {
+			return "", err
+		}
+		peers[key] = id
+	}
+	return r.Neutron.EnsureRuleSet(ctx, set, peers)
 }
 
 func (r *Reconciler) policiesFor(namespace string) ([]*networkingv1.NetworkPolicy, error) {

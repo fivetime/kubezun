@@ -1,6 +1,7 @@
 package netpol
 
 import (
+	"context"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -39,7 +40,7 @@ func pod(ns, name string, kv map[string]string) *corev1.Pod {
 // Neutron's baseline is deny and Kubernetes' is allow.
 func TestAnUnselectedPodKeepsBothGroups(t *testing.T) {
 	r := reconciler(t)
-	got, err := r.GroupsFor(pod("prod", "web", map[string]string{"app": "web"}))
+	got, err := r.GroupsFor(context.Background(), pod("prod", "web", map[string]string{"app": "web"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +61,7 @@ func TestIsolationTakesOnlyTheDirectionAsked(t *testing.T) {
 		},
 	})
 
-	got, err := r.GroupsFor(pod("prod", "web", map[string]string{"app": "web"}))
+	got, err := r.GroupsFor(context.Background(), pod("prod", "web", map[string]string{"app": "web"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +70,7 @@ func TestIsolationTakesOnlyTheDirectionAsked(t *testing.T) {
 	}
 
 	// A pod the policy does not select is untouched.
-	got, _ = r.GroupsFor(pod("prod", "db", map[string]string{"app": "db"}))
+	got, _ = r.GroupsFor(context.Background(), pod("prod", "db", map[string]string{"app": "db"}))
 	if len(got) != 3 {
 		t.Errorf("an unselected pod was isolated: %v", got)
 	}
@@ -77,7 +78,7 @@ func TestIsolationTakesOnlyTheDirectionAsked(t *testing.T) {
 	// ⚠️ Same labels, another namespace. A tenant's namespaces share one
 	// Neutron network, so a policy leaking across them would be invisible in
 	// the substrate and wrong in exactly the case namespaces are made for.
-	got, _ = r.GroupsFor(pod("staging", "web", map[string]string{"app": "web"}))
+	got, _ = r.GroupsFor(context.Background(), pod("staging", "web", map[string]string{"app": "web"}))
 	if len(got) != 3 {
 		t.Errorf("a policy reached into another namespace: %v", got)
 	}
@@ -93,7 +94,7 @@ func TestBothDirectionsLeaveNothing(t *testing.T) {
 				networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
 		},
 	})
-	got, err := r.GroupsFor(pod("prod", "web", nil))
+	got, err := r.GroupsFor(context.Background(), pod("prod", "web", nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +111,7 @@ func TestBothDirectionsLeaveNothing(t *testing.T) {
 // quietly producing a pod with no groups, which reads as deny-all.
 func TestBaselineMustBeResolvedFirst(t *testing.T) {
 	r := &Reconciler{Policies: policyLister(t)}
-	if _, err := r.GroupsFor(pod("prod", "web", nil)); err == nil {
+	if _, err := r.GroupsFor(context.Background(), pod("prod", "web", nil)); err == nil {
 		t.Error("groups were computed before the baseline existed")
 	}
 }

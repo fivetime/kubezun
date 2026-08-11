@@ -193,6 +193,69 @@ func (n *Neutron) rulesOf(ctx context.Context, groupID string) ([]rules.SecGroup
 	return out, err
 }
 
+// EnsureRuleSet makes a security group hold exactly these rules.
+//
+// The peers map turns a selector key into the address group id the rule refers
+// to; every key in the set must be present, because a rule naming a group that
+// does not exist is refused and leaves the set half written.
+func (n *Neutron) EnsureRuleSet(ctx context.Context, set RuleSet, peers map[string]string) (string, error) {
+	id, err := n.ensureGroup(ctx, set.Name(),
+		"kubezun: what one pod's NetworkPolicies allow")
+	if err != nil {
+		return "", err
+	}
+	have, err := n.rulesOf(ctx, id)
+	if err != nil {
+		return "", err
+	}
+
+	want := make([]rules.CreateOpts, 0, len(set.Rules))
+	for _, r := range set.Rules {
+		opts := rules.CreateOpts{
+			SecGroupID:   id,
+			Direction:    rules.RuleDirection(r.Direction),
+			EtherType:    rules.RuleEtherType(r.EtherType),
+			Protocol:     rules.RuleProtocol(r.Protocol),
+			PortRangeMin: int(r.PortMin),
+			PortRangeMax: int(r.PortMax),
+		}
+		switch {
+		case r.RemoteCIDR != "":
+			opts.RemoteIPPrefix = r.RemoteCIDR
+		case r.RemoteAddressGroup != "":
+			gid, ok := peers[r.RemoteAddressGroup]
+			if !ok || gid == "" {
+				return "", fmt.Errorf(
+					"the peer set %q has no address group yet", r.RemoteAddressGroup)
+			}
+			opts.RemoteAddressGroupID = gid
+		}
+		want = append(want, opts)
+	}
+
+	for _, w := range want {
+		if hasRule(have, w) {
+			continue
+		}
+		if _, err := rules.Create(ctx, n.Client, w).Extract(); err != nil && !isConflict(err) {
+			return "", fmt.Errorf("writing a rule into %s: %w", set.Name(), err)
+		}
+	}
+	// ⚠️ And remove what is no longer wanted, including the two egress
+	// allow-all rules Neutron adds to every group it creates. A rule set that
+	// only ever grows is a rule set that keeps allowing what a tenant has
+	// already taken out of its policy.
+	for _, h := range have {
+		if wantsRule(want, h) {
+			continue
+		}
+		if err := rules.Delete(ctx, n.Client, h.ID).ExtractErr(); err != nil && !isGone(err) {
+			return "", fmt.Errorf("removing a stale rule from %s: %w", set.Name(), err)
+		}
+	}
+	return id, nil
+}
+
 // EnsureAddressGroup makes sure a peer set exists under a stable name.
 func (n *Neutron) EnsureAddressGroup(ctx context.Context, name string) (string, error) {
 	var found string
@@ -337,6 +400,16 @@ func isConflict(err error) bool {
 func isGone(err error) bool {
 	var code gophercloud.ErrUnexpectedResponseCode
 	return errors.As(err, &code) && code.Actual == 404
+}
+
+// wantsRule reports whether an existing rule is one of the wanted ones.
+func wantsRule(want []rules.CreateOpts, have rules.SecGroupRule) bool {
+	for _, w := range want {
+		if hasRule([]rules.SecGroupRule{have}, w) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasRule(have []rules.SecGroupRule, want rules.CreateOpts) bool {
