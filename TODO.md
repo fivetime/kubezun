@@ -743,6 +743,45 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       空名字），现在只在**确实读到了名字**时才拒绝。架构无法核实：Zun 的 hosts API 是
       admin-only，而我们持租户凭据——拼写错能挡，"拼对了但没这硬件"归开通管
 
+## 存储（2026-08-11，emptyDir + PVC RWO/RWX 全部端到端实测）
+
+- [x] **emptyDir（Zun `84dd67d4` + kubezun `b7639ad`）**：新卷种 `emptydir`,容器间共享、
+      随 capsule 删除;`medium: Memory` → 宿主机 tmpfs(内核强制 sizeLimit,实测 64Mi
+      在 guest 里正好 65536KB);目录 0777(同 kubelet——capsule 不知道镜像用什么 uid)。
+      ⚠️ 放行清单散在四处,少一处一个错法:schema、`utils.capsule_get_volume_spec`、
+      stevedore entry point、`[volume] driver_list`
+- [x] **PVC 由 kubezun 自己 provision(§14.8 落定,`c21b50b`)**:不部署 CSI——集群级
+      CSI 控制器要持全租户云凭据,正是本平台要避免的;kubezun 已持租户 appcred、已在跑
+      同形状的 reconciler。accessModes 决定后端:RWO→Cinder,**RWX→只有 Manila**
+      (multiattach 共享的是块设备不是文件系统,两个写者静默损坏 ext4,`KindFor` 直接拒)。
+      PV 用 CSI 形状承载(driver 名 `cinder.knaas.io`/`manila.knaas.io`),将来真 CSI 接手
+      不用改数据。建了存储但写 PV 失败 → 删存储(唯一会漏成账单的方向)
+- [x] **RWO 端到端(Cinder/ceph)**:PVC→卷→Bound→pod 挂载写入→删 pod 重建→数据在。
+      ⚠️ **fsGroup 是两半**,缺任何一半症状一样(挂上了、属主对、每次写都 Permission
+      denied):fork 挂载后 chown :fsGroup + setgid(`93ba565b`),**且** fsGroup 必须进
+      CRI 的 supplemental_groups——进程不在那个组里,属主改了也没用。
+      ⚠️ 计算节点要 ceph-common + /etc/ceph 配置(`which rbd` 失败即此);已装 04/05/06
+- [x] **RWX 端到端(Manila NFS,fork `684580a3`)**:PVC RWX→share→两 pod 同挂,
+      reader 实时读到 writer 写入。**节点自授权模型**:attach 时节点用**租户请求上下文**
+      给自己的 /32 授权(永不授权子网),detach 时最后一个挂载走了才 revoke;
+      Manila 用 keystone session 直发 4 个 REST,不装 manilaclient。
+      ⚠️ 两节点同时 grant 是常态不是边角(RWX 本来就是多处同挂),Manila 一次只应用一条
+      规则、期间拒 400——必须重试,否则 pod 输在竞态上
+- [ ] **RWX 安全边界(生产化门槛)**:信任单元是节点不是 capsule——所有租户的 share
+      最终授权给同一批节点 IP,租户间隔离靠 Kata(宿主挂载路径)+ OVN port security
+      (capsule 伪造不了节点 IP,实测 port_security_enabled=True)。**真实暴露面**:
+      ①共节点 hostNetwork pod 持节点身份可挂任何租户 share(container1/2 生产形态!);
+      ②存储网必须从租户网**不可路由**(运维手抖授权个子网墙就没了)。
+      纯 KNaaS 节点(04/05/06)可接受;**共节点形态等有凭据的后端**(CephFS+cephx 每
+      share 一把钥匙)或 guest 内挂载(§8.2 P3:挂载动作进 Kata VM,客户端身份=capsule
+      OVN port IP,授权单元与租户边界重合;代价:存储网对租户网可路由的拓扑反转 +
+      guest 内核 NFS client + Zun→Kata direct-volume 通道)
+- [ ] 跨节点 RWX 未被调度触发(两 pod 落同节点,授权集=1 个 /32);机制是按节点的,
+      多节点时各自加一条,下次多 pod 实验顺带验
+- [ ] 开通清单新增:`KUBEZUN_VOLUME_TYPE`(必须映射到在跑的后端——默认类型指向没跑的
+      lvmdriver-1 时卷直接 error)、`KUBEZUN_SHARE_TYPE`、计算节点 ceph-common+配置、
+      nfs-common、RBAC pvc(读)/pv(写删)
+
 ## 阶段 4：生产化（§12）
 
 - [x] Zun capsule 容器名 minLength=2，K8s 允许单字符容器名 → 租户写 `name: c` 得到一个
