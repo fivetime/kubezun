@@ -656,6 +656,136 @@ wget http://samels/ 与 http://samels.111111-default.svc.cluster.local/ 均成�
 ⚠️ 环境中的 Designate 与 BIND 可以停用，但**先留着**——若将来有对外权威 DNS 需求
 （把租户服务发布到公网域名）仍会用到，那是另一件事。
 
+### 7.7 NetworkPolicy（2026-08-11 定案）
+
+**今天的状态是最坏的一种：apiserver 收下、存起来、`kubectl get netpol` 看得见，
+没有任何东西执行它。**全仓库零处处理 NetworkPolicy 或安全组，而租户的 N 个命名空间
+落进**同一个 project、同一张 OVN 网、同一组安全组**——租户建第二个命名空间最常见的
+动机恰恰是隔离（prod/staging）。**虚假隔离比没有隔离危险：没有隔离时人会自己小心。**
+
+#### 7.7.1 映射：谁承载什么
+
+OVN schema 里 ACL 只能挂在两处（`ovn-nb.ovsschema`：`Logical_Switch.acls`、
+`Port_Group.acls`），**`Address_Set` 没有 `acls` 列**。所以两者不可互换：
+**Address_Set 是"被匹配的东西"，Port_Group 是"规则的挂载点"。**
+
+| NetworkPolicy 的部分 | 落到 | 经 Neutron 的什么 |
+|---|---|---|
+| subject（这条策略管哪些 pod） | **Port_Group 成员** | 端口的 `security_groups` 列表 |
+| peer（from/to 的 selector） | **Address_Set** | `remote_address_group_id` → 地址组 |
+| 端口/协议/方向 | ACL 匹配 | 安全组规则字段 |
+| namespace | **不落任何底层对象** | 只活在我们的地址组命名键里 |
+
+⚠️ **peer 必须用 `remote_address_group_id`，不能用 `remote_group_id`。**后者解析成
+那个安全组**自己的 port-group 地址集**（Neutron `common/ovn/acl.py:226-233`），等于
+把 peer 变动压到 Port_Group 那条轴上——而那条轴在 ovn-controller 里**没有增量路径**
+（见 7.7.3）。
+
+⚠️ **allow-all 必须是两个安全组，不是一个。**Neutron 的安全组**没有方向**（方向在
+规则上，`acl.py:59-68`），而 NetworkPolicy 的隔离是**按方向**翻转的。一个合并的
+allow-all 组在 `policyTypes: [Ingress]` 时被摘掉，会**连出向一起杀掉**。两个组各自
+按方向引用计数。
+
+Neutron 的基线本来就是拒绝：开了 port_security 的端口一律加入全云的
+`neutron_pg_drop`（`ovn_client.py:678-682`），drop 在 1001、allow 在 1002。所以
+"未被任何策略选中的 pod 保持全开"要靠**主动挂上那两个 allow-all 组**来表达，
+不是靠什么都不做。空的安全组列表是被尊重的（默认组只在该属性**未设置**时注入，
+`securitygroups_db.py:1238-1250`）。
+
+#### 7.7.2 对象模型（每租户）
+
+| 对象 | 数量 | 随什么增长 |
+|---|---|---|
+| `knp-allow-ingress` / `knp-allow-egress` | 2 个安全组、约 4 条规则 | **不增长** |
+| 规则集安全组 | 每种**不同规则集**一个 | 不同规则集数（**不是** pod 数，**不是**策略数） |
+| 地址组 | 每个 (namespace, peer-selector) 一个 | 不同 peer selector 数 |
+| Neutron port | 每 capsule 一个 | pod 数（**今天已经在付**） |
+
+**安全组承载规则集，端口的安全组列表承载"哪些 pod 适用这套规则"。**这是
+ovn-kubernetes 的镜像——他们把 subject 放 port group、peer 放 address set；我们把
+subject 放**安全组成员（端口属性）**、peer 放地址组。两者都做到"每个被选中的 pod
+O(1) 条规则"。
+
+⚠️ **配额不是约束。**devstack 出厂的 `secgroups=10 / rules=100` 是运维要调的默认值，
+按 K8s pod 规模部署时放开几个数量级。**要论证的是增长率，不是绝对上限。**
+（开通清单需新增：按租户规模调 `secgroup_rules` 配额。）
+
+#### 7.7.3 代价模型：**哪个组件付钱**
+
+这是整节最重要的表，所有设计取舍都从它推出来。
+
+| 事件 | 落在哪条轴 | 增量处理 | 是不是新增开销 |
+|---|---|---|---|
+| pod 增删 | Port_Group 成员 + 地址组 delta | port group **无**；地址组**有** | port group 那笔**今天已在付**（端口必然加入某个组）；地址组是新增但便宜 |
+| **pod 标签变动**导致换规则集 | Port_Group 成员 | **无**（`ovn-controller.c:4416-4470` 三种情况全走重新解析） | **新增，设计上要避开** |
+| 策略增删**规则** | ACL 规则 | —— | 新增，northd 不全量重算 |
+| **建/删安全组对象** | **全云 northd 全量重算** | —— | **最贵，要控制频率** |
+
+- **northd 从不展开集合**：`northd/northd.c:7737` 把 NB 的 match 字符串原样抄进 SB
+  逻辑流，`$addrset` / `@portgroup` 保持符号形式。**逻辑流条数与集合大小无关。**
+- **但安全组对象增删会引发全云重算**：`northd/en-sync-sb.c:164-175`，只要有任何
+  Port_Group 新增或删除就返回 `EN_UNHANDLED`，触发 `:503-528` 遍历**云里每一个**
+  port group 重建地址集——**连 nova 和 Octavia 的一起**。规则增删不触发。
+- **ovn-controller 两条轴不对称**：地址集成员变动有专门的 delta 路径
+  （`ovn-controller.c:4380-4399`），Port_Group 成员变动**没有**（`:4416-4470`）。
+- ⚠️ **SB 的 Address_Set 和 Port_Group 没有任何监视条件**（受控表清单
+  `ovn-controller.c:422-439` 里没有它们）——**每台 chassis 都收全云所有租户的**
+  地址集和端口组，包括一个 capsule 都没有的纯 nova 计算节点。**没有per-租户爆炸半径。**
+
+**推论（设计约束）**：
+1. **不要每策略/每命名空间建一个安全组** —— 那是全云 northd 那条轴。
+2. **不要让 pod 标签变动频繁改写端口的安全组列表** —— 那是无增量路径那条轴。
+3. **把 peer churn 全部赶进地址组** —— 唯一两端（Neutron driver 与 ovn-controller）
+   都做增量的轴。
+
+#### 7.7.4 明确拒绝的（不做近似实现）
+
+近似的隔离和虚假的隔离是一回事，而那正是本节要修的东西。
+
+| 拒绝 | 为什么不是"还没做" |
+|---|---|
+| **ANP / BANP** | 语义就是分层的 Pass/Deny。Neutron **没有 tier**（OVN driver 里零处 `tier`），只有两个固定优先级 `ALLOW=1002 / DROP=1001`（`common/ovn/constants.py:114-115`），安全组规则也**没有 deny 动作**（`acl.py:178-190`）。**没有地方能落。** |
+| **`ipBlock.except`** | Neutron 匹配语法只生成 `==`（`acl.py:86-91`），无取反。可展开成补集，但每个 except 每个协议族最多约 32 条规则。**绝不能静默丢掉 except——那把"收窄"变成"放宽"，是 fail-open 方向。** |
+| **命名端口（首版）** | 解析是**每 pod** 的，而规则属于组不属于目标。⚠️ **不要抄 ovn-kubernetes**：`gress_policy.go:118-122` 只读 `IntVal`，字符串端口得 0，随后 `getL4Match` 返回**裸 `tcp`**——一条本该只放行某端口的规则变成放行整个协议。**它在端口处理上不是正确性参照。** |
+
+⚠️ **拒绝落在哪里：kubezun 不在准入路径上，它自己拒绝不了任何东西**，NetworkPolicy
+也没有 status 字段可写。明确拒绝只能由 **Kyverno/VAP 或 kubezoo 网关**做（阶段 2 协作项）。
+kubezun 单独能做的最强动作是**在 NetworkPolicy 对象上发 Warning Event**，
+`kubectl describe netpol` 看得见。
+
+#### 7.7.5 Zun fork 侧需要的一刀（小）
+
+驱动侧**已经**在读 `capsule.security_groups` 并传给 port（`cri/driver.py:323-330`），
+而 `network/neutron.py:110-113` 的**创建分支**本来就会把 `security_groups` 写进 port。
+**唯一缺的是 capsule API 不收这个字段**（`schemas/capsules.py` 零处提及）——补上
+约十几行，端口就在**创建时**带着安全组，**没有 fail-open 窗口**。
+
+⚠️ 否决了"kubezun 自建 port 再把 UUID 交给 Zun"（`nets: [{port: uuid}]` 这条路
+技术上可行）：它要改 §7 的"Zun 原生 port"定案，还要我们接管 port 的生命周期
+（`preserve_on_delete=True` 后 Zun 不再删它）——**为了省一个我们本来就在维护的
+fork，买进一个定案变更和一份新的生命周期责任。**
+
+#### 7.7.6 分两步交付
+
+**增量 0（先做，零底层对象）**：准入 webhook 拒掉表达不了的东西（ANP/BANP、
+`except`、命名端口）。**它把今天的静默 fail-open 变成明确拒绝，一个 OVN 对象都不造**，
+不依赖任何未测量的规模性质，可独立发布。
+
+**增量 1**：隔离翻转 + 每租户两个常量 allow-all 安全组 + 地址组承载 peer，
+限定在可表达子集（数字端口、podSelector/namespaceSelector 由我们算成**一个**地址组、
+普通 `ipBlock` CIDR）。
+
+#### 7.7.7 ⚠️ 没有人给过数字
+
+**OVN 自己不压测我们要造的那类对象**：`tests/perf-northd.at:197-215` 的 200HV×200port
+规模测试建的全是逻辑交换机/路由器/端口，**零 ACL、零 Port_Group、零 Address_Set**；
+`ovn-architecture.7.xml:2361` 只说"单个 OVN 控制面总有上限"。流传的 1M ACL / 500 节点
+之类都来自提交信息描述的外部 ovn-heater 跑分，**不在任何可复现的代码里**。
+
+**增量 2 之前必须自己压两个数**（实验床 `ovn-appctl stopwatch/show` 即可读）：
+① northd 在**建删安全组**时的重算耗时；② 计算节点 ovn-controller 在**改端口安全组
+列表**时的 `lflow_run` 耗时。**这两个数决定这套设计能不能撑过第一批租户。**
+
 ---
 
 ## 8. 存储与配置
@@ -728,6 +858,7 @@ capsule + CRI + zun-cni（正是以下各刀要动的地方）。
 |---|---|---|
 | **门槛** | ExecSync + liveness 重启 | §6；stub 现成（api_pb2_grpc.py:100-103），在 zun-compute 落实执行 + restart 语义 |
 | **门槛** | logs | CRI 驱动补 log_directory/log_path（cri/driver.py:89-94,181-192 现在不落日志文件）+ 新增 GET /capsules/{id}/logs（capsules.py:111-113 _custom_actions 为空）。capsule 容器 TYPE_CAPSULE_CONTAINER 无法借道 Container API（db/sqlalchemy/api.py:150-152） |
+| P1 | capsule 模板收 `securityGroups` | §7.7.5；驱动已在读 `capsule.security_groups`（`cri/driver.py:323-330`）、`neutron.py:110-113` 创建分支已会写进 port，**只差 API schema 不收**（`schemas/capsules.py` 零处）。补上即可让端口在创建时就带安全组，无 fail-open 窗口 |
 | P2 | Barbican secret ref 注入 | §8.1；与上面两刀同动 cri/driver.py sandbox 路径 |
 | P3 | Manila/RWX（virtiofs） | §8.2 |
 | ✅ 已做 | 架构上报 + capsule 架构约束 | §3.6；`driver.py` 上报 architecture/trait，capsule 模板加 `architecture` → `trait:COMPUTE_ARCH_*=required` |
@@ -785,6 +916,11 @@ kubetron DNS 分发通道改造、M8 编排层独立部署形态。
 | 剧场节点（视图层伪造 Node，pod 实跑 B1 池） | DS 立刻穿帮（DS controller 按上游真实 Node 扇出）；节点级调度语义全假；kubezoo 翻译面深度膨胀。仅可作过渡期产品单独评估，不通向 DS |
 | B1.5 影子 pod 路线（VK 后端=K8s worker） | 双倍 etcd 对象 + 镜像状态机，买到的只是"B1 算力换节点皮"，算力经济学与 B1 相同；投入不如砸向有真差异的 Zun 线（2026-08-06 定案） |
 | kubetron NetworkPortClaim 对接 capsule | 时序问题在 Zun 内联路径不存在；强套造 host_id 双主冲突（§7） |
+| NetworkPolicy 的 peer 用 `remote_group_id` | 它解析成安全组**自己的** port-group 地址集（Neutron `acl.py:226-233`），把 peer churn 压到 ovn-controller **没有增量路径**的那条轴上（`ovn-controller.c:4416-4470`）。用 `remote_address_group_id`（§7.7.1） |
+| 每策略／每命名空间建一个安全组 | 安全组**对象**增删触发**全云** northd 全量重算（`en-sync-sb.c:164-175`→`:503-528`，连 nova 和 Octavia 的 port group 一起重建）。安全组随**不同规则集**增长，不随策略数（§7.7.3） |
+| kubezun 自建 port 再交 UUID 给 Zun（为挂安全组） | 技术可行（`nets: [{port: uuid}]`），但要改 §7"Zun 原生 port"定案 + 接管 port 生命周期，只为省一个我们本来就在维护的 fork 里十几行（§7.7.5） |
+| 直接写 OVN NB / 依赖 northd 调优旋钮 | 我们只经 Neutron API 到 OVN。SB relay、`--n-threads`、`ovn-monitor-all` 都不归我们，属于 OpenStack 控制面运维（§7.7.3） |
+| 静默近似 `ipBlock.except` / 命名端口 | 丢掉 `except` 把"收窄"变成"放宽"；命名端口解析不了就退化成裸协议——**都是 fail-open 方向**，正是本项要修的病（§7.7.4） |
 | Barbican 作为 ConfigMap/Secret 主存储 | 双真相源；破坏 K8s 体验；重建引用/权限语义（§8.1） |
 | provider 远程探测 OVN IP（探针方案 B） | 要求管理面进程挂进重叠 CIDR 租户网，违反 kubetron 双挂纪律（§6） |
 | 单进程多租户 VK | 全集群 secret 缓存集中 + 凭据集中 + panic 全租户爆炸半径（§2）。凭据外置+informer 白名单+per-node 身份三件事完成后可作为成本优化重评 |
