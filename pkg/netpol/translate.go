@@ -143,9 +143,12 @@ func translateRule(ns string, dir Direction, index int, peers []networkingv1.Net
 	rule := &Rule{Direction: dir}
 	var refused []Refusal
 
-	// No peers means every source, which is a CIDR this can say.
+	// No peers means every source. ⚠️ Both families: a rule saying "from
+	// anywhere" that only names 0.0.0.0/0 allows anywhere reachable over IPv4
+	// and nothing over IPv6, which is narrower than what was written and
+	// invisible on a tenant that has not turned IPv6 on yet.
 	if len(peers) == 0 {
-		rule.Peers = []Peer{{CIDR: "0.0.0.0/0"}}
+		rule.Peers = []Peer{{CIDR: "0.0.0.0/0"}, {CIDR: "::/0"}}
 	}
 	for i, peer := range peers {
 		at := fmt.Sprintf("%s.%s[%d]", where, peerField(dir), i)

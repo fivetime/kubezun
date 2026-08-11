@@ -786,6 +786,21 @@ fork，买进一个定案变更和一份新的生命周期责任。**
 - ⚠️ **v4 前缀不能做 v6 规则的 remote**(反之亦然),Neutron 直接拒;**而在写一组
   规则的中途被拒,会让 pod 停在"半条策略"上**。展开时按族过滤。
 
+#### 7.7.4b 经过 Service 的流量,源地址保留(2026-08-11 实测)
+
+`podSelector` 类的规则匹配**源 IP**,所以有一个必须验的问题:client → ClusterIP →
+server 这条路上 Octavia 做了 DNAT,**server 看到的还是不是客户端 pod 的地址?**
+若它同时 SNAT,一条"只允许 role=client"的策略会把**经过 Service 的合法流量全挡掉**,
+而这是最常见的真实路径。
+
+**实测:保留。**同一条策略下,直连和走 VIP 行为完全一致(client 通、stranger 挡)。
+OVN provider 的 LB 只做 DNAT,不改源地址。
+
+⚠️ **测的时候先撞上另一件事**:Service 的 LB 建出来了却**没有 pool 也没有 member**,
+原因是 RBAC 只给了 `services/status` 的写权限,而 LB id 和 VIP 地址是记在
+**Service 的注解**上的(注解在主资源上)。**照原清单部署,任何新建 Service 都对账不完**。
+已在 `deploy/tenant-vk.yaml` 补 `services` 的 `update`/`patch`。
+
 #### 7.7.5a ⚠️ 迁移必须整租户一次切,不能逐个 pod（2026-08-11 实测）
 
 **今天租户的东西向连通性,靠的是"所有 pod 在同一个 `default` 安全组里"。**

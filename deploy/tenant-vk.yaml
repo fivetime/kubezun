@@ -87,7 +87,12 @@ rules:
     verbs: ["get"]
   - apiGroups: [""]
     resources: ["services"]
-    verbs: ["get", "list", "watch"]
+    # ⚠️ update, not only status. The load balancer's id and the address it
+    # answers on are recorded as annotations, which live on the object itself
+    # -- so a role granting only services/status leaves every Service stuck
+    # with a load balancer built and no pool, no members, and no address the
+    # tenant can reach.
+    verbs: ["get", "list", "watch", "update", "patch"]
   # Ingresses are read to build L7 load balancers, annotated with the load
   # balancer id, and given their address in status — the same contract
   # Services get at L4.

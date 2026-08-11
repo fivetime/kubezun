@@ -149,8 +149,18 @@ func TestEmptyPeerListMeansEverywhere(t *testing.T) {
 		Ingress:     []networkingv1.NetworkPolicyIngressRule{{}},
 	})
 	got, _ := Translate(p)
-	if len(got.Rules) != 1 || got.Rules[0].Peers[0].CIDR != "0.0.0.0/0" {
+	if len(got.Rules) != 1 {
 		t.Fatalf("an empty peer list should allow everywhere: %+v", got.Rules)
+	}
+	// ⚠️ Both families. Naming only 0.0.0.0/0 allows everywhere over IPv4 and
+	// nowhere over IPv6 -- narrower than written, and invisible until someone
+	// turns IPv6 on.
+	var families []string
+	for _, peer := range got.Rules[0].Peers {
+		families = append(families, peer.CIDR)
+	}
+	if len(families) != 2 || families[0] != "0.0.0.0/0" || families[1] != "::/0" {
+		t.Errorf("everywhere covered only %v", families)
 	}
 }
 
