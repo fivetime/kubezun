@@ -857,10 +857,28 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       停 Pending。⚠️ **纠错**:kubezoo 对 storageClassName **原样透传**(用户 grep 坐实,
       无任何前缀逻辑)——我此前从 IngressClass 的前缀行为错误外推;PVC 里的 `111111-`
       是当初测试时字面写进去的,不是网关加的。带前缀查找保留为容错,不再是依据
-- [ ] **AZ 拓扑 / WaitForFirstConsumer 未验**(Zun 场景特有):卷要开在 capsule 落的 AZ。
-      现在 SC 全 Immediate + `KUBEZUN_STORAGE_AZ` 静态配;WFFC 需要 provisioner 从
-      `volume.kubernetes.io/selected-node` 注解读虚拟节点拓扑,虚拟节点的 zone 标签
-      是我们自己写的——能不能被调度器/绑定链路正确消费要实测
+- [x] **AZ 拓扑 / WaitForFirstConsumer(2026-08-11,`21fc675`)**:卷不再在 PVC 创建时
+      就开——**那时还没有任何东西决定 pod 去哪**,zone 只能从配置里猜。一个 AZ 时永远
+      猜对;两个 AZ 时猜错**不可逆**:卷不能换 AZ,PVC 一直 Bound、pod 一直 Pending,
+      两个对象都不说为什么。
+      ⚠️ **WFFC 不是 CSI 的东西**(已查证):调度器的 volume binding 插件按
+      StorageClass 的 `volumeBindingMode` 给**任何**认领该类的供给者打
+      `volume.kubernetes.io/selected-node`(`binder.go:450`),CSI 只在"发布容量"
+      那一处出现(`:984`,注释明写"要么不是 CSI driver")。**实测:调度器确实给我们
+      这个非 CSI 供给者打了注解。**
+      ⚠️ **它给的是虚拟节点,而 capsule 落哪台机器由 Zun 定**——这恰好够用:卷属于
+      AZ 不属于主机,K8s 看不见的那一半正是对卷不重要的那一半。
+      ⚠️ **两个 zone 名不是一个名字**:节点对 K8s 报 `az1`、向 OpenStack 要 `nova`;
+      把前者交给 Cinder 等于要一个不存在的 AZ。这对名字**只在设置它们的启动参数里
+      同时出现**,映射就从那里读。
+      PV 还写了 zone 亲和——否则位置只决定一次就忘了,pod 删了重建可能被调到别的 zone,
+      而卷跟不过去。
+      ⚠️ **实测证明了决策,没证明映射**:实验床只有一个 Cinder AZ,"从节点解析出 nova"
+      和"留空让 Cinder 自己选"产生同一个卷。单元测试区分了两者;日志行记录的是
+      **问 Cinder 之前**我们决定的值。
+      ⚠️ **`volumeBindingMode` 不可变**:`apply` 覆盖会失败,类必须删了重建
+      (已 Bound 的 PVC/PV 不受影响——绑定不再读类;但当时正 Pending 的 claim 会失去
+      它在等的类,所以要挑没有等待者的时候做)
 - [ ] 开通清单新增:`KUBEZUN_VOLUME_TYPE`(必须映射到在跑的后端——默认类型指向没跑的
       lvmdriver-1 时卷直接 error)、`KUBEZUN_SHARE_TYPE`、计算节点 ceph-common+配置、
       nfs-common、RBAC pvc(读)/pv(写删)
