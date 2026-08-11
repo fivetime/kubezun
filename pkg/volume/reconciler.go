@@ -32,6 +32,12 @@ const (
 )
 
 // Reconciler turns a tenant's claims into OpenStack storage and back.
+// selectedNodeAnnotation is what the scheduler writes on a claim once it has
+// placed the first pod that uses it. Not a CSI mechanism: the scheduler's
+// volume binding plugin sets it for whatever provisioner owns the class, and
+// only consults CSI to ask about published capacity.
+const selectedNodeAnnotation = "volume.kubernetes.io/selected-node"
+
 type Reconciler struct {
 	Backend *Backend
 
@@ -39,6 +45,10 @@ type Reconciler struct {
 	Volumes corev1listers.PersistentVolumeLister
 	Classes storagev1listers.StorageClassLister
 	Client  corev1client.CoreV1Interface
+
+	// PlacementOf says where a virtual node puts what it runs. Nil, or a node
+	// it does not recognise, leaves the deployment default in force.
+	PlacementOf func(nodeName string) (Placement, bool)
 
 	// Tenant prefixes names on the OpenStack side, so one project holding
 	// several tenants' storage can still be read by a human.
@@ -158,6 +168,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, namespace, name string) erro
 		return fmt.Errorf("claim %s/%s: %w", namespace, name, err)
 	}
 
+	// A class that waits for its first consumer means exactly this: do not
+	// decide yet. The scheduler places the pod, records which node it chose on
+	// the claim, and only then is the zone the storage must live in known.
+	//
+	// ⚠️ What the scheduler chooses is a virtual node, and Zun chooses which
+	// machine inside that node's availability zone actually runs the capsule.
+	// That is the right granularity anyway: a volume belongs to a zone, not to
+	// a machine, so the half Kubernetes cannot see is the half that does not
+	// matter here.
+	if r.waitingForConsumer(claim) {
+		log.G(ctx).WithField("claim", namespace+"/"+name).
+			Debug("waiting for a pod to be scheduled before placing this storage")
+		return nil
+	}
+
 	// An existing volume for this claim means a previous attempt got as far as
 	// creating one. Binding that rather than making another is what keeps a
 	// retry from leaving storage nobody will ever mount and everybody pays for.
@@ -179,12 +204,62 @@ func (r *Reconciler) Reconcile(ctx context.Context, namespace, name string) erro
 	return nil
 }
 
+// Placement is where a virtual node puts what it runs: the zone it advertises
+// to Kubernetes and the availability zone its capsules are created in.
+//
+// ⚠️ Two names for one place, and they are not the same name. A node can
+// advertise topology.kubernetes.io/zone=az1 while its capsules go to the
+// OpenStack zone "nova"; handing the Kubernetes name to Cinder asks for a zone
+// that does not exist.
+type Placement struct {
+	Zone string
+	AZ   string
+}
+
+// waitingForConsumer reports whether this claim's class defers placement and
+// the scheduler has not placed a pod yet.
+func (r *Reconciler) waitingForConsumer(claim *corev1.PersistentVolumeClaim) bool {
+	class := r.classOf(claim)
+	if class == nil || class.VolumeBindingMode == nil ||
+		*class.VolumeBindingMode != storagev1.VolumeBindingWaitForFirstConsumer {
+		return false
+	}
+	return claim.Annotations[selectedNodeAnnotation] == ""
+}
+
+// placementFor is where this claim's storage should be created.
+//
+// The deployment-wide setting wins when it is set: an operator naming one
+// storage zone is saying the storage does not follow the compute, which is
+// true wherever a single storage zone serves every compute zone.
+func (r *Reconciler) placementFor(claim *corev1.PersistentVolumeClaim) Placement {
+	if r.Backend != nil && r.Backend.AvailabilityZone != "" {
+		return Placement{AZ: r.Backend.AvailabilityZone}
+	}
+	node := claim.Annotations[selectedNodeAnnotation]
+	if node == "" || r.PlacementOf == nil {
+		return Placement{}
+	}
+	if p, ok := r.PlacementOf(node); ok {
+		return p
+	}
+	return Placement{}
+}
+
 func (r *Reconciler) provision(ctx context.Context, claim *corev1.PersistentVolumeClaim, kind Kind, storageType string) (*corev1.PersistentVolume, error) {
 	request := claim.Spec.Resources.Requests[corev1.ResourceStorage]
 	gib := int((request.Value() + (1 << 30) - 1) / (1 << 30))
 
+	where := r.placementFor(claim)
+	// Where a volume was put, and on whose account. With one zone configured
+	// this reads as noise; with two it is the only record of a decision that
+	// cannot be revisited, because a volume does not move between zones.
+	log.G(ctx).WithField("claim", claim.Namespace+"/"+claim.Name).
+		WithField("selected-node", claim.Annotations[selectedNodeAnnotation]).
+		WithField("zone", where.Zone).WithField("availability-zone", where.AZ).
+		Info("placing storage")
 	made, err := r.Backend.Create(ctx, r.storageName(claim.Namespace, claim.Name), kind, gib,
-		fmt.Sprintf("kubezun claim %s/%s", claim.Namespace, claim.Name), storageType)
+		fmt.Sprintf("kubezun claim %s/%s", claim.Namespace, claim.Name), storageType, where.AZ)
 	if err != nil {
 		return nil, err
 	}
@@ -237,6 +312,23 @@ func (r *Reconciler) provision(ctx context.Context, claim *corev1.PersistentVolu
 				},
 			},
 		},
+	}
+	if where.Zone != "" {
+		// ⚠️ Without this the volume is placed once and then forgotten: a pod
+		// deleted and recreated can be scheduled into another zone, and a
+		// volume cannot follow it. The claim stays Bound and the pod stays
+		// Pending, with nothing in either object saying why.
+		pv.Spec.NodeAffinity = &corev1.VolumeNodeAffinity{
+			Required: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key:      corev1.LabelTopologyZone,
+						Operator: corev1.NodeSelectorOpIn,
+						Values:   []string{where.Zone},
+					}},
+				}},
+			},
+		}
 	}
 	if policy := claim.Annotations["knaas.io/reclaim-policy"]; policy == "Retain" {
 		pv.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimRetain

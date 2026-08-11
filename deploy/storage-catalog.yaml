@@ -26,6 +26,20 @@
 #   - a bound claim never re-reads its class, so editing a class here changes
 #     future claims only.
 #
+# volumeBindingMode: WaitForFirstConsumer holds the placement decision until a
+# pod using the claim is scheduled, so the storage is created in the zone the
+# workload actually landed in. With Immediate it is created when the claim is,
+# before anything has decided where the pod goes -- the zone is then a guess
+# from configuration, and a wrong guess cannot be corrected: a volume does not
+# move, so the claim stays Bound and the pod stays Pending forever.
+# ⚠️ With one zone the guess is always right, which is why this costs nothing
+# to set now and cannot be retrofitted onto claims made before it.
+# ⚠️ volumeBindingMode is immutable: `kubectl apply` over an existing class
+# fails, and the class has to be deleted and recreated. Bound claims and their
+# volumes are unaffected -- binding does not re-read the class -- but a claim
+# that is Pending at that moment loses the class it was waiting for, so do this
+# when nothing is waiting.
+#
 # ---- lab (devstack on incus-node-01) ----
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -37,6 +51,7 @@ provisioner: cinder.knaas.io
 parameters:
   type: ceph
 allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
 ---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -48,6 +63,7 @@ provisioner: cinder.knaas.io
 parameters:
   type: ceph-nvme-test
 allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
 ---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -58,6 +74,7 @@ metadata:
 provisioner: manila.knaas.io
 parameters:
   share_type: incus-nfs
+volumeBindingMode: WaitForFirstConsumer
 # ---- production (control1) ----
 # One class per public Cinder volume type, same names the types carry:
 #   nvme-rep3, nvme-ec42, ssd-rep3, ssd-ec42, hdd-rep3, hdd-ec42, hybrid-rep3

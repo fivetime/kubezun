@@ -55,7 +55,11 @@ type Backend struct {
 	ShareProto string
 	// VolumeType is the Cinder volume type; empty lets Cinder choose.
 	VolumeType string
-	// AvailabilityZone places the storage where the capsules are.
+	// AvailabilityZone places all of this deployment's storage in one zone,
+	// whatever the capsules do. Empty lets each claim be placed where the node
+	// that will consume it runs -- which is the only correct answer once
+	// there is more than one zone, and indistinguishable from this one while
+	// there is only one.
 	AvailabilityZone string
 }
 
@@ -77,7 +81,10 @@ type Provisioned struct {
 // Cinder volume type or the Manila share type, which is the whole reason the
 // catalog exists: the tier is the tenant's choice, priced accordingly, not a
 // deployment constant hidden behind an opaque class name.
-func (b *Backend) Create(ctx context.Context, name string, kind Kind, gib int, description, storageType string) (*Provisioned, error) {
+func (b *Backend) Create(ctx context.Context, name string, kind Kind, gib int, description, storageType, az string) (*Provisioned, error) {
+	if az == "" {
+		az = b.AvailabilityZone
+	}
 	if gib < 1 {
 		// Both services count in gibibytes and neither accepts zero. A claim
 		// for less than one gets one rather than an error, which is what
@@ -97,7 +104,7 @@ func (b *Backend) Create(ctx context.Context, name string, kind Kind, gib int, d
 			Name:             name,
 			Size:             gib,
 			VolumeType:       vtype,
-			AvailabilityZone: b.AvailabilityZone,
+			AvailabilityZone: az,
 			Description:      description,
 		}, nil).Extract()
 		if err != nil {
@@ -122,7 +129,7 @@ func (b *Backend) Create(ctx context.Context, name string, kind Kind, gib int, d
 			Size:             gib,
 			ShareProto:       proto,
 			ShareType:        stype,
-			AvailabilityZone: b.AvailabilityZone,
+			AvailabilityZone: az,
 			Description:      description,
 		}).Extract()
 		if err != nil {

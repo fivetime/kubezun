@@ -296,6 +296,7 @@ func run(o options) error {
 			Volumes:         set.VolumeInformer().Lister(),
 			Classes:         set.ClassInformer().Lister(),
 			Client:          client.CoreV1(),
+			PlacementOf:     placementOf(specs),
 			Tenant:          o.tenant,
 			ServesNamespace: set.Serves,
 		}
@@ -570,6 +571,24 @@ func withClientCA(path string) nodeutil.WebhookAuthOption {
 		}
 		cfg.AuthnConfig.ClientCertificateCAContentProvider = ca
 		return nil
+	}
+}
+
+// placementOf answers where a node this process runs puts its capsules.
+//
+// Read from the node specifications rather than from the node object's labels:
+// the two names for a zone -- the one Kubernetes is told and the one OpenStack
+// is asked for -- only appear together here, in the flags that set both. A
+// claim scheduled onto a node we do not run gets no answer, and falls back to
+// whatever the deployment configured.
+func placementOf(specs []nodeSpec) func(string) (kvolume.Placement, bool) {
+	where := make(map[string]kvolume.Placement, len(specs))
+	for _, spec := range specs {
+		where[spec.name] = kvolume.Placement{Zone: spec.zone, AZ: spec.zunAZ}
+	}
+	return func(node string) (kvolume.Placement, bool) {
+		p, ok := where[node]
+		return p, ok
 	}
 }
 
