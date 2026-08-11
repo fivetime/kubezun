@@ -542,8 +542,10 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       ⚠️ **默认关闭**(`--enforce-network-policy`),且开启前必须先跑两阶段转换——
       逐个 pod 切会断流(§7.7.5a)。
       ⚠️ **RBAC 需新增 `networkpolicies` 只读**(本次实测才发现清单里没有)。
-      **仍未做**:`ipBlock.except`/命名端口/ANP 的**准入拒绝**(kubezun 不在准入路径上,
-      只能发 Event,拒绝要 Kyverno 或 kubezoo 网关,§7.7.4);规则集组的 GC。
+      **GC 已做**(`cd25996`,半小时一轮、按策略身份识别、一趟收敛)。
+      **仍未做**:`ipBlock.except`/命名端口/ANP 的**准入拒绝**——kubezun 不在准入路径上,
+      NetworkPolicy 也没有 status 可写,只能记日志;真正的拒绝要 Kyverno 或 kubezoo
+      网关(§7.7.4),是跨团队协作项。
 - [ ] **⚠️ arm64 虚拟节点没有硬件却照样上报容量（2026-08-08 发现）**：
       CoreDNS 先被调度到 `111111-node-arm64`，全部 `CapsuleUnschedulable`（Placement 拒绝）。
       这正是"节点上报的 capacity 是承诺不是库存"的实例——虚拟节点按配额镜像容量，

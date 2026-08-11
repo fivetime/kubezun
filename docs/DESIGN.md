@@ -753,18 +753,6 @@ O(1) 条规则"。
 kubezun 单独能做的最强动作是**在 NetworkPolicy 对象上发 Warning Event**，
 `kubectl describe netpol` 看得见。
 
-#### 7.7.5 Zun fork 侧需要的一刀（小）
-
-驱动侧**已经**在读 `capsule.security_groups` 并传给 port（`cri/driver.py:323-330`），
-而 `network/neutron.py:110-113` 的**创建分支**本来就会把 `security_groups` 写进 port。
-**唯一缺的是 capsule API 不收这个字段**（`schemas/capsules.py` 零处提及）——补上
-约十几行，端口就在**创建时**带着安全组，**没有 fail-open 窗口**。
-
-⚠️ 否决了"kubezun 自建 port 再把 UUID 交给 Zun"（`nets: [{port: uuid}]` 这条路
-技术上可行）：它要改 §7 的"Zun 原生 port"定案，还要我们接管 port 的生命周期
-（`preserve_on_delete=True` 后 Zun 不再删它）——**为了省一个我们本来就在维护的
-fork，买进一个定案变更和一份新的生命周期责任。**
-
 #### 7.7.4a 规则集的两条非显然规则（2026-08-11 实现时定）
 
 - **只写被隔离方向的规则。**一条策略隔离 ingress、同时列了 egress 规则,
@@ -801,6 +789,18 @@ OVN provider 的 LB 只做 DNAT,不改源地址。
 **Service 的注解**上的(注解在主资源上)。**照原清单部署,任何新建 Service 都对账不完**。
 已在 `deploy/tenant-vk.yaml` 补 `services` 的 `update`/`patch`。
 
+#### 7.7.5 Zun fork 侧需要的一刀（小，已做：fork `cb5a57da`）
+
+驱动侧**已经**在读 `capsule.security_groups` 并传给 port（`cri/driver.py:323-330`），
+而 `network/neutron.py:110-113` 的**创建分支**本来就会把 `security_groups` 写进 port。
+**唯一缺的是 capsule API 不收这个字段**（`schemas/capsules.py` 零处提及）——补上
+约十几行，端口就在**创建时**带着安全组，**没有 fail-open 窗口**。
+
+⚠️ 否决了"kubezun 自建 port 再把 UUID 交给 Zun"（`nets: [{port: uuid}]` 这条路
+技术上可行）：它要改 §7 的"Zun 原生 port"定案，还要我们接管 port 的生命周期
+（`preserve_on_delete=True` 后 Zun 不再删它）——**为了省一个我们本来就在维护的
+fork，买进一个定案变更和一份新的生命周期责任。**
+
 #### 7.7.5a ⚠️ 迁移必须整租户一次切,不能逐个 pod（2026-08-11 实测）
 
 **今天租户的东西向连通性,靠的是"所有 pod 在同一个 `default` 安全组里"。**
@@ -824,7 +824,32 @@ OVN provider 的 LB 只做 DNAT,不改源地址。
 
 ⚠️ 新建的 capsule 从第 1 步开始就必须带上这两个组,否则它会成为"未切"的一员。
 
-#### 7.7.6 分两步交付
+#### 7.7.5b 开通与运维清单
+
+**RBAC 两项,都是实测才发现清单里没有的:**
+
+- `networkpolicies` **只读**(get/list/watch)。⚠️ 缺了它的症状是**沉默的**:
+  watch 拿到 403 只是一行日志、**不是启动失败**,于是"执行开关开着、一条策略都看不见、
+  什么都不执行",看起来一切正常。
+- `services` 的 **update/patch**(不只是 `services/status`)。LB 的 id 和地址记在
+  **Service 的注解**上,注解在主资源上。⚠️ 缺了它,**任何新建 Service 都对账不完**:
+  LB 建出来,pool 和 member 永远为空,而症状是一条"地址未就绪"的 Warning,
+  **不是权限报错**。
+
+**转换命令**(`deploy/kubezun@.service` 注释里也有一份):
+
+```
+kubezun --convert-network-policy=attach            # 只报告，不写
+kubezun --convert-network-policy=attach --convert-confirm
+kubezun --convert-network-policy=detach --convert-confirm
+# 两阶段全租户跑完，才打开 --enforce-network-policy
+```
+
+只需要 OpenStack 凭据,**不需要 kubeconfig**——手工跑的那件事不该是准备工作最多的。
+
+**开通清单新增**:按租户规模调 `secgroup_rules` 配额(devstack 默认 100 远不够)。
+
+#### 7.7.6 分两步交付（增量 1 已做，增量 0 未做）
 
 **增量 0（先做，零底层对象）**：准入 webhook 拒掉表达不了的东西（ANP/BANP、
 `except`、命名端口）。**它把今天的静默 fail-open 变成明确拒绝，一个 OVN 对象都不造**，
