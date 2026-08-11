@@ -779,15 +779,28 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       Manila 用 keystone session 直发 4 个 REST,不装 manilaclient。
       ⚠️ 两节点同时 grant 是常态不是边角(RWX 本来就是多处同挂),Manila 一次只应用一条
       规则、期间拒 400——必须重试,否则 pod 输在竞态上
-- [ ] **RWX 安全边界(生产化门槛)**:信任单元是节点不是 capsule——所有租户的 share
-      最终授权给同一批节点 IP,租户间隔离靠 Kata(宿主挂载路径)+ OVN port security
-      (capsule 伪造不了节点 IP,实测 port_security_enabled=True)。**真实暴露面**:
-      ①共节点 hostNetwork pod 持节点身份可挂任何租户 share(container1/2 生产形态!);
-      ②存储网必须从租户网**不可路由**(运维手抖授权个子网墙就没了)。
-      纯 KNaaS 节点(04/05/06)可接受;**共节点形态等有凭据的后端**(CephFS+cephx 每
-      share 一把钥匙)或 guest 内挂载(§8.2 P3:挂载动作进 Kata VM,客户端身份=capsule
-      OVN port IP,授权单元与租户边界重合;代价:存储网对租户网可路由的拓扑反转 +
-      guest 内核 NFS client + Zun→Kata direct-volume 通道)
+- [x] **RWX 安全边界:已落成控制(2026-08-11,fork `8e4b33d6`)**——原分析不变,
+      变的是它从**文档变成了代码**。信任单元是节点不是 capsule:share 挂在节点上,
+      文件服务器按客户端地址授权。两条控制,**都默认拒绝**:
+      ① **`[volume] host_dedicated_to_capsules`(默认 false)**:节点不自称"这里没有
+      别的租户负载"就**根本不挂 share**。⚠️ **开通/部署流程必须为纯 KNaaS 节点
+      设置它**,否则 RWX 全线不可用(04/05/06 已设)。
+      ② **授权集宽于单机即拒挂**:我们发的每条授权都是 `/32`、最后一个挂载走了就撤销,
+      那就是宿主挂载 share 的**全部**隔离;一条子网规则就把它换成零,而 capsule
+      看不出区别。非 `ip` 类型规则同样拒绝。
+      **为什么拒绝不是告警**:被保护的性质从 capsule 内部**不可观测**——邻居也能读的
+      share 和私有的 share 长得一模一样,直到被读走。**拒绝对能修的人可见,暴露对谁
+      都不可见。**
+      **实测四步**:未声明→拒绝且点名要设的配置;声明后→正常挂载读写;手工加
+      `10.32.32.0/24`→再次拒绝并说明宽在哪;删掉该规则→恢复,授权表回到一条 `/32`。
+      ⚠️ **这不让共节点形态变安全,是让它不可用**,直到有**凭据属于 share 而非属于
+      节点**的后端(CephFS+cephx)或 **guest 内挂载**(§8.2 P3:客户端身份=capsule
+      OVN port IP,授权单元与租户边界重合;代价是拓扑反转 + guest 内核 NFS client +
+      Zun→Kata direct-volume 通道)
+- [x] **失败原因不再半路丢失(kubezun `pkg/zun/status.go`)**:Error/Dead 分支读的是
+      `status_detail`,而后端把解释放在 **`status_reason`**(同文件的 waiting 分支
+      读的就是它)。于是一条点名了"要改哪个配置、在哪台机上改"的完整拒绝,到租户手里
+      只剩 `exitCode 1 / Error`。**失败路径上偏偏取了那个通常为空的字段。**已加回归测试
 - [x] **与 nova-incus 的 Manila 实现对比后硬化（fork `447a3a59`）**——抄了四处:
       ①挂载带 `nosuid,nodev`(租户控制 share 全部内容且挂在宿主机上);②mount 加 60s
       超时(NFS 服务端不可达时裸 mount 卡几分钟,zun-compute 是单进程 greenthread——

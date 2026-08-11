@@ -327,3 +327,26 @@ func TestStatesKubernetesCannotExpressAreStillDescribed(t *testing.T) {
 		t.Errorf("waitingReason(Unknown) = %q, want ContainerStatusUnknown", got)
 	}
 }
+
+// TestFailedContainerCarriesItsReason guards the field this used to read.
+//
+// A backend refusal arrives in status_reason with the whole explanation in it;
+// status_detail describes the state a container is in and is empty for one
+// that never ran. Reading the empty one left the tenant an exit code and the
+// word Error, with the actionable half of the message dropped in transit.
+func TestFailedContainerCarriesItsReason(t *testing.T) {
+	because := "This node does not declare itself dedicated to capsules"
+	st := ContainerState(&Container{Status: "Error", StatusReason: because})
+	if st.Terminated == nil {
+		t.Fatalf("a failed container should be terminated: %+v", st)
+	}
+	if st.Terminated.Message != because {
+		t.Errorf("the reason did not survive: %q", st.Terminated.Message)
+	}
+
+	// status_detail still has its use, for a container that did run.
+	st = ContainerState(&Container{Status: "Error", StatusDetail: "Exited(137)"})
+	if st.Terminated.Message != "Exited(137)" {
+		t.Errorf("fell back wrongly: %q", st.Terminated.Message)
+	}
+}

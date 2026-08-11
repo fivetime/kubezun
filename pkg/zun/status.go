@@ -145,7 +145,7 @@ func ContainerState(c *Container) corev1.ContainerState {
 			Terminated: &corev1.ContainerStateTerminated{
 				ExitCode:   exitCode(c),
 				Reason:     terminatedReason(c.Status),
-				Message:    c.StatusDetail,
+				Message:    failureMessage(c),
 				StartedAt:  started,
 				FinishedAt: metav1.NewTime(c.UpdatedAt.Time),
 			},
@@ -158,6 +158,21 @@ func ContainerState(c *Container) corev1.ContainerState {
 			},
 		}
 	}
+}
+
+// failureMessage is what to tell someone whose container failed.
+//
+// Two fields could hold it and only one usually does. status_reason is where
+// the backend puts why something failed; status_detail is a description of
+// what state it is in, which for a container that never ran is empty. Reading
+// the second alone is how a refusal with a complete explanation -- naming the
+// setting to change and the node to change it on -- reached the tenant as an
+// exit code and the word Error.
+func failureMessage(c *Container) string {
+	if c.StatusReason != "" {
+		return c.StatusReason
+	}
+	return c.StatusDetail
 }
 
 // exitCode reports the container's exit status. Zun does not expose the real
