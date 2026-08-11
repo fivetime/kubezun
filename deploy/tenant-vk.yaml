@@ -61,6 +61,11 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["get", "list", "watch", "create", "delete"]
+  # The storage catalog. Read-only: classes are the operator's price list, and
+  # this process only looks up which type a claim's class buys.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
   # Which namespaces this process serves. Watched rather than configured: a
   # tenant creates namespaces while this is running, and a fixed list leaves one
   # made afterwards with no compute and nothing saying why.

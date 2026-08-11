@@ -102,8 +102,12 @@ type Provisioned struct {
 	GiB int
 }
 
-// Create makes the storage for one claim.
-func (b *Backend) Create(ctx context.Context, name string, kind Kind, gib int, description string) (*Provisioned, error) {
+// Create makes the storage for one claim. storageType overrides the
+// deployment default -- it is what a catalog class's parameters chose, the
+// Cinder volume type or the Manila share type, which is the whole reason the
+// catalog exists: the tier is the tenant's choice, priced accordingly, not a
+// deployment constant hidden behind an opaque class name.
+func (b *Backend) Create(ctx context.Context, name string, kind Kind, gib int, description, storageType string) (*Provisioned, error) {
 	if gib < 1 {
 		// Both services count in gibibytes and neither accepts zero. A claim
 		// for less than one gets one rather than an error, which is what
@@ -115,10 +119,14 @@ func (b *Backend) Create(ctx context.Context, name string, kind Kind, gib int, d
 		if b.Block == nil {
 			return nil, fmt.Errorf("this deployment has no block storage endpoint")
 		}
+		vtype := b.VolumeType
+		if storageType != "" {
+			vtype = storageType
+		}
 		v, err := volumes.Create(ctx, b.Block, volumes.CreateOpts{
 			Name:             name,
 			Size:             gib,
-			VolumeType:       b.VolumeType,
+			VolumeType:       vtype,
 			AvailabilityZone: b.AvailabilityZone,
 			Description:      description,
 		}, nil).Extract()
@@ -135,11 +143,15 @@ func (b *Backend) Create(ctx context.Context, name string, kind Kind, gib int, d
 		if proto == "" {
 			proto = "NFS"
 		}
+		stype := b.ShareType
+		if storageType != "" {
+			stype = storageType
+		}
 		s, err := shares.Create(ctx, b.Shared, shares.CreateOpts{
 			Name:             name,
 			Size:             gib,
 			ShareProto:       proto,
-			ShareType:        b.ShareType,
+			ShareType:        stype,
 			AvailabilityZone: b.AvailabilityZone,
 			Description:      description,
 		}).Extract()

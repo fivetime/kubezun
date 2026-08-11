@@ -7,12 +7,14 @@ import (
 
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
+	storagev1listers "k8s.io/client-go/listers/storage/v1"
 )
 
 const (
@@ -35,6 +37,7 @@ type Reconciler struct {
 
 	Claims  corev1listers.PersistentVolumeClaimLister
 	Volumes corev1listers.PersistentVolumeLister
+	Classes storagev1listers.StorageClassLister
 	Client  corev1client.CoreV1Interface
 
 	// StorageClass is the class this process answers for. A claim naming
@@ -64,18 +67,72 @@ func pvName(claim *corev1.PersistentVolumeClaim) string {
 	return "pvc-" + string(claim.UID)
 }
 
+// classOf resolves the StorageClass a claim names, seeing through the
+// gateway's tenant prefix: the catalog entry the operator published as "ceph"
+// reaches this cluster as "111111-ceph" on a tenant's claim.
+func (r *Reconciler) classOf(claim *corev1.PersistentVolumeClaim) *storagev1.StorageClass {
+	if claim.Spec.StorageClassName == nil || r.Classes == nil {
+		return nil
+	}
+	name := *claim.Spec.StorageClassName
+	if sc, err := r.Classes.Get(name); err == nil {
+		return sc
+	}
+	if r.Tenant != "" && strings.HasPrefix(name, r.Tenant+"-") {
+		if sc, err := r.Classes.Get(strings.TrimPrefix(name, r.Tenant+"-")); err == nil {
+			return sc
+		}
+	}
+	return nil
+}
+
 // Ours reports whether a claim is this process's to serve.
+//
+// Two ways in. A claim naming a StorageClass whose provisioner is one of this
+// package's drivers is served through that class -- the class is the catalog
+// entry, and its parameters say which volume or share type to buy. A claim
+// naming the legacy per-deployment class (with or without the gateway's
+// tenant prefix -- the same trap the ingress class fell into) is served with
+// the deployment defaults, so nothing that worked keeps working only until
+// the catalog appears.
 func (r *Reconciler) Ours(claim *corev1.PersistentVolumeClaim) bool {
 	if claim.Spec.StorageClassName == nil {
 		return false
 	}
+	if sc := r.classOf(claim); sc != nil {
+		return sc.Provisioner == BlockDriver || sc.Provisioner == SharedDriver
+	}
 	name := *claim.Spec.StorageClassName
-	// The gateway prefixes cluster-scoped names for a tenant, StorageClass
-	// included, so what the tenant wrote as "knaas" arrives as
-	// "<tenant>-knaas". Matching only the bare name would leave every tenant
-	// claim unserved -- the same trap the ingress class fell into.
 	return name == r.StorageClass ||
 		(r.Tenant != "" && name == r.Tenant+"-"+r.StorageClass)
+}
+
+// planFor decides what a claim gets: which service, and which type within it.
+//
+// A typed class pins the service: ReadWriteMany on a block-device class is
+// refused here, loudly, rather than provisioned as something the class did
+// not promise. The legacy class keeps the old behaviour -- access modes
+// choose the service, deployment flags choose the types.
+func (r *Reconciler) planFor(claim *corev1.PersistentVolumeClaim) (Kind, string, error) {
+	sc := r.classOf(claim)
+	if sc == nil {
+		kind, err := KindFor(claim.Spec.AccessModes)
+		return kind, "", err
+	}
+	switch sc.Provisioner {
+	case BlockDriver:
+		for _, m := range claim.Spec.AccessModes {
+			if m == corev1.ReadWriteMany || m == corev1.ReadOnlyMany {
+				return "", "", fmt.Errorf(
+					"class %s is a block device and cannot serve %s; use a shared filesystem class",
+					sc.Name, m)
+			}
+		}
+		return Block, sc.Parameters["type"], nil
+	case SharedDriver:
+		return Shared, sc.Parameters["share_type"], nil
+	}
+	return "", "", fmt.Errorf("class %s is not served here", sc.Name)
 }
 
 // Reconcile provisions storage for one claim and binds a volume to it.
@@ -99,7 +156,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, namespace, name string) erro
 		return nil
 	}
 
-	kind, err := KindFor(claim.Spec.AccessModes)
+	kind, storageType, err := r.planFor(claim)
 	if err != nil {
 		return fmt.Errorf("claim %s/%s: %w", namespace, name, err)
 	}
@@ -112,7 +169,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, namespace, name string) erro
 		return err
 	}
 	if apierrors.IsNotFound(err) {
-		pv, err = r.provision(ctx, claim, kind)
+		pv, err = r.provision(ctx, claim, kind, storageType)
 		if err != nil {
 			return err
 		}
@@ -125,12 +182,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, namespace, name string) erro
 	return nil
 }
 
-func (r *Reconciler) provision(ctx context.Context, claim *corev1.PersistentVolumeClaim, kind Kind) (*corev1.PersistentVolume, error) {
+func (r *Reconciler) provision(ctx context.Context, claim *corev1.PersistentVolumeClaim, kind Kind, storageType string) (*corev1.PersistentVolume, error) {
 	request := claim.Spec.Resources.Requests[corev1.ResourceStorage]
 	gib := int((request.Value() + (1 << 30) - 1) / (1 << 30))
 
 	made, err := r.Backend.Create(ctx, r.storageName(claim.Namespace, claim.Name), kind, gib,
-		fmt.Sprintf("kubezun claim %s/%s", claim.Namespace, claim.Name))
+		fmt.Sprintf("kubezun claim %s/%s", claim.Namespace, claim.Name), storageType)
 	if err != nil {
 		return nil, err
 	}

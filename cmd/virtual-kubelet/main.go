@@ -293,6 +293,7 @@ func run(o options) error {
 			},
 			Claims:          set.ClaimInformer().Lister(),
 			Volumes:         set.VolumeInformer().Lister(),
+			Classes:         set.ClassInformer().Lister(),
 			Client:          client.CoreV1(),
 			StorageClass:    o.storageClass,
 			Tenant:          o.tenant,

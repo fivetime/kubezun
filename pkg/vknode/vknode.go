@@ -28,6 +28,7 @@ import (
 	corev1informers "k8s.io/client-go/informers/core/v1"
 	discoveryv1informers "k8s.io/client-go/informers/discovery/v1"
 	networkingv1informers "k8s.io/client-go/informers/networking/v1"
+	storagev1informers "k8s.io/client-go/informers/storage/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -55,6 +56,7 @@ type Set struct {
 	slices     discoveryv1informers.EndpointSliceInformer
 	claims     corev1informers.PersistentVolumeClaimInformer
 	volumes    corev1informers.PersistentVolumeInformer
+	classes    storagev1informers.StorageClassInformer
 	ingresses  networkingv1informers.IngressInformer
 
 	// namespaces is the watched set this process serves. Nil falls back to
@@ -146,6 +148,7 @@ func NewSet(opts SetOptions) (*Set, error) {
 	set.ingresses = scmFactory.Networking().V1().Ingresses()
 	set.claims = scmFactory.Core().V1().PersistentVolumeClaims()
 	set.volumes = scmFactory.Core().V1().PersistentVolumes()
+	set.classes = scmFactory.Storage().V1().StorageClasses()
 	// Read on demand rather than cached: see listers.go for why a cache is the
 	// wrong shape here even though the interface asks for an informer.
 	set.secrets = secretInformerShim{
@@ -215,6 +218,10 @@ func (s *Set) IngressInformer() networkingv1informers.IngressInformer { return s
 // ClaimInformer and VolumeInformer back the persistent volume provisioner.
 func (s *Set) ClaimInformer() corev1informers.PersistentVolumeClaimInformer { return s.claims }
 func (s *Set) VolumeInformer() corev1informers.PersistentVolumeInformer     { return s.volumes }
+
+// ClassInformer is the storage catalog: the classes whose parameters say which
+// volume or share type a claim buys.
+func (s *Set) ClassInformer() storagev1informers.StorageClassInformer { return s.classes }
 
 // Node is one virtual node: its node controller, its pod controller, and its
 // kubelet API endpoint.
