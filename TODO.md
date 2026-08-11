@@ -795,8 +795,12 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       分支直接返回,**它刚建的卷无人记录**——winner 的 PV 记的是 winner 的 ID,sweep
       永远认不出这个孤儿,漏成账单。现在输家在收养 winner 的 PV 前先删掉自己建的存储。
       实测:新 claim 恰好 1 个卷,删除后归零
-- [ ] 孤儿 share 挂载清扫:volmap 已删但挂载还在(进程在 mount 与记录之间死掉)。
-      Zun 式做法是周期任务对比 /proc/mounts 与 volmap 表,不必抄 journal
+- [ ] **孤儿节点资源清扫(NFS 挂载 + krbd map,两例都已实际发生)**:
+      ①NameError 窗口漏过一个 share 挂载;②dbpod 删除后 /dev/rbd0 仍 map 在 node-04
+      (Cinder 侧 attachment 已摘、卷 available,但异步删除撞 watcher 失败回滚——
+      "PV 删了、卷永远删不掉"就是这个样子,已手工 unmap+删)。
+      Zun 式做法:周期任务对比节点实际状态(/proc/mounts + rbd showmapped)与 volmap 表,
+      无主的 unmount/unmap;不必抄 nova-incus 的 journal
 - [ ] 跨节点 RWX 未被调度触发(两 pod 落同节点,授权集=1 个 /32);机制是按节点的,
       多节点时各自加一条,下次多 pod 实验顺带验
 - [x] **StorageClass 目录(`283a743`,方案来自用户对照 CPO 的分析)**:SC=目录项,
