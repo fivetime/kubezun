@@ -1,0 +1,66 @@
+# The storage catalog: what tenants see when they run `kubectl get sc`, and
+# the whole of what they need to know to choose.
+#
+# Each class is one tier for sale. The provisioner names the service --
+# cinder.knaas.io is a block device (ReadWriteOnce), manila.knaas.io a shared
+# filesystem (ReadWriteMany) -- and the parameters name the type within it:
+# parameters.type is the Cinder volume type, parameters.share_type the Manila
+# share type. kubezun provisions exactly what the class says, on the tenant's
+# own credential.
+#
+# This file is applied by the OPERATOR with kubectl, and that is deliberate --
+# no CRD, no controller owns it. A catalog is a price list, not a mirror of
+# the backend: Cinder also carries __DEFAULT__ and whatever test types the
+# operators keep for themselves, and none of that belongs in front of a
+# tenant. Which tiers are sold, and under what names, is a product decision
+# made here, in review, in git.
+#
+# The published label is kubezoo's contract: without it a class exists in this
+# cluster and no tenant ever sees it. Publishing IS part of the catalog entry,
+# which is why it lives in this file and not in a runbook step.
+#
+# Two failure shapes worth knowing:
+#   - a class naming a type the backend does not have fails at provision time,
+#     with the error in kubezun's log and the claim Pending (measured: the
+#     deployment default once pointed at a backend that was not running);
+#   - a bound claim never re-reads its class, so editing a class here changes
+#     future claims only.
+#
+# ---- lab (devstack on incus-node-01) ----
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ceph
+  labels:
+    storageclass.kubezoo.io/published: "true"
+provisioner: cinder.knaas.io
+parameters:
+  type: ceph
+allowVolumeExpansion: true
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ceph-nvme
+  labels:
+    storageclass.kubezoo.io/published: "true"
+provisioner: cinder.knaas.io
+parameters:
+  type: ceph-nvme-test
+allowVolumeExpansion: true
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: nfs-share
+  labels:
+    storageclass.kubezoo.io/published: "true"
+provisioner: manila.knaas.io
+parameters:
+  share_type: incus-nfs
+# ---- production (control1) ----
+# One class per public Cinder volume type, same names the types carry:
+#   nvme-rep3, nvme-ec42, ssd-rep3, ssd-ec42, hdd-rep3, hdd-ec42, hybrid-rep3
+# (not __DEFAULT__, not incus-e2e-qos -- the first is a fallback, the second a
+# test type; neither is a product). Copy a block above and change name and
+# parameters.type. Manila classes follow once production offers share types.
