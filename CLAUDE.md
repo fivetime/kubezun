@@ -4,9 +4,12 @@
 virtual-kubelet provider，把租户的逻辑虚拟节点落到 OpenStack Zun capsule（Kata 隔离，
 租户零 worker 节点），与 B1（kubezoo+kubetron，pod 跑平台 kata 池）体验档位共存。
 
-**⭐ 真相源（改代码前先读；会话压缩后先读这两份恢复状态，勿凭记忆续做）**：
+**⭐ 真相源（改代码前先读；会话压缩后先读这几份恢复状态，勿凭记忆续做）**：
 - [`docs/DESIGN.md`](docs/DESIGN.md) —— 14 章设计定案。**§13 已否决方案清单：不要重新提议**。
 - [`TODO.md`](TODO.md) —— 任务分解看板，**开发进度唯一真相源**，做一项勾一项补 commit hash。
+- `/root/k8s-zun-provider/openstack/zun/FORK.md` —— **Zun fork 侧的定案文档**（2026-08-11 起）。
+  DESIGN.md 只讲 kubezun；fork 改了什么、为什么、维护边界在哪、双驱动定案，都在 FORK.md。
+  改 Zun 前先读它。
 - 两份不一致时：先改 DESIGN，再改 TODO。姊妹文档：
   `/root/kubezoo-gateway/docs/kaaas-platform-architecture-cn.md`（平台全貌）、
   `/root/kubetron/DESIGN-refactor.md`（OVN 数据面）。
