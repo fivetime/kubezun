@@ -61,9 +61,20 @@ func (n *Neutron) EnsureBaseline(ctx context.Context) (ingressID, egressID strin
 }
 
 // ensureBaselineRules opens one direction completely, for both address
-// families. This is what "no policy selects this pod" means in Kubernetes, and
-// Neutron's baseline is the opposite -- a port with security groups is denied
-// what no rule allows -- so the permissive case has to be stated.
+// families, and closes the other.
+//
+// The opening is needed because Neutron's baseline is the opposite of
+// Kubernetes': a port carrying security groups is denied whatever no rule
+// allows, while a pod no policy selects must be able to talk. So "no policy
+// applies" has to be stated rather than left unsaid.
+//
+// ⚠️ The closing is needed because Neutron adds two egress allow-all rules to
+// every security group it creates, which nobody asked for and which the API
+// does not mention at creation time. Left in place they make the ingress group
+// allow all egress as well -- so detaching the egress group from an isolated
+// pod changes nothing, and egress policy is enforced in appearance only. That
+// is the failure this whole package exists to remove, so a group here carries
+// rules for its own direction and nothing else.
 func (n *Neutron) ensureBaselineRules(ctx context.Context, groupID, direction string) error {
 	want := []rules.CreateOpts{
 		{SecGroupID: groupID, Direction: rules.RuleDirection(direction),
@@ -81,10 +92,21 @@ func (n *Neutron) ensureBaselineRules(ctx context.Context, groupID, direction st
 		}
 		if _, err := rules.Create(ctx, n.Client, w).Extract(); err != nil {
 			// Another process of the same tenant may have written it between
-			// the read and the write. That is the same outcome we wanted.
+			// the read and the write, and Neutron reads a rule with no remote
+			// prefix as the same rule as one naming the whole address space.
+			// Either way the state we wanted is the state that exists.
 			if !isConflict(err) {
 				return fmt.Errorf("opening %s on %s: %w", direction, groupID, err)
 			}
+		}
+	}
+	for _, r := range have {
+		if r.Direction == direction {
+			continue
+		}
+		if err := rules.Delete(ctx, n.Client, r.ID).ExtractErr(); err != nil && !isGone(err) {
+			return fmt.Errorf("removing a %s rule from the %s group: %w",
+				r.Direction, direction, err)
 		}
 	}
 	return nil
@@ -270,6 +292,13 @@ func isConflict(err error) bool {
 		}
 	}
 	return false
+}
+
+// isGone reports whether the thing we were removing is already absent, which
+// is the outcome the caller wanted.
+func isGone(err error) bool {
+	var code gophercloud.ErrUnexpectedResponseCode
+	return errors.As(err, &code) && code.Actual == 404
 }
 
 func hasRule(have []rules.SecGroupRule, want rules.CreateOpts) bool {
