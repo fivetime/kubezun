@@ -508,16 +508,18 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       我们代码里也就不用抄"定长 6 + 第 7 位是 dash"那段算术——那是 kubezoo 的概念。
       ⚠️ pod/Secret 的 informer 要随这个集合动态建，**不能先加命名空间再说**，
       否则就是拿跨租户的 Secret 缓存换一个 DNS
-- [ ] **⚠️ 运行时任务没了的 capsule 永远删不掉(2026-08-11 发现,实验床实例 42 个)**:
-      删除路径卡在 StopContainer,运行时报
-      `failed to get task for container <id>: context deadline exceeded`——
-      shim 已经不在了,而删除仍在等它。表现为 `DELETE` 回 500、capsule 停在 Stopped,
-      **反复删也删不掉**;实验床上最老的来自 2026-08-06,五天里无人回收。
-      ⚠️ **和 rbd watcher 那条同一个形状**:看起来能删、实际删不掉、而且没有任何东西
-      显示在占着它。对平台是计费问题(资源账上它还在)。
-      修法:CRI 驱动的 delete 在"任务已不存在"时应继续走 RemoveContainer/
-      RemovePodSandbox,而不是在 stop 上放弃。
-      ⚠️ 顺带暴露**孤儿 capsule 治理确实还没做**:实测 4 个活 pod 对 93 个 capsule
+- [x] **运行时任务没了的 capsule 现在删得掉了(2026-08-11,fork `fcbc5da4`)**:
+      根子是**停止和删除写在同一个 try 里**——shim 没了时 stop 会等一个没人应答的任务、
+      `DEADLINE_EXCEEDED`,然后把删除一起带走。于是**永远删不掉**:每次重试都在等同一个
+      不存在的 shim,记录还在、资源账还在,而没有任何东西看起来占着它。
+      **删除才是目的,停止只是礼貌** —— 现在两者分开尝试,停不掉就记日志继续删
+      (CRI 本来就规定 `RemovePodSandbox` 要强制终止里面还在跑的东西)。
+      **实测**:那批 2026-08-06 起删不掉的,`DELETE` 从 500 变 204;租户的 capsule 从
+      29 个降到 5 个,且 5 个全部有 pod 在跑。
+      ⚠️ 修好这步才露出下一步:并发删 13 个时 Neutron 拒连(`Remote end closed
+      connection`)——那是负载不是逻辑,放慢重试即全部通过。
+      ⚠️ **孤儿 capsule 治理仍然没做**:这次是我手工清的,没有任何东西会定期比对
+      "活着的 pod"和"存在的 capsule"
 - [ ] ⚠️ **实验床的 systemd unit 是手改的,和仓库模板已经分叉(2026-08-11 发现)**:
       `/etc/systemd/system/kubezun@111111.service` 不是从 `deploy/kubezun@.service`
       生成的实例,而是一份独立维护的文件(21 个参数 vs 模板的一套)。我这次为了开
