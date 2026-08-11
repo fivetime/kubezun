@@ -794,6 +794,25 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       Zun 式做法是周期任务对比 /proc/mounts 与 volmap 表,不必抄 journal
 - [ ] 跨节点 RWX 未被调度触发(两 pod 落同节点,授权集=1 个 /32);机制是按节点的,
       多节点时各自加一条,下次多 pod 实验顺带验
+- [x] **StorageClass 目录(`283a743`,方案来自用户对照 CPO 的分析)**:SC=目录项,
+      `provisioner` 定服务(`cinder.knaas.io`/`manila.knaas.io`),`parameters.type`/
+      `parameters.share_type` 定档位;租户 `get sc` 一眼知道选什么,档位可见可计费。
+      类型钉死服务:块设备类 + RWX **拒绝并说明**,不静默给出类没承诺的东西;
+      旧 `knaas` 类保留按 accessModes 推断的老行为。网关前缀照 IngressClass 的教训处理
+      (`111111-ceph-nvme` → 上游 `ceph-nvme`)。
+      **实测**:`ceph-nvme` 类 → `ceph-nvme-test` 类型的卷;`nfs-share` 类 → `incus-nfs`
+      share;badmix 拒绝文案正确。
+      ⚠️ **否决了"只跑 CPO controllerplugin"**:external-provisioner 按 provisioner 名
+      全集群认领,一个实例=一份跨全租户建卷的凭据(CPO cloud.conf 静态模型,kubetron
+      记过同一问题);每租户一套则 provisioner 名裂开、共享目录不复存在。provision 半边
+      留自研(三百行已测),缺的是目录不是机器
+- [ ] **SC 目录要经 kubezoo 发布**(kubezoo 侧,publishedStorageClasses/#91 那套):
+      上游建的 SC 租户默认看不见;不发布,租户视角 `get sc` 仍是空。生产环境按 control1
+      的 8 个 public volume type 各建一条(nvme-rep3/ssd-ec42/hdd-rep3…)
+- [ ] **AZ 拓扑 / WaitForFirstConsumer 未验**(Zun 场景特有):卷要开在 capsule 落的 AZ。
+      现在 SC 全 Immediate + `KUBEZUN_STORAGE_AZ` 静态配;WFFC 需要 provisioner 从
+      `volume.kubernetes.io/selected-node` 注解读虚拟节点拓扑,虚拟节点的 zone 标签
+      是我们自己写的——能不能被调度器/绑定链路正确消费要实测
 - [ ] 开通清单新增:`KUBEZUN_VOLUME_TYPE`(必须映射到在跑的后端——默认类型指向没跑的
       lvmdriver-1 时卷直接 error)、`KUBEZUN_SHARE_TYPE`、计算节点 ceph-common+配置、
       nfs-common、RBAC pvc(读)/pv(写删)
