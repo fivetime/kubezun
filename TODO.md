@@ -726,6 +726,12 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       CA(`CN=kubernetes` 自签)，而 capsule 实际访问的 10.224.18.51 出示的是 **KubeZoo 自己的
       CA**(`O=KubeZoo`)。租户按投影进去的 CA 校验必失败(`-k` 才通)。我们这边无法凭空造出
       正确的 CA——发给租户的那个 ConfigMap 必须装它签的东西
+- [x] **`kubectl top` 端到端通(2026-08-11,`9c26a86`)**:metrics-server 0.8.1 抓虚拟节点
+      曾全 `<unknown>`,原因是我们 kubelet API 用了 `RequireAndVerifyClientCert`——
+      **比真 kubelet 严**,在 TLS 握手就拒掉只带 bearer token 的 metrics-server。真 kubelet
+      用 `RequestClientCert` 正是为此。改后节点/pod 指标都出真值。⚠️ 并不降低安全:
+      每个请求仍走 authn(x509 或 TokenReview)+ authz(`nodes/<name>` SAR),两者都没有
+      的调用方在 HTTP 层被 401
 - [x] **`kubectl top` / HPA 的数据面（`53204a9` + Zun `c6f85263`）**：以前 capsule 是黑盒。
       Zun 侧新增 capsule stats（CRI `ListContainerStats`，按容器给），kubezun 侧同时实现
       `/stats/summary` **和** `/metrics/resource`——只做前者的话现代 metrics-server 抓不到，
@@ -801,8 +807,13 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       "PV 删了、卷永远删不掉"就是这个样子,已手工 unmap+删)。
       Zun 式做法:周期任务对比节点实际状态(/proc/mounts + rbd showmapped)与 volmap 表,
       无主的 unmount/unmap;不必抄 nova-incus 的 journal
-- [ ] 跨节点 RWX 未被调度触发(两 pod 落同节点,授权集=1 个 /32);机制是按节点的,
-      多节点时各自加一条,下次多 pod 实验顺带验
+- [x] **跨节点 RWX 实测通过(2026-08-11)**:`rwx-far` 落 node-06 → 授权集自动变两条
+      `/32`,它读到 node-04 上 4 个 pod 写的全部内容;删掉它 → 收缩回一条,**留下的正是
+      仍有 pod 的那个节点**,其余 pod 读写不受影响。
+      ⚠️ **散开的决定权不在 K8s**:pod 落哪个虚拟节点只决定约束(arch/AZ),capsule 开在
+      该 AZ 的哪台计算节点由 **Zun 调度器**定,K8s 看不见。Zun 在容量充裕时**堆叠而非
+      分散**——4 个 RWX pod 全落 node-04,只能临时 `disabled=1` 禁用 node-04 才逼出跨节点。
+      这与租户有几个虚拟节点无关
 - [x] **StorageClass 目录(`283a743`,方案来自用户对照 CPO 的分析)**:SC=目录项,
       `provisioner` 定服务(`cinder.knaas.io`/`manila.knaas.io`),`parameters.type`/
       `parameters.share_type` 定档位;租户 `get sc` 一眼知道选什么,档位可见可计费。
