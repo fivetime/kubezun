@@ -69,6 +69,8 @@ type options struct {
 	volumeType           string
 	storageAZ            string
 	enforceNetworkPolicy bool
+	convertNetworkPolicy string
+	convertConfirm       bool
 	publicSvcs           bool
 }
 
@@ -139,6 +141,15 @@ func main() {
 	flag.StringVar(&o.volumeType, "volume-type", os.Getenv("KUBEZUN_VOLUME_TYPE"),
 		"Cinder volume type claims are created with; empty lets Cinder pick "+
 			"its default, which must map to a running backend")
+	flag.StringVar(&o.convertNetworkPolicy, "convert-network-policy", "",
+		"convert this tenant onto policy-decided security groups and exit: "+
+			"'attach' adds them to every capsule port, 'detach' then removes the "+
+			"project default. ⚠️ Run attach everywhere before detach anywhere: "+
+			"pods reach each other by sharing the default group, so a tenant "+
+			"half-way through detach is one whose halves cannot talk. Reports "+
+			"what it would do unless --convert-confirm is also given")
+	flag.BoolVar(&o.convertConfirm, "convert-confirm", false,
+		"actually write the conversion, rather than reporting what it would change")
 	flag.BoolVar(&o.enforceNetworkPolicy, "enforce-network-policy",
 		os.Getenv("KUBEZUN_ENFORCE_NETWORK_POLICY") == "true",
 		"enforce NetworkPolicy by placing each capsule's port in security groups. "+
@@ -202,6 +213,26 @@ func main() {
 }
 
 func run(o options) error {
+	// The conversion is an OpenStack operation and nothing else. Taking it
+	// before the node and Kubernetes setup means an operator running it by
+	// hand needs credentials and nothing more -- not a kubeconfig, not a node
+	// name for nodes it will not register.
+	if o.convertNetworkPolicy != "" {
+		ctx, cancel := signal.NotifyContext(context.Background(),
+			syscall.SIGINT, syscall.SIGTERM)
+		defer cancel()
+		creds, err := zun.CredentialsFromEnv()
+		if err != nil {
+			return fmt.Errorf("read OpenStack credentials: %w", err)
+		}
+		zunClient, err := zun.NewClient(ctx, creds)
+		if err != nil {
+			return err
+		}
+		return convertTenant(ctx, zunClient, netpol.Phase(o.convertNetworkPolicy),
+			o.convertConfirm)
+	}
+
 	specs, err := nodeSpecs(o)
 	if err != nil {
 		return err
@@ -616,6 +647,55 @@ func withClientCA(path string) nodeutil.WebhookAuthOption {
 		cfg.AuthnConfig.ClientCertificateCAContentProvider = ca
 		return nil
 	}
+}
+
+// convertTenant runs one half of the security group conversion and returns.
+//
+// A separate invocation rather than something the controller does on start:
+// it changes every capsule of a tenant at once, the two halves must be run in
+// order with the operator deciding when, and the first thing anyone will want
+// is to see what it would do.
+func convertTenant(ctx context.Context, zunClient *zun.Client, phase netpol.Phase, confirm bool) error {
+	switch phase {
+	case netpol.PhaseAttach, netpol.PhaseDetach:
+	default:
+		return fmt.Errorf("the conversion phase must be %q or %q, not %q",
+			netpol.PhaseAttach, netpol.PhaseDetach, phase)
+	}
+	client, err := netpol.NewClient(zunClient)
+	if err != nil {
+		return err
+	}
+	n := &netpol.Neutron{Client: client}
+	ingress, egress, err := n.EnsureBaseline(ctx)
+	if err != nil {
+		return fmt.Errorf("preparing the baseline groups: %w", err)
+	}
+	denyAll, err := n.EnsureDenyAll(ctx)
+	if err != nil {
+		return err
+	}
+
+	changed, total, err := n.Convert(ctx, phase, []string{denyAll, ingress, egress}, !confirm)
+	if err != nil {
+		return err
+	}
+	// Printed rather than logged: this runs before the logger is configured,
+	// and its output is the whole point of the command -- an operator deciding
+	// whether to let it write.
+	if confirm {
+		fmt.Printf("%s: changed %d of %d capsule ports\n", phase, changed, total)
+		if phase == netpol.PhaseAttach {
+			fmt.Println("every port is now at least as reachable as it was. " +
+				"Run the detach phase only once this has been done for the " +
+				"whole tenant.")
+		}
+		return nil
+	}
+	fmt.Printf("%s: would change %d of %d capsule ports; nothing was written\n",
+		phase, changed, total)
+	fmt.Println("pass --convert-confirm to apply")
+	return nil
 }
 
 // placementOf answers where a node this process runs puts its capsules.

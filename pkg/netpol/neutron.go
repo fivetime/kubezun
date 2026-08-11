@@ -150,7 +150,9 @@ func (n *Neutron) EnsureDenyAll(ctx context.Context) (string, error) {
 	return id, nil
 }
 
-func (n *Neutron) ensureGroup(ctx context.Context, name, description string) (string, error) {
+// findGroup returns a security group's id, or "" when the project has none by
+// that name.
+func (n *Neutron) findGroup(ctx context.Context, name string) (string, error) {
 	var found string
 	err := groups.List(n.Client, groups.ListOpts{Name: name}).EachPage(ctx,
 		func(_ context.Context, page pagination.Page) (bool, error) {
@@ -166,6 +168,14 @@ func (n *Neutron) ensureGroup(ctx context.Context, name, description string) (st
 		})
 	if err != nil {
 		return "", fmt.Errorf("looking for security group %s: %w", name, err)
+	}
+	return found, nil
+}
+
+func (n *Neutron) ensureGroup(ctx context.Context, name, description string) (string, error) {
+	found, err := n.findGroup(ctx, name)
+	if err != nil {
+		return "", err
 	}
 	if found != "" {
 		return found, nil
