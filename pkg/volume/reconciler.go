@@ -40,10 +40,6 @@ type Reconciler struct {
 	Classes storagev1listers.StorageClassLister
 	Client  corev1client.CoreV1Interface
 
-	// StorageClass is the class this process answers for. A claim naming
-	// another class belongs to someone else and is left alone -- the same
-	// boundary the ingress class draws.
-	StorageClass string
 	// Tenant prefixes names on the OpenStack side, so one project holding
 	// several tenants' storage can still be read by a human.
 	Tenant string
@@ -67,9 +63,13 @@ func pvName(claim *corev1.PersistentVolumeClaim) string {
 	return "pvc-" + string(claim.UID)
 }
 
-// classOf resolves the StorageClass a claim names, seeing through the
-// gateway's tenant prefix: the catalog entry the operator published as "ceph"
-// reaches this cluster as "111111-ceph" on a tenant's claim.
+// classOf resolves the StorageClass a claim names.
+//
+// The gateway passes storageClassName through verbatim -- measured by reading
+// its code, after the ingress class's prefixing was wrongly assumed to apply
+// here too -- so the exact name is the normal case. The prefixed spelling is
+// still accepted as tolerance for claims written against the old per-tenant
+// naming, not because anything produces it.
 func (r *Reconciler) classOf(claim *corev1.PersistentVolumeClaim) *storagev1.StorageClass {
 	if claim.Spec.StorageClassName == nil || r.Classes == nil {
 		return nil
@@ -86,38 +86,35 @@ func (r *Reconciler) classOf(claim *corev1.PersistentVolumeClaim) *storagev1.Sto
 	return nil
 }
 
-// Ours reports whether a claim is this process's to serve.
+// Ours reports whether a claim is this process's to serve: one naming a
+// StorageClass whose provisioner is one of this package's drivers. The class
+// is the catalog entry, and its parameters say which volume or share type to
+// buy.
 //
-// Two ways in. A claim naming a StorageClass whose provisioner is one of this
-// package's drivers is served through that class -- the class is the catalog
-// entry, and its parameters say which volume or share type to buy. A claim
-// naming the legacy per-deployment class (with or without the gateway's
-// tenant prefix -- the same trap the ingress class fell into) is served with
-// the deployment defaults, so nothing that worked keeps working only until
-// the catalog appears.
+// There is deliberately no other way in. An earlier per-tenant magic name
+// ("<tenant>-knaas") needed no StorageClass object at all, which also meant
+// the tenant could see their own tenant id inside their claim and could learn
+// nothing about what the class bought them. Claims bound under it keep
+// working -- binding, mounting and reclaim never consult the class again --
+// but new claims name a catalog entry or stay Pending.
 func (r *Reconciler) Ours(claim *corev1.PersistentVolumeClaim) bool {
 	if claim.Spec.StorageClassName == nil {
 		return false
 	}
-	if sc := r.classOf(claim); sc != nil {
-		return sc.Provisioner == BlockDriver || sc.Provisioner == SharedDriver
-	}
-	name := *claim.Spec.StorageClassName
-	return name == r.StorageClass ||
-		(r.Tenant != "" && name == r.Tenant+"-"+r.StorageClass)
+	sc := r.classOf(claim)
+	return sc != nil &&
+		(sc.Provisioner == BlockDriver || sc.Provisioner == SharedDriver)
 }
 
 // planFor decides what a claim gets: which service, and which type within it.
 //
 // A typed class pins the service: ReadWriteMany on a block-device class is
 // refused here, loudly, rather than provisioned as something the class did
-// not promise. The legacy class keeps the old behaviour -- access modes
-// choose the service, deployment flags choose the types.
+// not promise.
 func (r *Reconciler) planFor(claim *corev1.PersistentVolumeClaim) (Kind, string, error) {
 	sc := r.classOf(claim)
 	if sc == nil {
-		kind, err := KindFor(claim.Spec.AccessModes)
-		return kind, "", err
+		return "", "", fmt.Errorf("claim %s/%s names no catalog class", claim.Namespace, claim.Name)
 	}
 	switch sc.Provisioner {
 	case BlockDriver:

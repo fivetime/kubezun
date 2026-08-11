@@ -126,10 +126,11 @@ func main() {
 			"--cluster-dns. Normally left empty: the address is a load balancer "+
 			"this process builds and cannot be known in advance, so it is read "+
 			"from --dns-service instead")
-	flag.StringVar(&o.storageClass, "storage-class", envOr("KUBEZUN_STORAGE_CLASS", "knaas"),
-		"StorageClass this process provisions for. A claim naming it gets a "+
-			"Cinder volume (ReadWriteOnce) or a Manila share (ReadWriteMany) on "+
-			"the tenant's own credential. Empty turns provisioning off")
+	flag.StringVar(&o.storageClass, "storage-class", envOr("KUBEZUN_STORAGE_CLASS", "on"),
+		"set empty to turn claim provisioning off. Which claims are served is "+
+			"no longer named here: a claim is served when its StorageClass's "+
+			"provisioner is cinder.knaas.io or manila.knaas.io, and the class's "+
+			"parameters choose the volume or share type")
 	flag.StringVar(&o.shareType, "share-type", os.Getenv("KUBEZUN_SHARE_TYPE"),
 		"Manila share type ReadWriteMany claims are created with; empty lets "+
 			"Manila pick its default")
@@ -295,7 +296,6 @@ func run(o options) error {
 			Volumes:         set.VolumeInformer().Lister(),
 			Classes:         set.ClassInformer().Lister(),
 			Client:          client.CoreV1(),
-			StorageClass:    o.storageClass,
 			Tenant:          o.tenant,
 			ServesNamespace: set.Serves,
 		}

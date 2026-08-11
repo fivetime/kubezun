@@ -21,14 +21,12 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
 	"github.com/gophercloud/gophercloud/v2/openstack/sharedfilesystems/v2/shareaccessrules"
 	"github.com/gophercloud/gophercloud/v2/openstack/sharedfilesystems/v2/shares"
-	corev1 "k8s.io/api/core/v1"
 )
 
-// Kind is which OpenStack service backs a claim.
-//
-// It follows from the access modes, not from a choice the tenant makes
-// separately: ReadWriteMany needs a filesystem several machines can mount at
-// once, which is Manila; anything else is a block device, which is Cinder.
+// Kind is which OpenStack service backs a claim. The claim's StorageClass
+// decides it: a catalog entry's provisioner names the service, and
+// ReadWriteMany on a block-device class is refused rather than served by
+// something that shares a device instead of a filesystem.
 type Kind string
 
 const (
@@ -43,34 +41,6 @@ const (
 	BlockDriver  = "cinder.knaas.io"
 	SharedDriver = "manila.knaas.io"
 )
-
-// KindFor decides which service backs a claim, and refuses a combination
-// neither can serve.
-//
-// ReadWriteMany on a block device is the dangerous one to get wrong. Cinder
-// can attach a volume to several machines -- it calls it multiattach -- and
-// that is not what ReadWriteMany means. It shares the device, not a
-// filesystem; two capsules writing to the same ext4 through it corrupt it,
-// quietly and unrecoverably, which is a worse outcome than refusing the claim.
-func KindFor(modes []corev1.PersistentVolumeAccessMode) (Kind, error) {
-	var many, one bool
-	for _, m := range modes {
-		switch m {
-		case corev1.ReadWriteMany, corev1.ReadOnlyMany:
-			many = true
-		case corev1.ReadWriteOnce, corev1.ReadWriteOncePod:
-			one = true
-		}
-	}
-	switch {
-	case many:
-		return Shared, nil
-	case one:
-		return Block, nil
-	default:
-		return "", fmt.Errorf("no access mode was asked for; name ReadWriteOnce for a disk or ReadWriteMany for a shared filesystem")
-	}
-}
 
 // Backend provisions and removes the storage behind a claim.
 type Backend struct {
