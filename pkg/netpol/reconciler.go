@@ -97,13 +97,11 @@ func (r *Reconciler) GroupsFor(ctx context.Context, pod *corev1.Pod) ([]string, 
 		groups = append(groups, r.baseline.egress)
 	}
 
-	allowed, err := r.ruleSetFor(ctx, pod, policies)
+	allowed, err := r.policyGroupsFor(ctx, pod, policies)
 	if err != nil {
 		return nil, err
 	}
-	if allowed != "" {
-		groups = append(groups, allowed)
-	}
+	groups = append(groups, allowed...)
 	sort.Strings(groups)
 	return groups, nil
 }
@@ -114,48 +112,70 @@ func (r *Reconciler) GroupsFor(ctx context.Context, pod *corev1.Pod) ([]string, 
 // Returns "" when the policies allow nothing, which is the deny-all case: the
 // anchor group already says that, and creating an empty group to say it again
 // would cost a cloud-wide northd recompute for no effect.
-func (r *Reconciler) ruleSetFor(ctx context.Context, pod *corev1.Pod, policies []*networkingv1.NetworkPolicy) (string, error) {
-	var translated []*Translated
+// policyGroupsFor is one security group per policy selecting this pod.
+//
+// ⚠️ Per policy rather than per pod. Security group rules are an allow-list, so
+// carrying several groups means the union of their rules -- which is exactly
+// what Kubernetes means by a pod selected by several policies. One group per
+// policy therefore composes correctly, and keeps the number of groups equal to
+// the number of policies: a pod joining or leaving a policy is then a port
+// update, not a new group. Per pod it would be one group per distinct
+// COMBINATION of policies, and every new combination is a group creation --
+// which is the cloud-wide northd recompute (DESIGN §7.7.3).
+func (r *Reconciler) policyGroupsFor(ctx context.Context, pod *corev1.Pod, policies []*networkingv1.NetworkPolicy) ([]string, error) {
+	var out []string
 	for _, p := range policies {
 		t, err := Translate(p)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		if !t.Subject.Matches(labels.Set(pod.Labels)) {
 			continue
 		}
-		translated = append(translated, t)
-	}
-	set := EffectiveRules(pod, translated)
-	if set.Empty() {
-		return "", nil
-	}
+		r.ReportRefusals(ctx, p, t.Refused)
 
-	// The peer sets first: a rule naming an address group that does not exist
-	// is refused, and a refusal in the middle leaves the pod holding half a
-	// policy.
-	keys := make([]string, 0, len(set.Peers))
-	for key := range set.Peers {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+		set := PolicyRules(t)
+		if set.Empty() {
+			// A policy that isolates and allows nothing -- the deny-all
+			// everyone writes first. The isolation is already expressed by
+			// removing a baseline group; an empty security group to say the
+			// same thing again would cost a northd recompute for no effect.
+			continue
+		}
 
-	peers := make(map[string]string, len(set.Peers))
-	for _, key := range keys {
-		id, err := r.Neutron.EnsureAddressGroup(ctx, AddressGroupName(key))
+		// The peer sets first: a rule naming an address group that does not
+		// exist is refused, and a refusal in the middle leaves the pod holding
+		// half a policy.
+		keys := make([]string, 0, len(set.Peers))
+		for key := range set.Peers {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+
+		peers := make(map[string]string, len(set.Peers))
+		for _, key := range keys {
+			id, err := r.Neutron.EnsureAddressGroup(ctx, AddressGroupName(key))
+			if err != nil {
+				return nil, err
+			}
+			addresses, err := r.AddressesFor(key, set.Peers[key])
+			if err != nil {
+				return nil, err
+			}
+			if err := r.Neutron.SyncAddresses(ctx, id, addresses); err != nil {
+				return nil, err
+			}
+			peers[key] = id
+		}
+
+		id, err := r.Neutron.EnsureRuleSet(ctx,
+			GroupNameFor(p.Namespace, p.Name), set, peers)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		addresses, err := r.AddressesFor(key, set.Peers[key])
-		if err != nil {
-			return "", err
-		}
-		if err := r.Neutron.SyncAddresses(ctx, id, addresses); err != nil {
-			return "", err
-		}
-		peers[key] = id
+		out = append(out, id)
 	}
-	return r.Neutron.EnsureRuleSet(ctx, set, peers)
+	return out, nil
 }
 
 func (r *Reconciler) policiesFor(namespace string) ([]*networkingv1.NetworkPolicy, error) {

@@ -208,9 +208,9 @@ func (n *Neutron) rulesOf(ctx context.Context, groupID string) ([]rules.SecGroup
 // The peers map turns a selector key into the address group id the rule refers
 // to; every key in the set must be present, because a rule naming a group that
 // does not exist is refused and leaves the set half written.
-func (n *Neutron) EnsureRuleSet(ctx context.Context, set RuleSet, peers map[string]string) (string, error) {
-	id, err := n.ensureGroup(ctx, set.Name(),
-		"kubezun: what one pod's NetworkPolicies allow")
+func (n *Neutron) EnsureRuleSet(ctx context.Context, name string, set RuleSet, peers map[string]string) (string, error) {
+	id, err := n.ensureGroup(ctx, name,
+		"kubezun: what one NetworkPolicy allows")
 	if err != nil {
 		return "", err
 	}
@@ -248,7 +248,7 @@ func (n *Neutron) EnsureRuleSet(ctx context.Context, set RuleSet, peers map[stri
 			continue
 		}
 		if _, err := rules.Create(ctx, n.Client, w).Extract(); err != nil && !isConflict(err) {
-			return "", fmt.Errorf("writing a rule into %s: %w", set.Name(), err)
+			return "", fmt.Errorf("writing a rule into %s: %w", name, err)
 		}
 	}
 	// ⚠️ And remove what is no longer wanted, including the two egress
@@ -260,7 +260,7 @@ func (n *Neutron) EnsureRuleSet(ctx context.Context, set RuleSet, peers map[stri
 			continue
 		}
 		if err := rules.Delete(ctx, n.Client, h.ID).ExtractErr(); err != nil && !isGone(err) {
-			return "", fmt.Errorf("removing a stale rule from %s: %w", set.Name(), err)
+			return "", fmt.Errorf("removing a stale rule from %s: %w", name, err)
 		}
 	}
 	return id, nil

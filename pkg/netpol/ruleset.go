@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-
-	corev1 "k8s.io/api/core/v1"
 )
 
 // SGRule is one Neutron security group rule: the unit Neutron actually stores.
@@ -122,20 +120,21 @@ func (r SGRule) key() string {
 		r.Protocol, r.PortMin, r.PortMax, r.RemoteCIDR, r.RemoteAddressGroup)
 }
 
-// Name is the security group a rule set lives in.
+// GroupNameFor is the security group one policy's allowances live in.
 //
-// Derived from the content, so two pods allowed exactly the same things share
-// one group. That sharing is the point: a security group OBJECT created or
-// deleted makes ovn-northd rebuild every port group in the cloud, so the number
-// of them must follow the number of distinct rule sets and not the number of
-// policies or pods (DESIGN §7.7.3).
-func (s RuleSet) Name() string {
-	h := sha256.New()
-	for _, r := range s.Rules {
-		h.Write([]byte(r.key()))
-		h.Write([]byte{0})
-	}
-	return "knp-rules-" + hex.EncodeToString(h.Sum(nil))[:16]
+// Named after the policy, not after its contents. ⚠️ A content hash looks
+// tidier and is worse in the one dimension that matters: a security group
+// OBJECT created or deleted makes ovn-northd rebuild every port group in the
+// cloud, so the count must follow something that changes rarely. Named by
+// content, editing a policy mints a new group and orphans the old one, and a
+// pod selected by a new combination of policies mints another -- the number of
+// groups then follows the number of distinct COMBINATIONS, which is
+// exponential in the number of policies. Named by policy it is exactly one
+// group per policy, editing one rewrites rules inside it, and a pod's changing
+// membership is only a port update.
+func GroupNameFor(namespace, name string) string {
+	h := sha256.Sum256([]byte(namespace + "/" + name))
+	return "knp-policy-" + hex.EncodeToString(h[:])[:16]
 }
 
 // Empty reports whether this set allows nothing at all.
@@ -152,28 +151,20 @@ func AddressGroupName(selectorKey string) string {
 	return "knp-peers-" + hex.EncodeToString(h[:])[:16]
 }
 
-// EffectiveRules is everything the policies selecting this pod allow, in the
-// directions those policies isolate.
+// PolicyRules is what one policy allows: its own rules, in the directions that
+// same policy isolates.
 //
-// ⚠️ Only the isolated directions. A policy that isolates ingress and names
-// egress rules does not restrict egress at all -- Kubernetes reads the rules of
-// a direction it does not isolate as having no effect -- and writing them would
-// turn an unrestricted direction into one allowing only what was listed.
-func EffectiveRules(pod *corev1.Pod, translated []*Translated) RuleSet {
-	isolated := map[Direction]bool{}
-	for _, t := range translated {
-		for dir, yes := range t.Isolates {
-			if yes {
-				isolated[dir] = true
-			}
-		}
-	}
+// ⚠️ Its own directions, not the pod's. Kubernetes ignores the rules of a
+// direction a policy does not declare in policyTypes -- an `egress:` section
+// under `policyTypes: [Ingress]` has no effect at all. Deciding this from the
+// union across every policy selecting the pod, which is what a per-pod rule set
+// has to do, brings those inert rules back to life as soon as some other policy
+// isolates that direction. Per policy the question does not arise.
+func PolicyRules(t *Translated) RuleSet {
 	var keep []Rule
-	for _, t := range translated {
-		for _, r := range t.Rules {
-			if isolated[r.Direction] {
-				keep = append(keep, r)
-			}
+	for _, r := range t.Rules {
+		if t.Isolates[r.Direction] {
+			keep = append(keep, r)
 		}
 	}
 	return Expand(keep)
