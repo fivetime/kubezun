@@ -518,69 +518,17 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       修法:CRI 驱动的 delete 在"任务已不存在"时应继续走 RemoveContainer/
       RemovePodSandbox,而不是在 stop 上放弃。
       ⚠️ 顺带暴露**孤儿 capsule 治理确实还没做**:实测 4 个活 pod 对 93 个 capsule
-- [ ] **⚠️ NetworkPolicy 完全不生效，而且是静默 fail-open（2026-08-08 发现）**：
-      全仓库 0 处处理 NetworkPolicy / 安全组。租户的 N 个命名空间落进
-      **同一个 project、同一张 OVN 网、同一组安全组**，而租户建第二个命名空间
-      最常见的动机恰恰是隔离（prod/staging）。策略被 apiserver 收下、存起来、
-      `kubectl get netpol` 看得见，**没有任何东西执行它**。
-      这跟 `template.go:38` 已经写下的原则矛盾（"静默丢弃比失败更糟"）——
-      只是 NetworkPolicy 不是 pod 字段，逃掉了那条检查。
-      **先关上**：对 capsule 档租户拒绝 NetworkPolicy，让租户看到明确拒绝
-      而不是虚假的安全感（虚假隔离比没有隔离危险，没有隔离时人会自己小心）。
-      **再实现**：NetworkPolicy → Neutron 安全组挂到 capsule port；
-      基本 `podSelector`+端口能翻译，`namespaceSelector`/`ipBlock`/egress 组合很硬
-- [x] **✅ 查清：LB 地址由 provider 的端口持有（2026-08-08）**。
-      现象是两个 ACTIVE 的 LB 共用 `192.168.200.36`（probesvc 与 kube-dns），
-      流量归属未定义。
-      **查证**：`ovn-octavia-provider` 的 `create_vip_port`（`helper.py:3040`）总是自己建
-      `ovn-lb-vip-<lb_id>` 端口、带 `device_id=lb-<lb_id>`（注释说在镜像 amphora 的保护），
-      **并且忽略 API 传入的 `vip_port_id`**——所以"自己建端口占地址"这条路走不通，
-      实测每次创建都报 `IP address ... already allocated`，已回退（`0f59378`）。
-      **真正的原因**：那三个 LB 是在早先"删了重建"风暴里产生的，**没有 provider 端口**，
-      地址因此无人持有、被重新分配。干净创建的 LB 有端口（实测 `ffdde5d7`）。
-      **处置**：把三个老 LB 删掉重建，四个 LB 现在各自都有 provider 端口。
-      ⚠️ 留给将来：LB 被非正常删除时，其地址会变成无主，下一个 LB 可能抢走——
-      这是"删了重建"类 bug 的放大器，所以那类 bug 要当作数据面事故对待
-- [x] **✅ distroless 探针 helper（2026-08-08，kubezun `3749bc6`+`35bad6f`，
-      zun fork `e38751e9`+`4a6e6847`+`2471ed6c`）**。
-      **先排除了两条更省事的路**：
-      ① 学 kubelet 从节点发 HTTP 到 pod IP——实测三台计算节点，**根命名空间和任何 netns
-         都到不了 capsule 地址**（Kata 把地址搬进 guest，宿主 netns 只剩 tap），
-         所以 Zun 里"探针无法从别处到达容器"那句注释是对的，exec 躲不掉
-      ② 往每个 capsule 塞二进制——不必要，`_get_mounts` 本来就在建 host_path 挂载，
-         所以 helper 放宿主机 `/opt/kubezun/probe`、**只读挂进 `/.kubezun`** 即可：
-         每个 capsule 零负载，不动租户镜像
-      **实测通过**：`registry.k8s.io/coredns`（无 `/bin/sh`）+ `httpGet :8181/ready` → **1/1 Ready**
-      ⚠️ **过程中查出 Zun 一个死锁级 bug（`2471ed6c`）**：`_probe_due` 在 `started_at` 为空时
-      `return delay == 0`，于是 `initialDelaySeconds > 0` 的探针**永远不到期 → 永不执行 →
-      `_schedule_next` 永不写 `_next` → 永远不到期**。容器整个生命周期不就绪且日志里什么都没有
-      （不执行的探针无法失败）。而 `docs/tenant-guide.md` 恰恰**建议租户设 initialDelaySeconds**
-      （Kata 冷启动慢），所以它专打我们让人写的那种 pod。已改为回退到 `created_at`
-- [x] **✅ CoreDNS 跑成 capsule 的两层根因全部查清（2026-08-08，均非 kubezun 代码）**：
-      打标签后 CoreDNS 落到虚拟节点、拿到租户网络地址，但 capsule 每 ~60s 被删。
-      我先后猜了五次全错（节点心跳/informer 覆盖/kubezoo 对账/模板来回切/上游 VK 删除），
-      派 ultracode 全仓库摸排 + 对抗验证才定位。**两层**：
-      1. **cilium-operator 的 unmanaged-pod GC**（`cilium/operator/unmanagedpods/`）：
-         每 15s 删除 `phase=Running` 且带 `k8s-app=kube-dns`、无 CiliumEndpoint 的 pod。
-         capsule 不经 Cilium 数据面 → 永远没有 CiliumEndpoint → 永远"未管理" → 永删。
-         5 分钟冷却按 `namespace/name` 记，而 RS 每次换随机后缀，保险丝永不匹配。
-         **实测坐实**：operator 日志 `"Restarting unmanaged pod" ...unmanaged-pods-gc`
-         + pod 名一一对上 + `timeSincePodStarted≈44s`。
-         **解法**：kubezoo 把 CoreDNS 的 `k8s-app` 从 `kube-dns` 改成 `core-dns`
-         （Service 选择器 + RS 选择器同步），改后 **6 分钟纹丝不动**
-      2. **租户 router 的 SNAT 吞掉东西向 LB 流量**（数据面，非 kubezun 代码）：
-         改标签后 CoreDNS 稳定了，但 capsule 经 VIP 仍不通（连之前以为可用的
-         TCP Service 也超时——**整套 Service 数据面从没真正承载过流量**）。
-         `ovn-trace` 完整展开定位：capsule→VIP 经 router 时命中
-         `lr_out_snat: ct_snat(10.128.32.158)`，源被改成外网口，CoreDNS 应答回不来。
-         直连 pod 通是因为同子网纯 L2 不经 router。
-         **实测坐实**：删掉 router 的 SNAT 规则后，capsule 立即解析成功、经 VIP
-         wget 真的返回 HTML、短名/全名全通。
-         **解法已写进 `docs/bootstrap.md` §4**：pod 子网与 VIP 子网同一 address scope，
-         Neutron 就不装 SNAT（东西向不 NAT、出外网才 NAT）。
-         ⚠️ address-scope 消除 SNAT 是基于 Neutron 语义的推荐，**本环境只验证了
-         "删 SNAT 后通"**，文档里给了 operator 自测步骤。
-      ⚠️ 实验环境当前 SNAT 是我手删的临时状态（Neutron 可能自动同步加回），待恢复/重配
+- [x] **NetworkPolicy 已实现并端到端实测(2026-08-11)**——原"静默 fail-open"已消除。
+      设计见 DESIGN §7.7;实现 `pkg/netpol`(翻译/Neutron/规则集/reconciler/控制器/迁移)。
+      **实验床端到端**:租户 144 个 capsule 端口两阶段转换(attach 只加不减→连通性零影响;
+      detach 摘 default→**仍全通**),开启执行后写一条
+      "server 只收 role=client:8080":**client 通、stranger 被挡**;删掉策略两者恢复。
+      端口最终形态 `[knp-rules-<hash>, knp-allow-egress, knp-deny-all]`。
+      ⚠️ **默认关闭**(`--enforce-network-policy`),且开启前必须先跑两阶段转换——
+      逐个 pod 切会断流(§7.7.5a)。
+      ⚠️ **RBAC 需新增 `networkpolicies` 只读**(本次实测才发现清单里没有)。
+      **仍未做**:`ipBlock.except`/命名端口/ANP 的**准入拒绝**(kubezun 不在准入路径上,
+      只能发 Event,拒绝要 Kyverno 或 kubezoo 网关,§7.7.4);规则集组的 GC。
 - [ ] **⚠️ arm64 虚拟节点没有硬件却照样上报容量（2026-08-08 发现）**：
       CoreDNS 先被调度到 `111111-node-arm64`，全部 `CapsuleUnschedulable`（Placement 拒绝）。
       这正是"节点上报的 capacity 是承诺不是库存"的实例——虚拟节点按配额镜像容量，

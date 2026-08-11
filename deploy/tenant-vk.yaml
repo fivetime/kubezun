@@ -97,6 +97,14 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses/status"]
     verbs: ["update", "patch"]
+  # Read-only: a NetworkPolicy is enforced by putting the pod's port in
+  # security groups, so nothing is ever written back to the policy object.
+  # ⚠️ There is no status subresource to write to either, which is why a
+  # policy naming something unsupported can only be reported as an event and
+  # refused at admission, not on the object itself.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
