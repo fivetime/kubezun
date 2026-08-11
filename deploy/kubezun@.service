@@ -36,6 +36,23 @@ ExecStart=/usr/local/bin/kubezun \
   --client-ca-file /etc/kubezun/<TENANT>/client-ca.crt \
   --log-level info
 
+# NetworkPolicy. Uncomment only after converting this tenant, and in this
+# order:
+#
+#   kubezun --convert-network-policy=attach            # reports, writes nothing
+#   kubezun --convert-network-policy=attach --convert-confirm
+#   kubezun --convert-network-policy=detach --convert-confirm
+#
+# ⚠️ Both phases run over the whole tenant before this flag goes on. A tenant's
+# pods reach each other because all of them are in the project's default
+# security group, whose only ingress rule admits that same group -- so a pod
+# converted on its own stops being accepted by every pod still in the old
+# group, and the refusal happens at the receiver, putting the symptom on the
+# wrong pod. attach only ever adds, so nothing breaks while it runs; detach
+# then flips the tenant at once. DESIGN §7.7.5a.
+#
+#  --enforce-network-policy \
+
 # A tenant needing more than one architecture or availability zone adds a line
 # per node, above --log-level. They share this process's informers and
 # credential, so the second node costs a node object and a lease, not another

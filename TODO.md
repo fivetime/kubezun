@@ -518,6 +518,13 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       修法:CRI 驱动的 delete 在"任务已不存在"时应继续走 RemoveContainer/
       RemovePodSandbox,而不是在 stop 上放弃。
       ⚠️ 顺带暴露**孤儿 capsule 治理确实还没做**:实测 4 个活 pod 对 93 个 capsule
+- [ ] ⚠️ **实验床的 systemd unit 是手改的,和仓库模板已经分叉(2026-08-11 发现)**:
+      `/etc/systemd/system/kubezun@111111.service` 不是从 `deploy/kubezun@.service`
+      生成的实例,而是一份独立维护的文件(21 个参数 vs 模板的一套)。我这次为了开
+      NetworkPolicy **直接 sed 改了它** —— 那是错的:改动没进仓库、下次照模板部署就没了,
+      而且"实验床在跑什么"从此只能上机看、不能读仓库。
+      **和 `/opt/stack/zun` 是同一个形状**(CLAUDE.md 已经为 Zun 记过这条教训)。
+      要么让实例文件由模板生成,要么把两者的差异明确记下来
 - [x] **NetworkPolicy 已实现并端到端实测(2026-08-11)**——原"静默 fail-open"已消除。
       设计见 DESIGN §7.7;实现 `pkg/netpol`(翻译/Neutron/规则集/reconciler/控制器/迁移)。
       **实验床端到端**:租户 144 个 capsule 端口两阶段转换(attach 只加不减→连通性零影响;
