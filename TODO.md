@@ -806,9 +806,14 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       全集群认领,一个实例=一份跨全租户建卷的凭据(CPO cloud.conf 静态模型,kubetron
       记过同一问题);每租户一套则 provisioner 名裂开、共享目录不复存在。provision 半边
       留自研(三百行已测),缺的是目录不是机器
-- [ ] **SC 目录要经 kubezoo 发布**(kubezoo 侧,publishedStorageClasses/#91 那套):
-      上游建的 SC 租户默认看不见;不发布,租户视角 `get sc` 仍是空。生产环境按 control1
-      的 8 个 public volume type 各建一条(nvme-rep3/ssd-ec42/hdd-rep3…)
+- [x] **SC 目录已经 kubezoo 发布**(用户打标签发布,租户 `get sc` 看到
+      ceph/ceph-nvme/nfs-share 三条,名字干净无前缀)。生产环境照此按 control1 的
+      8 个 public volume type 各建一条
+- [x] **legacy 类已废(`b43d24e`)**:`<tenant>-knaas` 字符串匹配删除,目录是唯一入口。
+      已绑定的两个老 PVC 祖父化(绑定/挂载/回收都不再查类);legacy 名字的新 claim
+      停 Pending。⚠️ **纠错**:kubezoo 对 storageClassName **原样透传**(用户 grep 坐实,
+      无任何前缀逻辑)——我此前从 IngressClass 的前缀行为错误外推;PVC 里的 `111111-`
+      是当初测试时字面写进去的,不是网关加的。带前缀查找保留为容错,不再是依据
 - [ ] **AZ 拓扑 / WaitForFirstConsumer 未验**(Zun 场景特有):卷要开在 capsule 落的 AZ。
       现在 SC 全 Immediate + `KUBEZUN_STORAGE_AZ` 静态配;WFFC 需要 provisioner 从
       `volume.kubernetes.io/selected-node` 注解读虚拟节点拓扑,虚拟节点的 zone 标签
