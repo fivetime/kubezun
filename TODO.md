@@ -508,6 +508,16 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       我们代码里也就不用抄"定长 6 + 第 7 位是 dash"那段算术——那是 kubezoo 的概念。
       ⚠️ pod/Secret 的 informer 要随这个集合动态建，**不能先加命名空间再说**，
       否则就是拿跨租户的 Secret 缓存换一个 DNS
+- [ ] **⚠️ 运行时任务没了的 capsule 永远删不掉(2026-08-11 发现,实验床实例 42 个)**:
+      删除路径卡在 StopContainer,运行时报
+      `failed to get task for container <id>: context deadline exceeded`——
+      shim 已经不在了,而删除仍在等它。表现为 `DELETE` 回 500、capsule 停在 Stopped,
+      **反复删也删不掉**;实验床上最老的来自 2026-08-06,五天里无人回收。
+      ⚠️ **和 rbd watcher 那条同一个形状**:看起来能删、实际删不掉、而且没有任何东西
+      显示在占着它。对平台是计费问题(资源账上它还在)。
+      修法:CRI 驱动的 delete 在"任务已不存在"时应继续走 RemoveContainer/
+      RemovePodSandbox,而不是在 stop 上放弃。
+      ⚠️ 顺带暴露**孤儿 capsule 治理确实还没做**:实测 4 个活 pod 对 93 个 capsule
 - [ ] **⚠️ NetworkPolicy 完全不生效，而且是静默 fail-open（2026-08-08 发现）**：
       全仓库 0 处处理 NetworkPolicy / 安全组。租户的 N 个命名空间落进
       **同一个 project、同一张 OVN 网、同一组安全组**，而租户建第二个命名空间
