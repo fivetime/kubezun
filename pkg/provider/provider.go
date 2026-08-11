@@ -640,19 +640,17 @@ func (p *Provider) RunInContainer(ctx context.Context, namespace, podName, conta
 	if !tracked {
 		return errdefs.NotFoundf("pod %s/%s is not running on this node", namespace, podName)
 	}
-	if attach != nil && attach.TTY() {
-		// Zun runs the command to completion and answers with everything at
-		// once. There is no stream to attach a terminal to, and pretending
-		// otherwise would leave a caller waiting at a prompt that never reads.
-		return errNotImplemented(
-			"exec with a terminal needs a streaming endpoint Zun does not serve; " +
-				"run the command without -t")
-	}
-
 	index := containerIndex(pod, containerName)
 	if index < 0 {
 		return errdefs.NotFoundf(
 			"pod %s/%s has no container named %s", namespace, podName, containerName)
+	}
+
+	if attach != nil && attach.TTY() {
+		// A terminal is a session, not an answer: the command has not
+		// finished and the point is to type into it. Served on the runtime's
+		// own stream, through the proxy on the node holding the capsule.
+		return p.runInteractive(ctx, string(pod.UID), index, cmd, attach)
 	}
 
 	result, err := p.capsules.Exec(ctx, string(pod.UID), index, cmd)
