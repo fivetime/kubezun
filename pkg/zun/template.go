@@ -74,6 +74,10 @@ func Validate(pod *corev1.Pod) error {
 			// own kind of volume rather than as files: there is nothing to
 			// carry, and what a container writes there has to survive being
 			// written.
+		case v.PersistentVolumeClaim != nil:
+			// Resolved by the provider to the storage behind the claim; the
+			// capsule is told the Cinder volume or the NFS export, never the
+			// claim's name, which means nothing on that side.
 		case v.Projected != nil:
 			if strings.HasPrefix(v.Name, "kube-api-access-") {
 				// Kubernetes' own ServiceAccount admission injects this volume
@@ -222,6 +226,24 @@ type capsuleVolume struct {
 	Name     string        `json:"name"`
 	File     *fileData     `json:"file,omitempty"`
 	EmptyDir *emptyDirData `json:"emptyDir,omitempty"`
+	Cinder   *cinderData   `json:"cinder,omitempty"`
+	NFS      *nfsData      `json:"nfs,omitempty"`
+}
+
+// cinderData names an existing Cinder volume. The capsule never creates one:
+// provisioning belongs to the claim's reconciler, so a pod retried five times
+// attaches the same volume five times rather than creating five.
+type cinderData struct {
+	VolumeID string `json:"volumeID"`
+	// FSGroup is the pod's fsGroup; the volume is chowned to it after
+	// mounting, the way a kubelet does. Without it a fresh filesystem is
+	// root's and a non-root workload cannot write to its own volume.
+	FSGroup int64 `json:"fsGroup,omitempty"`
+}
+
+// nfsData is where a shared filesystem is mounted from.
+type nfsData struct {
+	Export string `json:"export"`
 }
 
 // emptyDirData is the pod's emptyDir, passed through as it was written.
@@ -318,6 +340,12 @@ type TemplateOptions struct {
 	// answers with the names their manifests use.
 	DNSNameservers []string
 
+	// Claims is the storage behind the pod's persistentVolumeClaim volumes,
+	// keyed by volume name, resolved by the provider before the template is
+	// built. A claim that cannot be resolved fails the pod there; by the time
+	// this map is read every claim volume the pod names has an entry.
+	Claims map[string]ClaimMount
+
 	// Architecture is the machine this node's capsules must run on. A node
 	// serves one architecture: its kubernetes.io/arch label is what got the
 	// pod scheduled here, and the capsule has to land on a host that matches
@@ -380,7 +408,7 @@ func BuildTemplate(pod *corev1.Pod, opts TemplateOptions) ([]byte, error) {
 		return nil, errdefs.InvalidInput("pod has no containers")
 	}
 
-	volumes, mounts, err := buildFileVolumes(pod, opts.Files)
+	volumes, mounts, err := buildFileVolumes(pod, opts.Files, opts.Claims)
 	if err != nil {
 		return nil, err
 	}
@@ -494,4 +522,15 @@ func SplitPodKey(key string) (namespace, name string, err error) {
 		return "", "", fmt.Errorf("malformed pod key %q", key)
 	}
 	return parts[0], parts[1], nil
+}
+
+// ClaimMount is the storage behind one persistentVolumeClaim volume, in the
+// terms the capsule needs: which service backs it and how to reach it.
+type ClaimMount struct {
+	// Kind is "cinder" for a block device, "nfs" for a shared filesystem.
+	Kind string
+	// VolumeID is the Cinder volume, when Kind is "cinder".
+	VolumeID string
+	// Export is "host:/path", when Kind is "nfs".
+	Export string
 }

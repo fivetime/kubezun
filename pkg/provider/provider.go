@@ -73,6 +73,11 @@ type Config struct {
 
 	// Tokens mints ServiceAccount tokens for pods that ask for one.
 	Tokens TokenMinter
+
+	// ResolveClaim turns a persistentVolumeClaim volume into the storage
+	// behind it. Nil means this node serves no claims, and a pod naming one is
+	// refused rather than started without its data.
+	ResolveClaim func(namespace, claim string) (zun.ClaimMount, error)
 }
 
 // Provider runs pods as Zun capsules for a single tenant.
@@ -193,6 +198,11 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 
 	searches, nameservers := p.dnsConfigFor(ctx, pod)
 
+	claims, err := p.resolveClaims(pod)
+	if err != nil {
+		return err
+	}
+
 	tpl, err := zun.BuildTemplate(pod, zun.TemplateOptions{
 		NetworkID:        p.cfg.NetworkID,
 		AvailabilityZone: p.cfg.AvailabilityZone,
@@ -201,6 +211,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 		Files:            files,
 		DNSSearches:      searches,
 		DNSNameservers:   nameservers,
+		Claims:           claims,
 	})
 	if err != nil {
 		return err
@@ -688,4 +699,34 @@ func recoverAs(err *error, op string) {
 	if r := recover(); r != nil {
 		*err = fmt.Errorf("%s panicked: %v", op, r)
 	}
+}
+
+// resolveClaims maps each of the pod's claim volumes to the storage behind it.
+//
+// Resolution failure fails the pod, loudly, before anything is created. A pod
+// started without its volume runs -- and writes into its own image, which
+// looks like it worked until the capsule is replaced and everything written is
+// gone. That is the least traceable failure storage can produce, and the one
+// this refuses to be.
+func (p *Provider) resolveClaims(pod *corev1.Pod) (map[string]zun.ClaimMount, error) {
+	var out map[string]zun.ClaimMount
+	for i := range pod.Spec.Volumes {
+		v := &pod.Spec.Volumes[i]
+		if v.PersistentVolumeClaim == nil {
+			continue
+		}
+		if p.cfg.ResolveClaim == nil {
+			return nil, fmt.Errorf(
+				"volume %s: this node was started without persistent volume support", v.Name)
+		}
+		m, err := p.cfg.ResolveClaim(pod.Namespace, v.PersistentVolumeClaim.ClaimName)
+		if err != nil {
+			return nil, fmt.Errorf("volume %s: %w", v.Name, err)
+		}
+		if out == nil {
+			out = make(map[string]zun.ClaimMount)
+		}
+		out[v.Name] = m
+	}
+	return out, nil
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/fivetime/kubezun/pkg/provider"
 	kservice "github.com/fivetime/kubezun/pkg/service"
 	vkset "github.com/fivetime/kubezun/pkg/vknode"
+	kvolume "github.com/fivetime/kubezun/pkg/volume"
 	"github.com/fivetime/kubezun/pkg/zun"
 )
 
@@ -62,6 +63,10 @@ type options struct {
 	clusterDomain   string
 	clusterDNS      string
 	dnsService      string
+	storageClass    string
+	shareType       string
+	volumeType      string
+	storageAZ       string
 	publicSvcs      bool
 }
 
@@ -121,6 +126,18 @@ func main() {
 			"--cluster-dns. Normally left empty: the address is a load balancer "+
 			"this process builds and cannot be known in advance, so it is read "+
 			"from --dns-service instead")
+	flag.StringVar(&o.storageClass, "storage-class", envOr("KUBEZUN_STORAGE_CLASS", "knaas"),
+		"StorageClass this process provisions for. A claim naming it gets a "+
+			"Cinder volume (ReadWriteOnce) or a Manila share (ReadWriteMany) on "+
+			"the tenant's own credential. Empty turns provisioning off")
+	flag.StringVar(&o.shareType, "share-type", os.Getenv("KUBEZUN_SHARE_TYPE"),
+		"Manila share type ReadWriteMany claims are created with; empty lets "+
+			"Manila pick its default")
+	flag.StringVar(&o.volumeType, "volume-type", os.Getenv("KUBEZUN_VOLUME_TYPE"),
+		"Cinder volume type claims are created with; empty lets Cinder pick "+
+			"its default, which must map to a running backend")
+	flag.StringVar(&o.storageAZ, "storage-availability-zone", os.Getenv("KUBEZUN_STORAGE_AZ"),
+		"availability zone storage is created in; empty lets the service choose")
 	flag.StringVar(&o.dnsService, "dns-service", envOr("KUBEZUN_DNS_SERVICE", "kube-system/kube-dns"),
 		"Service whose address capsules resolve through, named as the tenant "+
 			"writes it. Empty leaves capsules with the subnet's resolver, which "+
@@ -249,6 +266,46 @@ func run(o options) error {
 		}
 	}
 
+	// Storage: claims become Cinder volumes or Manila shares on the tenant's
+	// own credential. Before the node loop because each node's provider
+	// resolves claims through it.
+	var volRec *kvolume.Reconciler
+	if o.storageClass != "" {
+		blockC, err := kvolume.NewBlockStorageClient(zunClient)
+		if err != nil {
+			vklog.G(ctx).WithError(err).Warn(
+				"no block storage endpoint; ReadWriteOnce claims will be refused")
+			blockC = nil
+		}
+		sharedC, err := kvolume.NewSharedFSClient(zunClient)
+		if err != nil {
+			vklog.G(ctx).WithError(err).Warn(
+				"no shared filesystem endpoint; ReadWriteMany claims will be refused")
+			sharedC = nil
+		}
+		volRec = &kvolume.Reconciler{
+			Backend: &kvolume.Backend{
+				Block:            blockC,
+				Shared:           sharedC,
+				ShareType:        o.shareType,
+				VolumeType:       o.volumeType,
+				AvailabilityZone: o.storageAZ,
+			},
+			Claims:          set.ClaimInformer().Lister(),
+			Volumes:         set.VolumeInformer().Lister(),
+			Client:          client.CoreV1(),
+			StorageClass:    o.storageClass,
+			Tenant:          o.tenant,
+			ServesNamespace: set.Serves,
+		}
+		volCtl, err := kvolume.NewController(volRec, set.ClaimInformer(), set.VolumeInformer())
+		if err != nil {
+			return err
+		}
+		go volCtl.Run(ctx)
+		go volCtl.RunGC(ctx)
+	}
+
 	for _, spec := range specs {
 		nodeObj := knode.Build(knode.Options{
 			Name:       spec.name,
@@ -275,6 +332,23 @@ func run(o options) error {
 			Tenant:           o.tenant,
 			ClusterDNS:       splitList(o.clusterDNS),
 			DNSService:       o.dnsService,
+			ResolveClaim: func(namespace, claim string) (zun.ClaimMount, error) {
+				if volRec == nil {
+					return zun.ClaimMount{}, fmt.Errorf("persistent volumes are not enabled on this deployment")
+				}
+				m, err := volRec.MountFor(namespace, claim)
+				if err != nil {
+					return zun.ClaimMount{}, err
+				}
+				out := zun.ClaimMount{VolumeID: m.ID, Export: m.Export}
+				switch m.Kind {
+				case kvolume.Block:
+					out.Kind = "cinder"
+				case kvolume.Shared:
+					out.Kind = "nfs"
+				}
+				return out, nil
+			},
 			Tokens: func(ctx context.Context, namespace, account string,
 				req *authv1.TokenRequest) (*authv1.TokenRequest, error) {
 				return client.CoreV1().ServiceAccounts(namespace).

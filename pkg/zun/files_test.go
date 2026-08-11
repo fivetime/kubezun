@@ -40,6 +40,12 @@ type renderedTemplate struct {
 				Medium    string `json:"medium"`
 				SizeLimit int64  `json:"sizeLimit"`
 			} `json:"emptyDir"`
+			Cinder *struct {
+				VolumeID string `json:"volumeID"`
+			} `json:"cinder"`
+			NFS *struct {
+				Export string `json:"export"`
+			} `json:"nfs"`
 		} `json:"volumes"`
 		Containers []struct {
 			Name   string `json:"name"`
@@ -121,8 +127,6 @@ func TestSubPathMountsOneKeyAtTheMountPath(t *testing.T) {
 func TestUnsupportedVolumesAreRefusedNotDropped(t *testing.T) {
 	for name, source := range map[string]corev1.VolumeSource{
 		"downwardAPI": {DownwardAPI: &corev1.DownwardAPIVolumeSource{}},
-		"pvc": {PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-			ClaimName: "data"}},
 	} {
 		pod := podWithConfigVolume()
 		pod.Spec.Volumes = []corev1.Volume{{Name: "v", VolumeSource: source}}
@@ -248,4 +252,63 @@ func TestEmptyDirMediumAndSizeLimitAreCarried(t *testing.T) {
 		return
 	}
 	t.Fatal("the emptyDir volume was not emitted")
+}
+
+// A claim volume reaches the capsule as the storage behind it -- the Cinder
+// volume or the NFS export -- never as the claim's name, which means nothing
+// on the Zun side. A claim the provider failed to resolve fails the pod:
+// starting without the volume leaves the application writing into its image.
+func TestClaimVolumesAreEmittedAsTheirStorage(t *testing.T) {
+	pod := podWithConfigVolume()
+	pod.Spec.Volumes = append(pod.Spec.Volumes,
+		corev1.Volume{Name: "data", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "db-data"}}},
+		corev1.Volume{Name: "media", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "shared-media"}}},
+	)
+	pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts,
+		corev1.VolumeMount{Name: "data", MountPath: "/var/lib/data"},
+		corev1.VolumeMount{Name: "media", MountPath: "/media"},
+	)
+
+	tpl, err := BuildTemplate(pod, TemplateOptions{
+		Files: map[string]map[string][]byte{"cfg": {"app.conf": []byte("x")}},
+		Claims: map[string]ClaimMount{
+			"data":  {Kind: "cinder", VolumeID: "vol-123"},
+			"media": {Kind: "nfs", Export: "10.0.0.5:/shares/abc"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildTemplate: %v", err)
+	}
+	var got renderedTemplate
+	if err := json.Unmarshal(tpl, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	var cinder, nfs bool
+	for _, v := range got.Spec.Volumes {
+		switch v.Name {
+		case "data":
+			if v.Cinder == nil || v.Cinder.VolumeID != "vol-123" {
+				t.Errorf("data volume: %+v, want cinder vol-123", v)
+			}
+			cinder = true
+		case "media":
+			if v.NFS == nil || v.NFS.Export != "10.0.0.5:/shares/abc" {
+				t.Errorf("media volume: %+v, want the export", v)
+			}
+			nfs = true
+		}
+	}
+	if !cinder || !nfs {
+		t.Fatalf("volumes missing: cinder=%v nfs=%v: %+v", cinder, nfs, got.Spec.Volumes)
+	}
+
+	// The same pod with the claims unresolved must fail, not start hollow.
+	if _, err := BuildTemplate(pod, TemplateOptions{
+		Files: map[string]map[string][]byte{"cfg": {"app.conf": []byte("x")}},
+	}); err == nil {
+		t.Fatal("an unresolved claim was accepted; the pod would run without its data")
+	}
 }

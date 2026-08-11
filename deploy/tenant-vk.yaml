@@ -52,6 +52,15 @@ rules:
   - apiGroups: [""]
     resources: ["serviceaccounts/token"]
     verbs: ["create"]
+  # Provisioning the storage behind a tenant's claims. The claims are watched;
+  # the volumes are created by this process and deleted by it when the claim
+  # goes -- there is no CSI controller in this cluster to do either.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete"]
   # Which namespaces this process serves. Watched rather than configured: a
   # tenant creates namespaces while this is running, and a fixed list leaves one
   # made afterwards with no compute and nothing saying why.

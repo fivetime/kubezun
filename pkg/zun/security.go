@@ -21,6 +21,11 @@ import (
 type containerSecurity struct {
 	RunAsUser  *int64 `json:"runAsUser,omitempty"`
 	RunAsGroup *int64 `json:"runAsGroup,omitempty"`
+	// FSGroup is pod-level only in Kubernetes and travels per container here
+	// because the runtime applies groups per container. It is what makes a
+	// chowned volume writable: the ownership half without this half mounts
+	// clean and refuses every write.
+	FSGroup *int64 `json:"fsGroup,omitempty"`
 	// ReadOnlyRootFilesystem and AllowPrivilegeEscalation are pointers because
 	// false is a request, not an absence: allowPrivilegeEscalation: false is
 	// what PodSecurity restricted demands, and treating it as unset would drop
@@ -40,6 +45,7 @@ func effectiveSecurity(pod *corev1.Pod, c *corev1.Container) containerSecurity {
 	if ps := pod.Spec.SecurityContext; ps != nil {
 		out.RunAsUser = ps.RunAsUser
 		out.RunAsGroup = ps.RunAsGroup
+		out.FSGroup = ps.FSGroup
 		out.SeccompProfile = ps.SeccompProfile
 	}
 	if cs := c.SecurityContext; cs != nil {
@@ -60,7 +66,7 @@ func effectiveSecurity(pod *corev1.Pod, c *corev1.Container) containerSecurity {
 }
 
 func (s containerSecurity) empty() bool {
-	return s.RunAsUser == nil && s.RunAsGroup == nil &&
+	return s.RunAsUser == nil && s.RunAsGroup == nil && s.FSGroup == nil &&
 		s.ReadOnlyRootFilesystem == nil && s.AllowPrivilegeEscalation == nil &&
 		s.Capabilities == nil && s.SeccompProfile == nil
 }

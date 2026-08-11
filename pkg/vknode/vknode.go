@@ -53,6 +53,8 @@ type Set struct {
 	configMaps corev1informers.ConfigMapInformer
 	services   corev1informers.ServiceInformer
 	slices     discoveryv1informers.EndpointSliceInformer
+	claims     corev1informers.PersistentVolumeClaimInformer
+	volumes    corev1informers.PersistentVolumeInformer
 	ingresses  networkingv1informers.IngressInformer
 
 	// namespaces is the watched set this process serves. Nil falls back to
@@ -142,6 +144,8 @@ func NewSet(opts SetOptions) (*Set, error) {
 	set.services = scmFactory.Core().V1().Services()
 	set.slices = scmFactory.Discovery().V1().EndpointSlices()
 	set.ingresses = scmFactory.Networking().V1().Ingresses()
+	set.claims = scmFactory.Core().V1().PersistentVolumeClaims()
+	set.volumes = scmFactory.Core().V1().PersistentVolumes()
 	// Read on demand rather than cached: see listers.go for why a cache is the
 	// wrong shape here even though the interface asks for an informer.
 	set.secrets = secretInformerShim{
@@ -207,6 +211,10 @@ func (s *Set) EndpointSliceInformer() discoveryv1informers.EndpointSliceInformer
 // IngressInformer backs the ingress controller, which, like the Service
 // controller, runs once per process: load balancers belong to the tenant.
 func (s *Set) IngressInformer() networkingv1informers.IngressInformer { return s.ingresses }
+
+// ClaimInformer and VolumeInformer back the persistent volume provisioner.
+func (s *Set) ClaimInformer() corev1informers.PersistentVolumeClaimInformer { return s.claims }
+func (s *Set) VolumeInformer() corev1informers.PersistentVolumeInformer     { return s.volumes }
 
 // Node is one virtual node: its node controller, its pod controller, and its
 // kubelet API endpoint.

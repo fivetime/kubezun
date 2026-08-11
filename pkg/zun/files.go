@@ -17,18 +17,24 @@ import (
 // Zun's local volume driver writes one file per volume, so a configMap with
 // three keys becomes three capsule volumes, each mounted at its own full path.
 // The container sees the same directory either way.
-func buildFileVolumes(pod *corev1.Pod, files map[string]map[string][]byte) (
-	[]capsuleVolume, map[string][]volumeMount, error) {
+func buildFileVolumes(pod *corev1.Pod, files map[string]map[string][]byte,
+	claims map[string]ClaimMount) ([]capsuleVolume, map[string][]volumeMount, error) {
 
 	var volumes []capsuleVolume
 	mounts := make(map[string][]volumeMount)
 
-	// The pod's emptyDir volumes, by name: they are mounted as directories,
-	// not rendered as files, so they are looked up separately below.
+	// The pod's emptyDir and claim volumes, by name: they are mounted as
+	// directories, not rendered as files, so they are looked up separately
+	// below.
 	dirs := make(map[string]*corev1.EmptyDirVolumeSource)
+	claimOf := make(map[string]string)
 	for i := range pod.Spec.Volumes {
-		if v := &pod.Spec.Volumes[i]; v.EmptyDir != nil {
+		v := &pod.Spec.Volumes[i]
+		if v.EmptyDir != nil {
 			dirs[v.Name] = v.EmptyDir
+		}
+		if v.PersistentVolumeClaim != nil {
+			claimOf[v.Name] = v.PersistentVolumeClaim.ClaimName
 		}
 	}
 	// A capsule volume name is matched by string, so each has to be unique
@@ -37,6 +43,37 @@ func buildFileVolumes(pod *corev1.Pod, files map[string]map[string][]byte) (
 
 	for _, c := range allContainers(pod) {
 		for _, m := range c.VolumeMounts {
+			if claim, ok := claimOf[m.Name]; ok {
+				resolved, have := claims[m.Name]
+				if !have {
+					// The provider resolves every claim before building the
+					// template, so reaching here is a bug there -- but failing
+					// the pod is still right: starting it without the volume
+					// leaves the application writing into its own image.
+					return nil, nil, fmt.Errorf(
+						"volume %s: claim %s was not resolved", m.Name, claim)
+				}
+				if !emitted[m.Name] {
+					vol := capsuleVolume{Name: m.Name}
+					switch resolved.Kind {
+					case "cinder":
+						vol.Cinder = &cinderData{VolumeID: resolved.VolumeID,
+							FSGroup: fsGroupOf(pod)}
+					case "nfs":
+						vol.NFS = &nfsData{Export: resolved.Export}
+					default:
+						return nil, nil, fmt.Errorf(
+							"volume %s: claim %s resolves to unknown storage %q",
+							m.Name, claim, resolved.Kind)
+					}
+					volumes = append(volumes, vol)
+					emitted[m.Name] = true
+				}
+				mounts[c.Name] = append(mounts[c.Name], volumeMount{
+					Name: m.Name, MountPath: m.MountPath,
+				})
+				continue
+			}
 			if src, ok := dirs[m.Name]; ok {
 				// One capsule volume per pod volume, mounted at the path each
 				// container asked for. Every container that names it gets the
@@ -119,6 +156,14 @@ func volumeName(volume, key string) (string, error) {
 			"volume %q key %q: name is longer than the 255 characters Zun accepts", volume, key)
 	}
 	return name, nil
+}
+
+// fsGroupOf is the pod's declared fsGroup, or zero when it has none.
+func fsGroupOf(pod *corev1.Pod) int64 {
+	if sc := pod.Spec.SecurityContext; sc != nil && sc.FSGroup != nil {
+		return *sc.FSGroup
+	}
+	return 0
 }
 
 // emptyDirOf translates the pod's emptyDir into the capsule's.
