@@ -22,6 +22,17 @@ import (
 const (
 	AllowIngress = "knp-allow-ingress"
 	AllowEgress  = "knp-allow-egress"
+
+	// DenyAll carries no rules at all, and exists so that a port's group list
+	// is never empty.
+	//
+	// ⚠️ Empty and absent are opposite meanings and one API cannot tell them
+	// apart. Neutron injects the project's default group -- which is
+	// permissive -- when a port names no groups, so a pod isolated in both
+	// directions, whose correct group list is empty, would come up reachable
+	// by everything. Naming a group that allows nothing says deny-all in a way
+	// that survives the round trip.
+	DenyAll = "knp-deny-all"
 )
 
 // managedBy marks what this controller owns, so a sweep can tell our objects
@@ -41,6 +52,9 @@ type Neutron struct {
 // direction. One combined group, detached from a pod whose policy names only
 // Ingress, would take that pod's egress with it.
 func (n *Neutron) EnsureBaseline(ctx context.Context) (ingressID, egressID string, err error) {
+	if _, err := n.EnsureDenyAll(ctx); err != nil {
+		return "", "", err
+	}
 	ingressID, err = n.ensureGroup(ctx, AllowIngress,
 		"kubezun: a pod no policy has isolated for ingress")
 	if err != nil {
@@ -110,6 +124,30 @@ func (n *Neutron) ensureBaselineRules(ctx context.Context, groupID, direction st
 		}
 	}
 	return nil
+}
+
+// EnsureDenyAll makes sure the anchor group exists and is empty.
+//
+// ⚠️ Emptying it is the work. Neutron adds two egress allow-all rules to every
+// group it creates, so a group made to allow nothing arrives allowing all
+// egress -- and a pod isolated in both directions would keep talking outward
+// while appearing to be fully isolated.
+func (n *Neutron) EnsureDenyAll(ctx context.Context) (string, error) {
+	id, err := n.ensureGroup(ctx, DenyAll,
+		"kubezun: allows nothing; carried so a port's group list is never empty")
+	if err != nil {
+		return "", err
+	}
+	have, err := n.rulesOf(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	for _, r := range have {
+		if err := rules.Delete(ctx, n.Client, r.ID).ExtractErr(); err != nil && !isGone(err) {
+			return "", fmt.Errorf("emptying the deny-all group: %w", err)
+		}
+	}
+	return id, nil
 }
 
 func (n *Neutron) ensureGroup(ctx context.Context, name, description string) (string, error) {

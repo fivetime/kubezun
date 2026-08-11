@@ -31,7 +31,7 @@ type Reconciler struct {
 	PortOf func(pod *corev1.Pod) string
 
 	baseline struct {
-		ingress, egress string
+		ingress, egress, denyAll string
 	}
 }
 
@@ -41,7 +41,11 @@ func (r *Reconciler) EnsureBaseline(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	r.baseline.ingress, r.baseline.egress = ingress, egress
+	denyAll, err := r.Neutron.EnsureDenyAll(ctx)
+	if err != nil {
+		return err
+	}
+	r.baseline.ingress, r.baseline.egress, r.baseline.denyAll = ingress, egress, denyAll
 	return nil
 }
 
@@ -51,7 +55,7 @@ func (r *Reconciler) EnsureBaseline(ctx context.Context) error {
 // default is a pod that stops being reachable the moment the tenant is
 // converted (§7.7.5a).
 func (r *Reconciler) BaselineGroups() []string {
-	return []string{r.baseline.ingress, r.baseline.egress}
+	return []string{r.baseline.denyAll, r.baseline.ingress, r.baseline.egress}
 }
 
 // GroupsFor is the security group list a pod's port should carry.
@@ -63,7 +67,7 @@ func (r *Reconciler) BaselineGroups() []string {
 // away, and nothing else changes -- which is why there are two groups and not
 // one.
 func (r *Reconciler) GroupsFor(pod *corev1.Pod) ([]string, error) {
-	if r.baseline.ingress == "" || r.baseline.egress == "" {
+	if r.baseline.ingress == "" || r.baseline.egress == "" || r.baseline.denyAll == "" {
 		return nil, fmt.Errorf("the baseline security groups have not been resolved yet")
 	}
 	policies, err := r.policiesFor(pod.Namespace)
@@ -74,19 +78,17 @@ func (r *Reconciler) GroupsFor(pod *corev1.Pod) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	var groups []string
+	// ⚠️ Always present, so the list is never empty. Neutron reads a port with
+	// no groups as "use the project default", which is permissive -- so a pod
+	// isolated in both directions would come up reachable by everything, which
+	// is the exact opposite of what its policy asked for.
+	groups := []string{r.baseline.denyAll}
 	if len(isolated[Ingress]) == 0 {
 		groups = append(groups, r.baseline.ingress)
 	}
 	if len(isolated[Egress]) == 0 {
 		groups = append(groups, r.baseline.egress)
 	}
-	// ⚠️ Not an empty list. Neutron injects the project's default group when
-	// the attribute is absent, and an empty list is a different thing from an
-	// unset one -- but a port with no groups at all is also a port whose
-	// isolation nothing can later relax. A pod isolated in both directions
-	// carries the rule-set groups its policies produced, and until those exist
-	// it carries nothing, which is deny-all: the safe direction.
 	sort.Strings(groups)
 	return groups, nil
 }

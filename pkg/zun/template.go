@@ -278,6 +278,7 @@ type template struct {
 	Metadata         metadata `json:"metadata"`
 	Spec             spec     `json:"spec"`
 	Nets             []net    `json:"nets,omitempty"`
+	SecurityGroups   []string `json:"securityGroups,omitempty"`
 	AvailabilityZone string   `json:"availabilityZone,omitempty"`
 	Architecture     string   `json:"architecture,omitempty"`
 }
@@ -345,6 +346,22 @@ type TemplateOptions struct {
 	// answers with the names their manifests use.
 	DNSNameservers []string
 
+	// SecurityGroups is what the capsule's port should carry, decided from the
+	// NetworkPolicies that select this pod.
+	//
+	// ⚠️ Named at creation, not attached afterwards. The groups are what make a
+	// pod reachable at all -- a tenant's pods reach each other because they
+	// share a group, not because they share a network -- so a capsule that
+	// comes up with the wrong ones is a capsule that is briefly reachable by
+	// the wrong people, or briefly reachable by nobody.
+	//
+	// ⚠️ An empty list is not the same as none. None lets Zun fall through to
+	// the project's default group; empty is the deny-all a pod isolated in both
+	// directions is supposed to have. The distinction is carried by omitempty
+	// only working on nil, so callers must not "helpfully" replace an empty
+	// slice with nil.
+	SecurityGroups []string
+
 	// Claims is the storage behind the pod's persistentVolumeClaim volumes,
 	// keyed by volume name, resolved by the provider before the template is
 	// built. A claim that cannot be resolved fails the pod there; by the time
@@ -394,6 +411,7 @@ func BuildTemplate(pod *corev1.Pod, opts TemplateOptions) ([]byte, error) {
 	case opts.NetworkID != "":
 		t.Nets = []net{{Network: opts.NetworkID}}
 	}
+	t.SecurityGroups = opts.SecurityGroups
 
 	for _, c := range pod.Spec.InitContainers {
 		built, err := buildContainer(pod, c)

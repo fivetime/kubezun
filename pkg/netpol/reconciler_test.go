@@ -25,6 +25,7 @@ func policyLister(t *testing.T, list ...*networkingv1.NetworkPolicy) networkingv
 func reconciler(t *testing.T, list ...*networkingv1.NetworkPolicy) *Reconciler {
 	r := &Reconciler{Policies: policyLister(t, list...)}
 	r.baseline.ingress, r.baseline.egress = "sg-in", "sg-eg"
+	r.baseline.denyAll = "sg-deny"
 	return r
 }
 
@@ -42,7 +43,7 @@ func TestAnUnselectedPodKeepsBothGroups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 {
+	if len(got) != 3 {
 		t.Fatalf("a pod no policy selects lost a group: %v", got)
 	}
 }
@@ -63,13 +64,13 @@ func TestIsolationTakesOnlyTheDirectionAsked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0] != "sg-eg" {
+	if len(got) != 2 || got[0] != "sg-deny" || got[1] != "sg-eg" {
 		t.Errorf("an ingress policy should leave egress alone: %v", got)
 	}
 
 	// A pod the policy does not select is untouched.
 	got, _ = r.GroupsFor(pod("prod", "db", map[string]string{"app": "db"}))
-	if len(got) != 2 {
+	if len(got) != 3 {
 		t.Errorf("an unselected pod was isolated: %v", got)
 	}
 
@@ -77,7 +78,7 @@ func TestIsolationTakesOnlyTheDirectionAsked(t *testing.T) {
 	// Neutron network, so a policy leaking across them would be invisible in
 	// the substrate and wrong in exactly the case namespaces are made for.
 	got, _ = r.GroupsFor(pod("staging", "web", map[string]string{"app": "web"}))
-	if len(got) != 2 {
+	if len(got) != 3 {
 		t.Errorf("a policy reached into another namespace: %v", got)
 	}
 }
@@ -96,8 +97,12 @@ func TestBothDirectionsLeaveNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 0 {
-		t.Errorf("deny-all in both directions still carried groups: %v", got)
+	// ⚠️ One group, not none. A port naming no groups is a port Neutron gives
+	// the project default to, so the deny-all case has to be said out loud --
+	// otherwise the most restrictive policy a tenant can write produces the
+	// most permissive port.
+	if len(got) != 1 || got[0] != "sg-deny" {
+		t.Errorf("deny-all should carry exactly the anchor group: %v", got)
 	}
 }
 
