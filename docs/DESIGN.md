@@ -32,6 +32,12 @@ EndpointSlice / 同一个 Octavia LB 后面可同时站两种后端，租户升�
 （B1 同样做到后者，不构成差异）。B1 的空节点列表就让它空着——这是两档之间诚实的产品边界，
 也是升级 B2' 的理由。
 
+⚠️ **还有第三档，不在本文档范围内**：Zun 原生的"容器即虚机"——在 Horizon 里点几下建一个
+容器、开个终端就能用，面向不需要理解 K8s 和集群概念的用户。它与 B2' 共用同一套
+containerd + kata + VMM 和同一份 OpenStack 资源账，只是入口从 kubectl 换成 zun-ui。
+本文档只讲 kubezun（K8s 那半）；**那一档的定案、驱动分工与实现进度见
+`/root/k8s-zun-provider/openstack/zun/FORK.md` §4**，改 Zun 前先读它。
+
 ### 1.1 为什么必须是 VK + Zun（结构论证）
 
 **Node 对象不是一条记录，是一份契约**：注册者必须履行 kubelet 的全部义务——lease 心跳 +
