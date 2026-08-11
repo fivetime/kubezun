@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -35,6 +36,10 @@ type renderedTemplate struct {
 			File *struct {
 				Contents string `json:"contents"`
 			} `json:"file"`
+			EmptyDir *struct {
+				Medium    string `json:"medium"`
+				SizeLimit int64  `json:"sizeLimit"`
+			} `json:"emptyDir"`
 		} `json:"volumes"`
 		Containers []struct {
 			Name   string `json:"name"`
@@ -115,7 +120,6 @@ func TestSubPathMountsOneKeyAtTheMountPath(t *testing.T) {
 // application reads simply absent.
 func TestUnsupportedVolumesAreRefusedNotDropped(t *testing.T) {
 	for name, source := range map[string]corev1.VolumeSource{
-		"emptyDir":    {EmptyDir: &corev1.EmptyDirVolumeSource{}},
 		"downwardAPI": {DownwardAPI: &corev1.DownwardAPIVolumeSource{}},
 		"pvc": {PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 			ClaimName: "data"}},
@@ -161,4 +165,87 @@ func TestVolumeNameSanitisesKeys(t *testing.T) {
 	if _, err := volumeName("", ""); err == nil {
 		t.Error("an empty name was accepted; Zun requires at least two characters")
 	}
+}
+
+// An emptyDir is the scratch space nearly every workload assumes: a sidecar
+// writing where another reads, a cache directory, the writable path an image
+// with a read-only root filesystem needs. Refusing it refused most charts.
+func TestEmptyDirIsSharedByTheContainersThatMountIt(t *testing.T) {
+	pod := podWithConfigVolume()
+	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+		Name:         "scratch",
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+	})
+	pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts,
+		corev1.VolumeMount{Name: "scratch", MountPath: "/cache"})
+	pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
+		Name: "sidecar", Image: "busybox",
+		VolumeMounts: []corev1.VolumeMount{{Name: "scratch", MountPath: "/shared"}},
+	})
+
+	got := render(t, pod, nil)
+
+	var dirs int
+	for _, v := range got.Spec.Volumes {
+		if v.EmptyDir != nil {
+			dirs++
+			if v.Name != "scratch" {
+				t.Errorf("emptyDir volume named %q", v.Name)
+			}
+		}
+	}
+	// One volume, however many containers mount it: Zun matches volumes to
+	// mounts by name, so declaring it twice is two volumes claiming one name.
+	if dirs != 1 {
+		t.Fatalf("got %d emptyDir volumes, want 1: %+v", dirs, got.Spec.Volumes)
+	}
+
+	paths := map[string]string{}
+	for _, c := range got.Spec.Containers {
+		for _, m := range c.Mounts {
+			if m.Name == "scratch" {
+				paths[c.Name] = m.MountPath
+			}
+		}
+	}
+	if len(paths) != 2 {
+		t.Fatalf("both containers should mount it, got %v", paths)
+	}
+	if paths["sidecar"] != "/shared" {
+		t.Errorf("each container mounts it where it asked: %v", paths)
+	}
+}
+
+// "Memory" is a tmpfs, and the size limit is real there because the kernel
+// enforces it. Both have to reach the capsule or a caller asking for memory
+// silently gets a directory on a disk.
+func TestEmptyDirMediumAndSizeLimitAreCarried(t *testing.T) {
+	limit := resource.MustParse("64Mi")
+	pod := podWithConfigVolume()
+	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+		Name: "shm",
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			Medium: corev1.StorageMediumMemory, SizeLimit: &limit,
+		}},
+	})
+	pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts,
+		corev1.VolumeMount{Name: "shm", MountPath: "/dev/shm"})
+
+	got := render(t, pod, nil)
+	for _, v := range got.Spec.Volumes {
+		if v.Name != "shm" {
+			continue
+		}
+		if v.EmptyDir == nil {
+			t.Fatal("no emptyDir on the volume")
+		}
+		if v.EmptyDir.Medium != "Memory" {
+			t.Errorf("medium = %q, want Memory", v.EmptyDir.Medium)
+		}
+		if v.EmptyDir.SizeLimit != 64*1024*1024 {
+			t.Errorf("sizeLimit = %d bytes, want 67108864", v.EmptyDir.SizeLimit)
+		}
+		return
+	}
+	t.Fatal("the emptyDir volume was not emitted")
 }

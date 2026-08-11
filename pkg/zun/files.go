@@ -22,12 +22,37 @@ func buildFileVolumes(pod *corev1.Pod, files map[string]map[string][]byte) (
 
 	var volumes []capsuleVolume
 	mounts := make(map[string][]volumeMount)
+
+	// The pod's emptyDir volumes, by name: they are mounted as directories,
+	// not rendered as files, so they are looked up separately below.
+	dirs := make(map[string]*corev1.EmptyDirVolumeSource)
+	for i := range pod.Spec.Volumes {
+		if v := &pod.Spec.Volumes[i]; v.EmptyDir != nil {
+			dirs[v.Name] = v.EmptyDir
+		}
+	}
 	// A capsule volume name is matched by string, so each has to be unique
 	// across the whole capsule even when two containers mount the same volume.
 	emitted := make(map[string]bool)
 
 	for _, c := range allContainers(pod) {
 		for _, m := range c.VolumeMounts {
+			if src, ok := dirs[m.Name]; ok {
+				// One capsule volume per pod volume, mounted at the path each
+				// container asked for. Every container that names it gets the
+				// same directory, which is the whole point of an emptyDir: a
+				// sidecar writes where another reads.
+				if !emitted[m.Name] {
+					volumes = append(volumes, capsuleVolume{
+						Name: m.Name, EmptyDir: emptyDirOf(src),
+					})
+					emitted[m.Name] = true
+				}
+				mounts[c.Name] = append(mounts[c.Name], volumeMount{
+					Name: m.Name, MountPath: m.MountPath,
+				})
+				continue
+			}
 			content, ok := files[m.Name]
 			if !ok {
 				// Either a volume kind Validate refused, or one whose content
@@ -94,6 +119,19 @@ func volumeName(volume, key string) (string, error) {
 			"volume %q key %q: name is longer than the 255 characters Zun accepts", volume, key)
 	}
 	return name, nil
+}
+
+// emptyDirOf translates the pod's emptyDir into the capsule's.
+//
+// A size limit is passed on in bytes. Kubernetes enforces it on a tmpfs and,
+// on a node directory, only by evicting the pod later -- a capsule has no
+// eviction, so there it is carried for the record and not pretended about.
+func emptyDirOf(src *corev1.EmptyDirVolumeSource) *emptyDirData {
+	out := &emptyDirData{Medium: string(src.Medium)}
+	if src.SizeLimit != nil {
+		out.SizeLimit = src.SizeLimit.Value()
+	}
+	return out
 }
 
 func allContainers(pod *corev1.Pod) []corev1.Container {

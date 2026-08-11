@@ -69,6 +69,11 @@ func Validate(pod *corev1.Pod) error {
 				"there is no shared host filesystem behind a virtual node")
 		case v.ConfigMap != nil, v.Secret != nil:
 			// Rendered into the capsule as files; see TemplateOptions.Files.
+		case v.EmptyDir != nil:
+			// Scratch space shared by the capsule's containers. Carried as its
+			// own kind of volume rather than as files: there is nothing to
+			// carry, and what a container writes there has to survive being
+			// written.
 		case v.Projected != nil:
 			if strings.HasPrefix(v.Name, "kube-api-access-") {
 				// Kubernetes' own ServiceAccount admission injects this volume
@@ -208,12 +213,25 @@ type spec struct {
 	Volumes        []capsuleVolume `json:"volumes,omitempty"`
 }
 
-// capsuleVolume carries one file's content with the capsule. Zun's local volume
-// driver writes a single file per volume, so a configMap with three keys
-// becomes three of these.
+// capsuleVolume is one volume of a capsule: a file whose content travels with
+// it, or a directory that lives and dies with it.
+//
+// Zun's local volume driver writes a single file per volume, so a configMap
+// with three keys becomes three of these.
 type capsuleVolume struct {
-	Name string    `json:"name"`
-	File *fileData `json:"file,omitempty"`
+	Name     string        `json:"name"`
+	File     *fileData     `json:"file,omitempty"`
+	EmptyDir *emptyDirData `json:"emptyDir,omitempty"`
+}
+
+// emptyDirData is the pod's emptyDir, passed through as it was written.
+type emptyDirData struct {
+	// Medium is "Memory" for a tmpfs, empty for a directory on the node.
+	Medium string `json:"medium,omitempty"`
+	// SizeLimit in bytes, enforced only for a tmpfs -- the kernel does it
+	// there. On a node directory nothing enforces it, and the capsule API says
+	// so rather than accepting a limit that does not hold.
+	SizeLimit int64 `json:"sizeLimit,omitempty"`
 }
 
 type fileData struct {
