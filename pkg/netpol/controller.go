@@ -122,8 +122,42 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 	for i := 0; i < workers; i++ {
 		go wait.UntilWithContext(ctx, c.work, time.Second)
 	}
+	go wait.UntilWithContext(ctx, c.sweep, SweepInterval)
 	<-ctx.Done()
 	return nil
+}
+
+// SweepInterval is how often unused groups are collected.
+//
+// ⚠️ Slow on purpose. Removing a security group object makes ovn-northd
+// rebuild every port group in the cloud, so the cost is paid by every other
+// tenant, by nova and by Octavia. A tenant editing policies through an
+// afternoon should cost that once, not once per edit -- and nothing is
+// harmed by a group that outlives its policy by half an hour.
+const SweepInterval = 30 * time.Minute
+
+func (c *Controller) sweep(ctx context.Context) {
+	live := map[string]bool{}
+	policies, err := c.reconciler.Policies.List(labels.Everything())
+	if err != nil {
+		log.G(ctx).WithError(err).Warn("skipping the group sweep; the policy list is unavailable")
+		return
+	}
+	for _, p := range policies {
+		live[p.Namespace+"/"+p.Name] = true
+	}
+	// ⚠️ An empty live set with a populated cache is a tenant with no
+	// policies, which is ordinary. An empty one because the cache never
+	// synced would delete every group the tenant has, so the sweep runs only
+	// after the caches are up -- which Run has already waited for.
+	removed, err := c.reconciler.Neutron.Sweep(ctx, live, c.reconciler.ServesNamespace)
+	if err != nil {
+		log.G(ctx).WithError(err).Warn("the group sweep did not finish; it will run again")
+	}
+	if removed > 0 {
+		log.G(ctx).WithField("removed", removed).
+			Info("collected security and address groups no policy needs")
+	}
 }
 
 func (c *Controller) work(ctx context.Context) {

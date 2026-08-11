@@ -169,7 +169,7 @@ func (r *Reconciler) policyGroupsFor(ctx context.Context, pod *corev1.Pod, polic
 		}
 
 		id, err := r.Neutron.EnsureRuleSet(ctx,
-			GroupNameFor(p.Namespace, p.Name), set, peers)
+			GroupNameFor(p.Namespace, p.Name), p.Namespace+"/"+p.Name, set, peers)
 		if err != nil {
 			return nil, err
 		}

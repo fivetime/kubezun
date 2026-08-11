@@ -120,11 +120,8 @@ func desiredGroups(phase Phase, current, baseline []string, defaultID string) []
 }
 
 func (n *Neutron) defaultGroupID(ctx context.Context) (string, error) {
-	id, err := n.findGroup(ctx, "default")
-	if err != nil {
-		return "", err
-	}
-	return id, nil
+	id, _, err := n.findGroup(ctx, "default")
+	return id, err
 }
 
 func sorted(in []string) []string {

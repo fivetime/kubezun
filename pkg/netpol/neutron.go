@@ -150,10 +150,10 @@ func (n *Neutron) EnsureDenyAll(ctx context.Context) (string, error) {
 	return id, nil
 }
 
-// findGroup returns a security group's id, or "" when the project has none by
-// that name.
-func (n *Neutron) findGroup(ctx context.Context, name string) (string, error) {
-	var found string
+// findGroup returns a security group's id and description, or "" when the
+// project has none by that name.
+func (n *Neutron) findGroup(ctx context.Context, name string) (string, string, error) {
+	var found, description string
 	err := groups.List(n.Client, groups.ListOpts{Name: name}).EachPage(ctx,
 		func(_ context.Context, page pagination.Page) (bool, error) {
 			list, err := groups.ExtractGroups(page)
@@ -161,23 +161,33 @@ func (n *Neutron) findGroup(ctx context.Context, name string) (string, error) {
 				return false, err
 			}
 			if len(list) > 0 {
-				found = list[0].ID
+				found, description = list[0].ID, list[0].Description
 				return false, nil
 			}
 			return true, nil
 		})
 	if err != nil {
-		return "", fmt.Errorf("looking for security group %s: %w", name, err)
+		return "", "", fmt.Errorf("looking for security group %s: %w", name, err)
 	}
-	return found, nil
+	return found, description, nil
 }
 
 func (n *Neutron) ensureGroup(ctx context.Context, name, description string) (string, error) {
-	found, err := n.findGroup(ctx, name)
+	found, have, err := n.findGroup(ctx, name)
 	if err != nil {
 		return "", err
 	}
 	if found != "" {
+		if have != description {
+			// ⚠️ Rewritten when it differs, because the description is not
+			// decoration: the sweep reads which policy a group belongs to out
+			// of it, and a group left carrying an older wording is one the
+			// sweep can never identify and so can never collect.
+			if _, err := groups.Update(ctx, n.Client, found,
+				groups.UpdateOpts{Description: &description}).Extract(); err != nil {
+				return "", fmt.Errorf("correcting the description of %s: %w", name, err)
+			}
+		}
 		return found, nil
 	}
 	g, err := groups.Create(ctx, n.Client, groups.CreateOpts{
@@ -208,9 +218,14 @@ func (n *Neutron) rulesOf(ctx context.Context, groupID string) ([]rules.SecGroup
 // The peers map turns a selector key into the address group id the rule refers
 // to; every key in the set must be present, because a rule naming a group that
 // does not exist is refused and leaves the set half written.
-func (n *Neutron) EnsureRuleSet(ctx context.Context, name string, set RuleSet, peers map[string]string) (string, error) {
+func (n *Neutron) EnsureRuleSet(ctx context.Context, name, policyRef string, set RuleSet, peers map[string]string) (string, error) {
+	// ⚠️ The policy this belongs to goes in the description, because the name
+	// is a hash and nothing can be read back out of it. Without it the sweep
+	// cannot tell a group whose policy is gone from one belonging to a
+	// namespace this process does not serve -- and it would have to choose
+	// between leaking groups forever and deleting another process's.
 	id, err := n.ensureGroup(ctx, name,
-		"kubezun: what one NetworkPolicy allows")
+		"kubezun: what NetworkPolicy "+policyRef+" allows")
 	if err != nil {
 		return "", err
 	}
@@ -264,6 +279,134 @@ func (n *Neutron) EnsureRuleSet(ctx context.Context, name string, set RuleSet, p
 		}
 	}
 	return id, nil
+}
+
+// policyOf reads back which policy a group was made for, or "" if it was not
+// made by this.
+func policyOf(description string) string {
+	const prefix = "kubezun: what NetworkPolicy "
+	const suffix = " allows"
+	if !strings.HasPrefix(description, prefix) || !strings.HasSuffix(description, suffix) {
+		return ""
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(description, prefix), suffix)
+}
+
+// Sweep removes the groups no live policy needs any more.
+//
+// ⚠️ Deliberately not driven by policy deletion. Deleting a security group
+// object makes ovn-northd rebuild every port group in the cloud -- other
+// tenants', nova's, Octavia's -- so the cost of removing one is paid by
+// everybody. Doing it on a slow timer, in a batch, spends that once for
+// whatever has accumulated instead of once per policy a tenant edits.
+//
+// live is the set of policy references ("namespace/name") that still exist.
+// A group is removed only when this process serves its namespace and the
+// policy is gone: a group whose policy exists but whose pods have all left is
+// kept, because the pods will come back and rebuilding it costs more than
+// leaving it.
+func (n *Neutron) Sweep(ctx context.Context, live map[string]bool, serves func(string) bool) (removed int, err error) {
+	var all []groups.SecGroup
+	err = groups.List(n.Client, groups.ListOpts{}).EachPage(ctx,
+		func(_ context.Context, page pagination.Page) (bool, error) {
+			got, err := groups.ExtractGroups(page)
+			if err != nil {
+				return false, err
+			}
+			all = append(all, got...)
+			return true, nil
+		})
+	if err != nil {
+		return 0, fmt.Errorf("listing security groups: %w", err)
+	}
+
+	// ⚠️ Decide what goes before working out what is still referenced. A peer
+	// set pointed at only by a group that is about to be deleted is not
+	// referenced by anything, and computing that from the list as read leaves
+	// it behind for a whole sweep interval -- correct in the end, and a
+	// needlessly long end.
+	doomed := map[string]struct{}{}
+	for _, g := range all {
+		if !strings.HasPrefix(g.Name, "knp-policy-") {
+			continue
+		}
+		ref := policyOf(g.Description)
+		if ref == "" {
+			// Not identifiable, so not ours to judge: it may belong to a
+			// namespace this process does not serve.
+			continue
+		}
+		namespace, _, ok := strings.Cut(ref, "/")
+		if !ok || !serves(namespace) || live[ref] {
+			continue
+		}
+		doomed[g.ID] = struct{}{}
+	}
+
+	// Which peer sets the survivors still point at -- including groups
+	// belonging to namespaces this process does not serve, whose rules are
+	// just as real.
+	referenced := map[string]struct{}{}
+	for _, g := range all {
+		if !strings.HasPrefix(g.Name, "knp-policy-") {
+			continue
+		}
+		if _, going := doomed[g.ID]; going {
+			continue
+		}
+		for _, r := range g.Rules {
+			if r.RemoteAddressGroupID != "" {
+				referenced[r.RemoteAddressGroupID] = struct{}{}
+			}
+		}
+	}
+
+	for _, g := range all {
+		if _, going := doomed[g.ID]; !going {
+			continue
+		}
+		if err := groups.Delete(ctx, n.Client, g.ID).ExtractErr(); err != nil {
+			if isConflict(err) || isGone(err) {
+				// Still on a port somewhere: a pod this process has not
+				// finished reconciling. It will come round again.
+				continue
+			}
+			return removed, fmt.Errorf("removing %s: %w", g.Name, err)
+		}
+		removed++
+	}
+
+	// Peer sets are named by prefix and referenced by id, so an unreferenced
+	// one is unreferenced for everybody.
+	var peers []addressgroups.AddressGroup
+	err = addressgroups.List(n.Client, addressgroups.ListOpts{}).EachPage(ctx,
+		func(_ context.Context, page pagination.Page) (bool, error) {
+			got, err := addressgroups.ExtractGroups(page)
+			if err != nil {
+				return false, err
+			}
+			peers = append(peers, got...)
+			return true, nil
+		})
+	if err != nil {
+		return removed, fmt.Errorf("listing address groups: %w", err)
+	}
+	for _, p := range peers {
+		if !strings.HasPrefix(p.Name, "knp-peers-") {
+			continue
+		}
+		if _, still := referenced[p.ID]; still {
+			continue
+		}
+		if err := addressgroups.Delete(ctx, n.Client, p.ID).ExtractErr(); err != nil {
+			if isConflict(err) || isGone(err) {
+				continue
+			}
+			return removed, fmt.Errorf("removing peer set %s: %w", p.Name, err)
+		}
+		removed++
+	}
+	return removed, nil
 }
 
 // EnsureAddressGroup makes sure a peer set exists under a stable name.
