@@ -539,6 +539,19 @@ func serverTLS(o options) (*tls.Config, *vkset.CertReloader, error) {
 	if err := nodeutil.WithCAFromPath(o.clientCA)(cfg); err != nil {
 		return nil, nil, fmt.Errorf("load client CA: %w", err)
 	}
+	// Ask for a client certificate; do not demand one. The helper above sets
+	// RequireAndVerifyClientCert, which refuses at the TLS handshake anything
+	// that authenticates another way -- and metrics-server authenticates with
+	// a bearer token, as kubelet has always allowed. A real kubelet requests
+	// rather than requires for exactly this reason.
+	//
+	// Nothing is given away by it. The certificate was never what made this
+	// port safe: every request is still authenticated (x509 or TokenReview)
+	// and authorized (SubjectAccessReview on nodes/<name>) before it reaches a
+	// handler, and a caller with neither credential is refused there with 401.
+	// What the strict setting bought was a slightly earlier "no" for one kind
+	// of caller, at the price of "kubectl top" reporting <unknown> forever.
+	cfg.ClientAuth = tls.RequestClientCert
 	return cfg, reloader, nil
 }
 
