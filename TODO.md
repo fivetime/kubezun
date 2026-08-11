@@ -820,12 +820,16 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       分支直接返回,**它刚建的卷无人记录**——winner 的 PV 记的是 winner 的 ID,sweep
       永远认不出这个孤儿,漏成账单。现在输家在收养 winner 的 PV 前先删掉自己建的存储。
       实测:新 claim 恰好 1 个卷,删除后归零
-- [ ] **孤儿节点资源清扫(NFS 挂载 + krbd map,两例都已实际发生)**:
+- [x] **孤儿节点资源清扫(2026-08-11,fork `22faac5a`)**——卷走了但节点上的东西留下:
       ①NameError 窗口漏过一个 share 挂载;②dbpod 删除后 /dev/rbd0 仍 map 在 node-04
-      (Cinder 侧 attachment 已摘、卷 available,但异步删除撞 watcher 失败回滚——
-      "PV 删了、卷永远删不掉"就是这个样子,已手工 unmap+删)。
-      Zun 式做法:周期任务对比节点实际状态(/proc/mounts + rbd showmapped)与 volmap 表,
-      无主的 unmount/unmap;不必抄 nova-incus 的 journal
+      (Cinder 侧 attachment 已摘、卷 available,但异步删除撞 watcher 失败回滚)。
+      **不是美观问题**:映射着的 rbd 镜像持有 Ceph watcher,Ceph 拒绝删除被 watch 的
+      镜像——表现为"卷可用但删不掉,且没有任何东西看起来占着它"。而一旦 volmap 行
+      没了,**再没有任何东西会回来找这些残留**:引用它们的记录正是被删掉的那条。
+      实现:周期任务(`[compute] reclaim_node_resources_interval`,默认 600s)比对
+      `/proc/mounts` + `rbd showmapped` 与 volmap 表,无主的 unmount/unmap。
+      ⚠️ **rbd 侧靠镜像名里的 Cinder 卷 id 反查**——volmap 自己的 uuid 根本没传到设备上。
+      两种形状都实际发生过并已实测清掉
 - [x] **跨节点 RWX 实测通过(2026-08-11)**:`rwx-far` 落 node-06 → 授权集自动变两条
       `/32`,它读到 node-04 上 4 个 pod 写的全部内容;删掉它 → 收缩回一条,**留下的正是
       仍有 pod 的那个节点**,其余 pod 读写不受影响。
