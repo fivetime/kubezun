@@ -244,6 +244,15 @@ func (r *Reconciler) provision(ctx context.Context, claim *corev1.PersistentVolu
 
 	created, err := r.Client.PersistentVolumes().Create(ctx, pv, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
+		// A concurrent reconcile won: the informer cache had not seen its PV
+		// yet, so this one provisioned too. The storage THIS attempt created
+		// backs nothing and is recorded nowhere -- the winner's PV names the
+		// winner's storage id -- so no sweep will ever recognise it. Losing
+		// the race must pay its own bill on the way out.
+		if rmErr := r.Backend.Delete(ctx, made.Kind, made.ID); rmErr != nil {
+			log.G(ctx).WithError(rmErr).WithField("id", made.ID).
+				Warn("could not remove the storage of a lost provisioning race")
+		}
 		return r.Client.PersistentVolumes().Get(ctx, pv.Name, metav1.GetOptions{})
 	}
 	if err != nil {
