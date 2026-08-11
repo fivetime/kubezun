@@ -518,8 +518,14 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       29 个降到 5 个,且 5 个全部有 pod 在跑。
       ⚠️ 修好这步才露出下一步:并发删 13 个时 Neutron 拒连(`Remote end closed
       connection`)——那是负载不是逻辑,放慢重试即全部通过。
-      ⚠️ **孤儿 capsule 治理仍然没做**:这次是我手工清的,没有任何东西会定期比对
-      "活着的 pod"和"存在的 capsule"
+      ⚠️ **纠正:孤儿 capsule 治理早就做了**(`pkg/provider/orphans.go`,每 2 分钟一轮)。
+      积压不是因为它不存在,而是两件事叠加,现在都没了:① 13 次删除里 9 次撞上上面
+      那个删不掉的 bug;② **192 次/天被"这个 capsule 没有节点名,不敢动"挡住**——那批
+      是加 `knaas.io/node-name` 标签之前建的历史遗留,已手工清空,新建的一律带标签。
+      **它分辨归属靠六道闸,每道都 fail-closed**:pod 标签必须能解出 key(⚠️ **租户
+      直接用 Zun API 建的 capsule 没有这些标签,整个跳过**)、只看 capsule 不看原生
+      容器、`node-name` 必须等于本节点、命名空间必须是本节点服务的、按 **pod UID**
+      而不是名字匹配、5 分钟宽限期
 - [ ] ⚠️ **实验床的 systemd unit 是手改的,和仓库模板已经分叉(2026-08-11 发现)**:
       `/etc/systemd/system/kubezun@111111.service` 不是从 `deploy/kubezun@.service`
       生成的实例,而是一份独立维护的文件(21 个参数 vs 模板的一套)。我这次为了开

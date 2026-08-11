@@ -81,17 +81,26 @@ func (p *Provider) orphansAmong(ctx context.Context, key string, capsules []*zun
 	//
 	// A capsule carrying no node name predates the label. Leaving it alone
 	// leaks the tenant's quota; deleting it could destroy another node's
-	// running workload. Neither is free, so it is left to a human, logged once
-	// per sweep rather than silently.
+	// running workload. Neither is free, so it is left to a human.
+	//
+	// ⚠️ Reported once per capsule, not once per sweep. Every two minutes
+	// forever is 700 identical lines a day for the same two objects, which
+	// does not escalate anything -- it teaches whoever reads the log that
+	// this line means nothing. Measured at 192 in one day here.
 	var mine []*zun.Capsule
 	for _, c := range capsules {
 		switch c.NodeName() {
 		case p.cfg.NodeName:
 			mine = append(mine, c)
 		case "":
+			if p.reportedUnowned(c.UUID) {
+				break
+			}
 			log.G(ctx).WithField("pod", key).WithField("capsule", c.Name()).
 				Info("orphan sweep left a capsule alone: it names no node, so " +
-					"whether it belongs to this node cannot be established")
+					"whether it belongs to this node cannot be established. " +
+					"It holds quota until somebody decides; this is said once " +
+					"per capsule, not once per sweep")
 		}
 	}
 	capsules = mine
@@ -142,6 +151,21 @@ func (p *Provider) orphansAmong(ctx context.Context, key string, capsules []*zun
 		orphans = append(orphans, c)
 	}
 	return orphans
+}
+
+// reportedUnowned records that a capsule with no owner has been mentioned, and
+// says whether it already had been.
+func (p *Provider) reportedUnowned(uuid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.unowned == nil {
+		p.unowned = map[string]struct{}{}
+	}
+	if _, seen := p.unowned[uuid]; seen {
+		return true
+	}
+	p.unowned[uuid] = struct{}{}
+	return false
 }
 
 func (p *Provider) orphanLoop(ctx context.Context) {

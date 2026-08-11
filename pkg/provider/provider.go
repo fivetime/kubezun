@@ -105,6 +105,10 @@ type Provider struct {
 
 	notify func(*corev1.Pod)
 
+	// unowned remembers the capsules the orphan sweep has already said it
+	// cannot judge, so it says so once each rather than every two minutes.
+	unowned map[string]struct{}
+
 	// policies decides which security groups a pod's port carries, from the
 	// NetworkPolicies that select it. Nil on a deployment that does not
 	// enforce them, which leaves every capsule on the project default.
