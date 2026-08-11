@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 
+	"github.com/fivetime/kubezun/pkg/netpol"
 	"github.com/fivetime/kubezun/pkg/service"
 	"github.com/fivetime/kubezun/pkg/zun"
 )
@@ -103,6 +104,11 @@ type Provider struct {
 	deleted map[string]types.UID
 
 	notify func(*corev1.Pod)
+
+	// policies decides which security groups a pod's port carries, from the
+	// NetworkPolicies that select it. Nil on a deployment that does not
+	// enforce them, which leaves every capsule on the project default.
+	policies *netpol.Reconciler
 
 	// cpuRates remembers each container's last CPU counter so the next reading
 	// becomes a rate. Zun reports a cumulative count, as the runtime does.
@@ -203,7 +209,19 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 		return err
 	}
 
+	// ⚠️ Decided before the capsule exists, not attached to it afterwards. A
+	// tenant's pods reach each other because they share a security group, not
+	// because they share a network, so a capsule created with the wrong groups
+	// is reachable by the wrong people for as long as it takes to correct --
+	// and a capsule created with none is given the project's permissive
+	// default, which no policy can then take back.
+	groups, err := p.securityGroupsFor(ctx, pod)
+	if err != nil {
+		return err
+	}
+
 	tpl, err := zun.BuildTemplate(pod, zun.TemplateOptions{
+		SecurityGroups:   groups,
 		NetworkID:        p.cfg.NetworkID,
 		AvailabilityZone: p.cfg.AvailabilityZone,
 		Architecture:     p.cfg.Architecture,
@@ -502,6 +520,66 @@ func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, con
 		data = data[len(data)-opts.LimitBytes:]
 	}
 	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// UsePolicies turns on NetworkPolicy enforcement, and gives the reconciler the
+// two things only the provider knows: where a pod's port is, and that this
+// provider is the one placing it.
+//
+// ⚠️ Enabling this on a tenant whose capsules already exist is not a per-pod
+// change. A tenant's pods reach each other because every one of them is in the
+// project's default group, whose only ingress rule admits members of that same
+// group; a pod moved out of it stops being accepted by every pod still in it,
+// and the failure lands on the receiver. So the groups have to be added
+// everywhere first and the default removed everywhere second (DESIGN §7.7.5a).
+func (p *Provider) UsePolicies(r *netpol.Reconciler) {
+	if r == nil {
+		return
+	}
+	r.PortOf = p.portOf
+	p.policies = r
+}
+
+// portOf finds the Neutron port behind a pod's capsule.
+//
+// Read from the capsule rather than remembered here: the capsule is where the
+// address actually lives, and a cache of it would go stale exactly when a
+// capsule is rebuilt -- which is when the port matters most.
+func (p *Provider) portOf(pod *corev1.Pod) string {
+	capsule, err := p.capsules.Get(context.Background(), "kubezun-"+string(pod.UID))
+	if err != nil {
+		return ""
+	}
+	for _, addresses := range capsule.Addresses {
+		for _, a := range addresses {
+			if a.Port != "" {
+				return a.Port
+			}
+		}
+	}
+	return ""
+}
+
+// securityGroupsFor is what this pod's port should carry.
+//
+// Nil when no policy controller is running, which leaves the field out of the
+// template entirely and lets Zun fall through to the project default -- the
+// behaviour of every deployment before NetworkPolicy was enforced at all. ⚠️
+// That is not the same as an empty list, which means "reach nothing"; the two
+// must not be conflated anywhere along this path.
+func (p *Provider) securityGroupsFor(ctx context.Context, pod *corev1.Pod) ([]string, error) {
+	if p.policies == nil {
+		return nil, nil
+	}
+	groups, err := p.policies.GroupsFor(pod)
+	if err != nil {
+		// Refusing to place the pod is the safe direction. Creating it with
+		// the default group would give a pod its policy says is isolated the
+		// most permissive port the project has.
+		return nil, fmt.Errorf("deciding the security groups for %s/%s: %w",
+			pod.Namespace, pod.Name, err)
+	}
+	return groups, nil
 }
 
 // dnsConfigFor decides what the pod's resolver is told: which servers to ask,

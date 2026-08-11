@@ -23,6 +23,7 @@ import (
 	"k8s.io/apiserver/pkg/server/dynamiccertificates"
 
 	kingress "github.com/fivetime/kubezun/pkg/ingress"
+	"github.com/fivetime/kubezun/pkg/netpol"
 	knode "github.com/fivetime/kubezun/pkg/node"
 	"github.com/fivetime/kubezun/pkg/provider"
 	kservice "github.com/fivetime/kubezun/pkg/service"
@@ -35,39 +36,40 @@ import (
 var version = "v1.36.3-knaas.1"
 
 type options struct {
-	nodeName        string
-	tenant          string
-	namespaces      string
-	zone            string
-	zunAZ           string
-	arch            string
-	networkID       string
-	kubeconfig      string
-	listenAddr      string
-	internalIP      string
-	capacityCPU     string
-	capacityMem     string
-	capacityPod     string
-	logLevel        string
-	nsSelector      string
-	ingressProvider string
-	ingressClass    string
-	leaseSeconds    int
-	nodes           nodeSpecList
-	tlsCert         string
-	tlsKey          string
-	clientCA        string
-	vipSubnet       string
-	vipNetwork      string
-	floatingNet     string
-	clusterDomain   string
-	clusterDNS      string
-	dnsService      string
-	storageClass    string
-	shareType       string
-	volumeType      string
-	storageAZ       string
-	publicSvcs      bool
+	nodeName             string
+	tenant               string
+	namespaces           string
+	zone                 string
+	zunAZ                string
+	arch                 string
+	networkID            string
+	kubeconfig           string
+	listenAddr           string
+	internalIP           string
+	capacityCPU          string
+	capacityMem          string
+	capacityPod          string
+	logLevel             string
+	nsSelector           string
+	ingressProvider      string
+	ingressClass         string
+	leaseSeconds         int
+	nodes                nodeSpecList
+	tlsCert              string
+	tlsKey               string
+	clientCA             string
+	vipSubnet            string
+	vipNetwork           string
+	floatingNet          string
+	clusterDomain        string
+	clusterDNS           string
+	dnsService           string
+	storageClass         string
+	shareType            string
+	volumeType           string
+	storageAZ            string
+	enforceNetworkPolicy bool
+	publicSvcs           bool
 }
 
 func main() {
@@ -137,6 +139,14 @@ func main() {
 	flag.StringVar(&o.volumeType, "volume-type", os.Getenv("KUBEZUN_VOLUME_TYPE"),
 		"Cinder volume type claims are created with; empty lets Cinder pick "+
 			"its default, which must map to a running backend")
+	flag.BoolVar(&o.enforceNetworkPolicy, "enforce-network-policy",
+		os.Getenv("KUBEZUN_ENFORCE_NETWORK_POLICY") == "true",
+		"enforce NetworkPolicy by placing each capsule's port in security groups. "+
+			"⚠️ Off by default and not a per-pod switch: a tenant's pods reach each "+
+			"other because all of them are in the project's default group, whose "+
+			"only ingress rule admits that same group, so a pod moved out of it "+
+			"stops being accepted by every pod still in it. Turning this on "+
+			"converts the whole tenant; see DESIGN §7.7.5a for the order")
 	flag.StringVar(&o.storageAZ, "storage-availability-zone", os.Getenv("KUBEZUN_STORAGE_AZ"),
 		"availability zone storage is created in; empty lets the service choose")
 	flag.StringVar(&o.dnsService, "dns-service", envOr("KUBEZUN_DNS_SERVICE", "kube-system/kube-dns"),
@@ -308,6 +318,36 @@ func run(o options) error {
 		go volCtl.RunGC(ctx)
 	}
 
+	// NetworkPolicy. Off unless asked for, because switching it on is a
+	// tenant-wide conversion rather than a setting: pods reach each other by
+	// sharing the project's default security group, so a half-converted tenant
+	// is one where the converted and unconverted halves cannot talk, and the
+	// failure lands on whichever side is still in the old group.
+	var netpolRec *netpol.Reconciler
+	if o.enforceNetworkPolicy {
+		netC, err := netpol.NewClient(zunClient)
+		if err != nil {
+			return fmt.Errorf("no network endpoint, which NetworkPolicy needs: %w", err)
+		}
+		netpolRec = &netpol.Reconciler{
+			Neutron:         &netpol.Neutron{Client: netC},
+			Pods:            set.AllPodsInformer().Lister(),
+			Policies:        set.PolicyInformer().Lister(),
+			ServesNamespace: set.Serves,
+		}
+		netpolCtl, err := netpol.NewController(netpolRec,
+			set.AllPodsInformer(), set.PolicyInformer())
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := netpolCtl.Run(ctx, 2); err != nil {
+				vklog.G(ctx).WithError(err).Error(
+					"the NetworkPolicy controller stopped; policies are no longer enforced")
+			}
+		}()
+	}
+
 	for _, spec := range specs {
 		nodeObj := knode.Build(knode.Options{
 			Name:       spec.name,
@@ -363,6 +403,10 @@ func run(o options) error {
 		if err != nil {
 			return err
 		}
+		// The provider is what knows where a pod's port is, and the reconciler
+		// is what knows which groups belong on it. Neither can do the job
+		// alone, and one reconciler serves every node this process runs.
+		p.UsePolicies(netpolRec)
 
 		var auth nodeutil.Auth
 		if tlsConfig != nil {

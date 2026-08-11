@@ -58,6 +58,8 @@ type Set struct {
 	volumes    corev1informers.PersistentVolumeInformer
 	classes    storagev1informers.StorageClassInformer
 	ingresses  networkingv1informers.IngressInformer
+	policies   networkingv1informers.NetworkPolicyInformer
+	allPods    corev1informers.PodInformer
 
 	// namespaces is the watched set this process serves. Nil falls back to
 	// fixed, the list given at startup.
@@ -146,6 +148,12 @@ func NewSet(opts SetOptions) (*Set, error) {
 	set.services = scmFactory.Core().V1().Services()
 	set.slices = scmFactory.Discovery().V1().EndpointSlices()
 	set.ingresses = scmFactory.Networking().V1().Ingresses()
+	set.policies = scmFactory.Networking().V1().NetworkPolicies()
+	// ⚠️ Every pod this process serves, not the per-node informers above. A
+	// policy's peers are pods wherever they run, and a peer set built from one
+	// node's pods would silently allow only the part of the selector that
+	// happens to be local.
+	set.allPods = scmFactory.Core().V1().Pods()
 	set.claims = scmFactory.Core().V1().PersistentVolumeClaims()
 	set.volumes = scmFactory.Core().V1().PersistentVolumes()
 	set.classes = scmFactory.Storage().V1().StorageClasses()
@@ -214,6 +222,12 @@ func (s *Set) EndpointSliceInformer() discoveryv1informers.EndpointSliceInformer
 // IngressInformer backs the ingress controller, which, like the Service
 // controller, runs once per process: load balancers belong to the tenant.
 func (s *Set) IngressInformer() networkingv1informers.IngressInformer { return s.ingresses }
+
+// PolicyInformer and AllPodsInformer back the NetworkPolicy controller, which
+// runs once per process: a policy's subjects and peers are pods on any of this
+// tenant's nodes, and security groups belong to the tenant.
+func (s *Set) PolicyInformer() networkingv1informers.NetworkPolicyInformer { return s.policies }
+func (s *Set) AllPodsInformer() corev1informers.PodInformer                { return s.allPods }
 
 // ClaimInformer and VolumeInformer back the persistent volume provisioner.
 func (s *Set) ClaimInformer() corev1informers.PersistentVolumeClaimInformer { return s.claims }
