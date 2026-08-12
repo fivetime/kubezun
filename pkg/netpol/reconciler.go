@@ -49,15 +49,6 @@ func (r *Reconciler) EnsureBaseline(ctx context.Context) error {
 	return nil
 }
 
-// BaselineGroups are the two groups every pod carries until a policy takes one
-// away. A capsule must be created with them: a pod that arrives without them
-// is a pod nothing can reach, and one that arrives carrying only the project
-// default is a pod that stops being reachable the moment the tenant is
-// converted (§7.7.5a).
-func (r *Reconciler) BaselineGroups() []string {
-	return []string{r.baseline.denyAll, r.baseline.ingress, r.baseline.egress}
-}
-
 // GroupsFor is the security group list a pod's port should carry.
 //
 // ⚠️ The whole of the isolation semantic lives in this function. A pod no
@@ -152,17 +143,17 @@ func (r *Reconciler) policyGroupsFor(ctx context.Context, pod *corev1.Pod, polic
 		}
 		sort.Strings(keys)
 
+		// Only that they exist, not what is in them. ⚠️ Membership belongs to
+		// the policy, not to whichever pod happened to be reconciled: this
+		// runs for the policy's SUBJECT pods, and a peer pod is usually not
+		// one of them. Syncing here meant a new replica of a peer was never
+		// added and a deleted one never removed -- the set drifted into
+		// whatever it held the last time a subject pod was touched.
+		// SyncPolicyPeers, driven by its own queue, owns the contents.
 		peers := make(map[string]string, len(set.Peers))
 		for _, key := range keys {
 			id, err := r.Neutron.EnsureAddressGroup(ctx, AddressGroupName(key))
 			if err != nil {
-				return nil, err
-			}
-			addresses, err := r.AddressesFor(key, set.Peers[key])
-			if err != nil {
-				return nil, err
-			}
-			if err := r.Neutron.SyncAddresses(ctx, id, addresses); err != nil {
 				return nil, err
 			}
 			peers[key] = id
@@ -255,6 +246,42 @@ func (r *Reconciler) namespacesMatching(sel PeerSelector) ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// SyncPolicyPeers makes the address groups one policy refers to hold exactly
+// the pods its peer selectors currently match.
+//
+// ⚠️ Keyed by the policy, and triggered by ANY pod in a namespace this process
+// serves -- because a peer is a pod the policy does not select, so nothing
+// about the pod itself says which policies care about it. Working that out
+// backwards is more state than recomputing the sets, and the sets are what has
+// to be right.
+func (r *Reconciler) SyncPolicyPeers(ctx context.Context, p *networkingv1.NetworkPolicy) error {
+	t, err := Translate(p)
+	if err != nil {
+		return err
+	}
+	set := PolicyRules(t)
+	keys := make([]string, 0, len(set.Peers))
+	for key := range set.Peers {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		id, err := r.Neutron.EnsureAddressGroup(ctx, AddressGroupName(key))
+		if err != nil {
+			return err
+		}
+		addresses, err := r.AddressesFor(key, set.Peers[key])
+		if err != nil {
+			return err
+		}
+		if err := r.Neutron.SyncAddresses(ctx, id, addresses); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ReportRefusals writes what a policy asked for and did not get, so it is

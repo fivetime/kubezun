@@ -697,11 +697,12 @@ Neutron 的基线本来就是拒绝：开了 port_security 的端口一律加入
 | 对象 | 数量 | 随什么增长 |
 |---|---|---|
 | `knp-allow-ingress` / `knp-allow-egress` | 2 个安全组、约 4 条规则 | **不增长** |
-| 规则集安全组 | 每种**不同规则集**一个 | 不同规则集数（**不是** pod 数，**不是**策略数） |
+| 策略安全组 | **每条 NetworkPolicy 一个** | 策略数（**不是** pod 数，**不是**策略组合数——见 §7.7.4a） |
 | 地址组 | 每个 (namespace, peer-selector) 一个 | 不同 peer selector 数 |
 | Neutron port | 每 capsule 一个 | pod 数（**今天已经在付**） |
 
-**安全组承载规则集，端口的安全组列表承载"哪些 pod 适用这套规则"。**这是
+**一条策略一个安全组，端口的安全组列表承载"这个 pod 被哪几条策略选中"。**
+安全组规则是白名单，所以挂多个组 = 规则取并集，正好是 K8s "多条策略叠加"的语义。这是
 ovn-kubernetes 的镜像——他们把 subject 放 port group、peer 放 address set；我们把
 subject 放**安全组成员（端口属性）**、peer 放地址组。两者都做到"每个被选中的 pod
 O(1) 条规则"。

@@ -28,8 +28,17 @@ import (
 // policy that does nothing is a bug someone notices.
 type Controller struct {
 	reconciler *Reconciler
-	queue      workqueue.TypedRateLimitingInterface[string]
-	synced     []cache.InformerSynced
+	// pods carries "which groups should this port hold".
+	queue workqueue.TypedRateLimitingInterface[string]
+	// policies carries "what is in the address groups this policy refers to".
+	//
+	// ⚠️ A second queue rather than more work on the first. Peer membership is
+	// a property of the policy; the pods in it are ones the policy does NOT
+	// select, so reconciling a pod cannot maintain the sets it belongs to --
+	// which is how a new replica of a peer was never added and a deleted one
+	// never removed.
+	policies workqueue.TypedRateLimitingInterface[string]
+	synced   []cache.InformerSynced
 }
 
 // NewController wires the reconciler to the informers this process runs.
@@ -47,10 +56,12 @@ func NewController(r *Reconciler, pods corev1informers.PodInformer,
 		reconciler: r,
 		queue: workqueue.NewTypedRateLimitingQueue(
 			workqueue.DefaultTypedControllerRateLimiter[string]()),
+		policies: workqueue.NewTypedRateLimitingQueue(
+			workqueue.DefaultTypedControllerRateLimiter[string]()),
 	}
 
 	if _, err := pods.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj any) { c.enqueuePod(obj) },
+		AddFunc: func(obj any) { c.enqueuePod(obj); c.enqueuePoliciesNear(obj) },
 		UpdateFunc: func(old, cur any) {
 			// Labels decide which policies select a pod, and an address is
 			// what a peer set is made of. Everything else about a pod changes
@@ -61,14 +72,25 @@ func NewController(r *Reconciler, pods corev1informers.PodInformer,
 				return
 			}
 			c.enqueuePod(cur)
+			c.enqueuePoliciesNear(cur)
 		},
+		// ⚠️ A deleted pod must reach the peer sets it was in. Without this its
+		// address stays allowed for ever -- and Neutron reuses addresses, so
+		// the next capsule to be given it inherits the access, whatever its
+		// labels. The one direction in this package that fails open.
+		DeleteFunc: func(obj any) { c.enqueuePoliciesNear(obj) },
 	}); err != nil {
 		return nil, err
 	}
 
 	if _, err := policies.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj any) { c.enqueueNamespaceOf(obj) },
-		UpdateFunc: func(_, cur any) { c.enqueueNamespaceOf(cur) },
+		AddFunc: func(obj any) { c.enqueueNamespaceOf(obj); c.enqueuePolicy(obj) },
+		UpdateFunc: func(_, cur any) {
+			c.enqueueNamespaceOf(cur)
+			c.enqueuePolicy(cur)
+		},
+		// A deleted policy leaves its groups to the sweep; there is nothing
+		// left whose peers could need syncing.
 		DeleteFunc: func(obj any) { c.enqueueNamespaceOf(obj) },
 	}); err != nil {
 		return nil, err
@@ -91,6 +113,40 @@ func (c *Controller) enqueuePod(obj any) {
 	c.queue.Add(pod.Namespace + "/" + pod.Name)
 }
 
+// enqueuePoliciesNear queues every policy in the pod's namespace.
+//
+// Every one, not the ones that select it: a peer is by definition a pod the
+// policy does not select, so there is nothing on the pod that says which
+// policies care about it. Recomputing the sets is cheaper than keeping the
+// reverse index that would answer it, and the sets are what has to be right.
+func (c *Controller) enqueuePoliciesNear(obj any) {
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+	pod, ok := obj.(*corev1.Pod)
+	if !ok || !c.reconciler.ServesNamespace(pod.Namespace) {
+		return
+	}
+	list, err := c.reconciler.Policies.NetworkPolicies(pod.Namespace).List(labels.Everything())
+	if err != nil {
+		return
+	}
+	for _, p := range list {
+		c.policies.Add(p.Namespace + "/" + p.Name)
+	}
+}
+
+func (c *Controller) enqueuePolicy(obj any) {
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+	p, ok := obj.(*networkingv1.NetworkPolicy)
+	if !ok || !c.reconciler.ServesNamespace(p.Namespace) {
+		return
+	}
+	c.policies.Add(p.Namespace + "/" + p.Name)
+}
+
 func (c *Controller) enqueueNamespaceOf(obj any) {
 	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 		obj = tombstone.Obj
@@ -111,6 +167,7 @@ func (c *Controller) enqueueNamespaceOf(obj any) {
 // Run reconciles pods until the context is cancelled.
 func (c *Controller) Run(ctx context.Context, workers int) error {
 	defer c.queue.ShutDown()
+	defer c.policies.ShutDown()
 	if !cache.WaitForCacheSync(ctx.Done(), c.synced...) {
 		return fmt.Errorf("the caches this needs never synced")
 	}
@@ -121,8 +178,15 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 	}
 	for i := 0; i < workers; i++ {
 		go wait.UntilWithContext(ctx, c.work, time.Second)
+		go wait.UntilWithContext(ctx, c.workPolicies, time.Second)
 	}
 	go wait.UntilWithContext(ctx, c.sweep, SweepInterval)
+	// ⚠️ And a full recomputation on a timer, so a peer set that drifted for
+	// any reason -- a missed event, a failed write retried past its limit --
+	// comes back on its own rather than staying wrong until somebody edits
+	// the policy. A set that can only be corrected by hand is a set that
+	// stays wrong.
+	go wait.UntilWithContext(ctx, c.resyncPolicies, PeerResyncInterval)
 	<-ctx.Done()
 	return nil
 }
@@ -135,6 +199,60 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 // afternoon should cost that once, not once per edit -- and nothing is
 // harmed by a group that outlives its policy by half an hour.
 const SweepInterval = 30 * time.Minute
+
+// PeerResyncInterval is how often every policy's peer sets are recomputed
+// whether anything looked like it changed or not.
+//
+// Cheaper than it sounds and worth it anyway: the work is one read per address
+// group and a write only when the contents differ, and what it buys is that no
+// peer set can stay wrong indefinitely. Membership drifting quietly is the
+// failure this whole path had.
+const PeerResyncInterval = 10 * time.Minute
+
+func (c *Controller) workPolicies(ctx context.Context) {
+	for {
+		key, quit := c.policies.Get()
+		if quit {
+			return
+		}
+		if err := c.syncPolicy(ctx, key); err != nil {
+			log.G(ctx).WithError(err).WithField("policy", key).
+				Warn("could not update this policy's peer sets; will retry")
+			c.policies.AddRateLimited(key)
+		} else {
+			c.policies.Forget(key)
+		}
+		c.policies.Done(key)
+	}
+}
+
+func (c *Controller) syncPolicy(ctx context.Context, key string) error {
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return err
+	}
+	if !c.reconciler.ServesNamespace(namespace) {
+		return nil
+	}
+	p, err := c.reconciler.Policies.NetworkPolicies(namespace).Get(name)
+	if err != nil {
+		// Gone. Its groups are the sweep's business.
+		return nil
+	}
+	return c.reconciler.SyncPolicyPeers(ctx, p)
+}
+
+func (c *Controller) resyncPolicies(ctx context.Context) {
+	list, err := c.reconciler.Policies.List(labels.Everything())
+	if err != nil {
+		return
+	}
+	for _, p := range list {
+		if c.reconciler.ServesNamespace(p.Namespace) {
+			c.policies.Add(p.Namespace + "/" + p.Name)
+		}
+	}
+}
 
 func (c *Controller) sweep(ctx context.Context) {
 	live := map[string]bool{}
