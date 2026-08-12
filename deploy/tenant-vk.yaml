@@ -59,8 +59,15 @@ rules:
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
+    # A claim's status carries the size it actually has. ⚠️ There is no resizer
+    # in this deployment, so if this does not write it nothing does, and the
+    # claim reports the old size for ever after being grown.
+    resources: ["persistentvolumeclaims/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: [""]
     resources: ["persistentvolumes"]
-    verbs: ["get", "list", "watch", "create", "delete"]
+    # update, because growing a volume changes its recorded capacity.
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
   # The storage catalog. Read-only: classes are the operator's price list, and
   # this process only looks up which type a claim's class buys.
   - apiGroups: ["storage.k8s.io"]

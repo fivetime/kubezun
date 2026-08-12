@@ -93,6 +93,12 @@ metadata:
 provisioner: manila.knaas.io
 parameters:
   share_type: incus-nfs
+# ⚠️ True here and false on the block classes, which is the opposite of where
+# it started. A share only needs extending: the file server owns the
+# filesystem, so neither the node nor the capsule is involved. A block volume
+# needs the filesystem grown after the device is, and that is a second step
+# nobody performs yet.
+allowVolumeExpansion: true
 volumeBindingMode: WaitForFirstConsumer
 # ---- production (control1) ----
 # One class per public Cinder volume type, same names the types carry:

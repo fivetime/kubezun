@@ -89,21 +89,24 @@ func TestStorageFollowsTheNodeThatWillUseIt(t *testing.T) {
 		PlacementOf: lookup,
 	}
 
+	// ⚠️ The node decides the Kubernetes zone, and never the OpenStack one.
+	// There is no single OpenStack zone namespace: measured on one deployment,
+	// Nova and Cinder say "nova" while Manila's share service says
+	// "manila-zone-0". Deriving the storage zone from the compute one works
+	// only where the names coincide, and where they do not the scheduler
+	// reports no capacity -- which reads as a full backend, not a bad name.
 	base.Backend = &Backend{}
 	got := base.placementFor(claimOf("deferred", "tenant-node-az2"))
-	if got.AZ != "zone-b" || got.Zone != "az2" {
-		t.Errorf("storage did not follow the node: %+v", got)
+	if got.Zone != "az2" {
+		t.Errorf("the volume was not pinned to the node's zone: %+v", got)
 	}
-
-	// ⚠️ The Kubernetes zone name must not reach OpenStack. Asking Cinder for
-	// "az2" would name a zone it has never heard of.
-	if got.AZ == got.Zone {
-		t.Errorf("the two zone names were conflated: %+v", got)
+	if got.AZ != "" {
+		t.Errorf("a compute zone reached the storage service: %+v", got)
 	}
 
 	// A node this process does not run cannot be resolved; falling back beats
 	// guessing.
-	if got := base.placementFor(claimOf("deferred", "someone-elses-node")); got.AZ != "" {
+	if got := base.placementFor(claimOf("deferred", "someone-elses-node")); got.Zone != "" {
 		t.Errorf("an unknown node should not produce a zone: %+v", got)
 	}
 

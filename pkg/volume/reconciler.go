@@ -15,6 +15,7 @@ import (
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	storagev1listers "k8s.io/client-go/listers/storage/v1"
+	record "k8s.io/client-go/tools/record"
 )
 
 const (
@@ -45,6 +46,10 @@ type Reconciler struct {
 	Volumes corev1listers.PersistentVolumeLister
 	Classes storagev1listers.StorageClassLister
 	Client  corev1client.CoreV1Interface
+
+	// Events reports expansion progress where a tenant looks for it. Nil
+	// falls back to the log, which is where nobody looks.
+	Events record.EventRecorder
 
 	// PlacementOf says where a virtual node puts what it runs. Nil, or a node
 	// it does not recognise, leaves the deployment default in force.
@@ -158,9 +163,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, namespace, name string) erro
 		return nil
 	}
 	if claim.Spec.VolumeName != "" {
-		// Already bound. Whether the storage behind it still exists is the
-		// sweep's question, not this path's.
-		return nil
+		// Bound. The only thing left that can change is its size.
+		return r.expandIfAsked(ctx, claim)
 	}
 
 	kind, storageType, err := r.planFor(claim)
@@ -229,21 +233,132 @@ func (r *Reconciler) waitingForConsumer(claim *corev1.PersistentVolumeClaim) boo
 
 // placementFor is where this claim's storage should be created.
 //
-// The deployment-wide setting wins when it is set: an operator naming one
-// storage zone is saying the storage does not follow the compute, which is
-// true wherever a single storage zone serves every compute zone.
+// ⚠️ The availability zone comes from configuration and never from the node's
+// compute zone. There is no one OpenStack zone namespace: measured on one
+// deployment, Nova and Cinder both call it "nova" while Manila's share service
+// lives in "manila-zone-0". Passing the compute zone to a storage service
+// therefore works by coincidence where the names happen to agree, and where
+// they do not the scheduler answers "no storage could be allocated" -- which
+// reads as a full backend rather than as a name from the wrong namespace.
+//
+// The node still decides the zone written onto the volume, which is what keeps
+// a pod from being rescheduled away from storage it cannot reach. Only the
+// OpenStack-side name is left to whoever knows it.
 func (r *Reconciler) placementFor(claim *corev1.PersistentVolumeClaim) Placement {
-	if r.Backend != nil && r.Backend.AvailabilityZone != "" {
-		return Placement{AZ: r.Backend.AvailabilityZone}
+	where := Placement{}
+	if r.Backend != nil {
+		where.AZ = r.Backend.AvailabilityZone
 	}
 	node := claim.Annotations[selectedNodeAnnotation]
 	if node == "" || r.PlacementOf == nil {
-		return Placement{}
+		return where
 	}
 	if p, ok := r.PlacementOf(node); ok {
-		return p
+		where.Zone = p.Zone
 	}
-	return Placement{}
+	return where
+}
+
+// expandIfAsked grows a bound claim whose request has outgrown what it has.
+//
+// ⚠️ There is no resizer in this deployment, so nothing else will do it and
+// nothing else will report it either: with no resizer, Kubernetes does not even
+// mark the claim as resizing. Before this existed the edit was accepted and
+// then landed nowhere -- a spec asking for more, a status showing the old size,
+// and no condition or event to connect the two.
+func (r *Reconciler) expandIfAsked(ctx context.Context, claim *corev1.PersistentVolumeClaim) error {
+	want, ok := claim.Spec.Resources.Requests[corev1.ResourceStorage]
+	if !ok {
+		return nil
+	}
+	have := claim.Status.Capacity[corev1.ResourceStorage]
+	if want.Cmp(have) <= 0 {
+		return nil
+	}
+
+	pv, err := r.Volumes.Get(claim.Spec.VolumeName)
+	if err != nil {
+		return nil // not ours to grow, or not there yet
+	}
+	if !r.provisionedByUs(pv) {
+		return nil
+	}
+	kind := Kind(pv.Annotations[KindAnnotation])
+	id := pv.Annotations[IDAnnotation]
+	if id == "" {
+		return fmt.Errorf("volume %s records no storage id", pv.Name)
+	}
+
+	gib := int((want.Value() + (1 << 30) - 1) / (1 << 30))
+	log.G(ctx).WithField("claim", claim.Namespace+"/"+claim.Name).
+		WithField("from", have.String()).WithField("to", want.String()).
+		Info("growing the storage behind this claim")
+
+	got, err := r.Backend.Expand(ctx, kind, id, gib)
+	if err != nil {
+		r.report(ctx, claim, "ExpansionFailed", err.Error())
+		return err
+	}
+
+	// ⚠️ The size it actually has, not the size that was asked for. Recording
+	// the request would make a partial expansion look complete, and the
+	// difference is only discovered when the filesystem fills.
+	actual := resource.NewQuantity(int64(got)<<30, resource.BinarySI)
+	if err := r.recordSize(ctx, pv, claim, *actual); err != nil {
+		return err
+	}
+	if kind == Block {
+		// ⚠️ The device is bigger and the filesystem inside it is not. It is
+		// mounted on the compute node, not in the capsule, so growing it is
+		// Zun's to do -- and until it does, the pod sees the old size however
+		// large the volume is. Reported rather than left silent.
+		r.report(ctx, claim, "FileSystemResizePending",
+			"the volume is now "+actual.String()+"; the filesystem grows when "+
+				"the node next attaches it")
+	}
+	return nil
+}
+
+// recordSize tells Kubernetes what the storage now is.
+//
+// Both objects: the volume's capacity is what a scheduler and a human read,
+// and the claim's status is what `kubectl get pvc` shows. Updating one and not
+// the other leaves them disagreeing with no way to tell which is true.
+func (r *Reconciler) recordSize(ctx context.Context, pv *corev1.PersistentVolume,
+	claim *corev1.PersistentVolumeClaim, size resource.Quantity) error {
+	if pv.Spec.Capacity[corev1.ResourceStorage] != size {
+		updated := pv.DeepCopy()
+		updated.Spec.Capacity[corev1.ResourceStorage] = size
+		if _, err := r.Client.PersistentVolumes().Update(ctx, updated,
+			metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("recording the new size on %s: %w", pv.Name, err)
+		}
+	}
+	fresh, err := r.Client.PersistentVolumeClaims(claim.Namespace).Get(
+		ctx, claim.Name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if fresh.Status.Capacity == nil {
+		fresh.Status.Capacity = corev1.ResourceList{}
+	}
+	fresh.Status.Capacity[corev1.ResourceStorage] = size
+	if _, err := r.Client.PersistentVolumeClaims(claim.Namespace).UpdateStatus(
+		ctx, fresh, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("recording the new size on claim %s/%s: %w",
+			claim.Namespace, claim.Name, err)
+	}
+	return nil
+}
+
+// report says something about a claim where a tenant will see it.
+func (r *Reconciler) report(ctx context.Context, claim *corev1.PersistentVolumeClaim, reason, message string) {
+	if r.Events == nil {
+		log.G(ctx).WithField("claim", claim.Namespace+"/"+claim.Name).
+			WithField("reason", reason).Info(message)
+		return
+	}
+	r.Events.Eventf(claim, corev1.EventTypeNormal, reason, "%s", message)
 }
 
 func (r *Reconciler) provision(ctx context.Context, claim *corev1.PersistentVolumeClaim, kind Kind, storageType string) (*corev1.PersistentVolume, error) {
