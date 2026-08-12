@@ -841,6 +841,50 @@ fork，买进一个定案变更和一份新的生命周期责任。**
 `--namespace-selector kubezoo.io/tenant=111111`(全部)——**启动它就会撞出上面那个
 定时互相覆写**。已删除;新增节点一律用 `--node`,不要另起进程。
 
+#### 7.7.5d ⚠️ 每租户**一个**进程,不能靠多副本做高可用(2026-08-12 查证)
+
+7.7.5c 说的是"两个进程服务不同 namespace 子集"会坏。这里说的是**服务同一份 namespace
+的两个进程**——也就是把 kubezun 做成 `Deployment` 且 `replicas: 2` 的那种形态。
+结论:**同样不行,而且坏的地方不在直觉指的那一处**。
+
+**清理不会打架。** 三个清扫器在多副本下都是收敛的,因为它们是**纯函数**:输入(capsule
+列表、pod 列表、策略列表)相同就得出相同结论,两个副本只会同时做同一个决定。
+
+| 清扫器 | 判据 | 并发结果 |
+|---|---|---|
+| capsule 孤儿(`orphans.go`) | pod UID 不在 K8s | 同判;并发删,后到的拿 404 → `Warn` 一行 |
+| 地址组 GC(`netpol.Sweep`,30 min) | 组不被任何策略引用 | 同判 |
+| LB GC(`service/gc.go`) | 名字前缀解不出活 Service | 同判 |
+| Zun 端口回收(`manager.py`) | `binding:host_id == self.host` | **计算节点之间根本不重叠**,天然无竞争 |
+
+**打架的是创建,形状全是 check-then-act。** 两个副本同时"查——没有——建":
+
+- `provider.go:214-221` `CreatePod`:`ListManaged` 没查到就建。**这个检查本来就是为了防重**
+  ——注释写着 Zun 不拒绝同名 capsule,所以指望 API 报错是不行的。两个副本同时错过,
+  就是一个 pod 两个 capsule,都在跑都在计费。
+- `service/reconciler.go:225-232` `ensureLoadBalancer`:`GetLoadBalancerByName` 没查到就建。
+  两个副本 → **一个 Service 两个同名 Octavia LB**。
+- 地址组 `SyncAddresses`(`neutron.go:468`)是读-diff-写,并发写靠 400 当共识,
+  同 namespace 集合下两副本算出同一个 `want`,**收敛**;只有 informer 缓存偏斜的瞬间会抖,
+  下一次 pod 事件或 10 分钟全量重算抹平。
+
+**然后清理去收拾创建的烂摊子,收拾得不对。** 这是真正的代价:
+
+- 重复 capsule 会被孤儿清扫按"留最新的"处理(`orphans.go:127-139`),而被删的那个
+  **可能正是另一个副本写进 pod status 的那个 IP** → `podIP == capsule OVN IP` 不变式破了,
+  pod 指向一个已删除的 capsule。
+- 重复 LB **连收都收不掉**:`parseLBName` 判的是"名字解出的 Service 还活着吗",
+  重复 LB 的名字是**合法的**,所以 GC 认为它天经地义。而 `lbIDAnnotation` 是
+  last-writer-wins,输的那个 LB 从此无人引用、无人回收、一直计费。
+
+**没有 leader election**:全仓库零处 `leaderelection`,`go.sum` 里也没有这个依赖。
+所以"多副本"目前不是"能力弱",是"**没有任何东西在阻止它双写**"。
+
+**当前形态是对的**:`deploy/kubezun@.service`,systemd `Restart=always`,每租户一个进程,
+多虚拟节点用重复 `--node` 挤在同一进程内共享 informer 和凭据。这等于 active/passive,
+代价是重启期间有个空窗。真要 HA,**方向是 active/passive 的 leader election(Lease 锁),
+不是 `replicas: 2`**——上面每一条都要求"同一时刻只有一个写者",而不是"多个写者协调好"。
+
 #### 7.7.5b 开通与运维清单
 
 **RBAC 两项,都是实测才发现清单里没有的:**
