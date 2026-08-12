@@ -113,12 +113,19 @@ func (c *Controller) enqueuePod(obj any) {
 	c.queue.Add(pod.Namespace + "/" + pod.Name)
 }
 
-// enqueuePoliciesNear queues every policy in the pod's namespace.
+// enqueuePoliciesNear queues every policy that could have this pod as a peer.
 //
-// Every one, not the ones that select it: a peer is by definition a pod the
-// policy does not select, so there is nothing on the pod that says which
-// policies care about it. Recomputing the sets is cheaper than keeping the
-// reverse index that would answer it, and the sets are what has to be right.
+// Every policy in every namespace this process serves -- not only the pod's
+// own. ⚠️ A namespaceSelector peer reaches across namespaces, so a policy in
+// one namespace routinely names pods in another; queueing only the pod's
+// namespace leaves those policies waiting for an event that never comes. That
+// is the case DESIGN §7.7 opens with: a tenant's namespaces share one project,
+// and separating prod from staging is the usual reason to make a second one.
+//
+// Every policy rather than the ones that actually match: a peer is by
+// definition a pod the policy does not select, so nothing on the pod says
+// which policies care about it. Recomputing is cheaper than the reverse index
+// that would answer it, and the sets are what has to be right.
 func (c *Controller) enqueuePoliciesNear(obj any) {
 	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 		obj = tombstone.Obj
@@ -127,13 +134,29 @@ func (c *Controller) enqueuePoliciesNear(obj any) {
 	if !ok || !c.reconciler.ServesNamespace(pod.Namespace) {
 		return
 	}
-	list, err := c.reconciler.Policies.NetworkPolicies(pod.Namespace).List(labels.Everything())
+	list, err := c.reconciler.Policies.List(labels.Everything())
 	if err != nil {
 		return
 	}
 	for _, p := range list {
-		c.policies.Add(p.Namespace + "/" + p.Name)
+		if c.reconciler.ServesNamespace(p.Namespace) {
+			c.enqueuePolicyKey(p.Namespace + "/" + p.Name)
+		}
 	}
+}
+
+// PeerCoalesce is how long a policy waits before its peer sets are recomputed.
+//
+// ⚠️ Every pod event queues every policy, so without a wait the work follows
+// the rate pods come and go rather than the rate the sets actually change --
+// and on a serverless line those are very different numbers. A delaying queue
+// collapses repeats of a key that is still waiting, so a burst of pod churn
+// becomes one synchronisation per policy. A second is far below anything a
+// person notices and far above the length of a rollout's thundering herd.
+const PeerCoalesce = time.Second
+
+func (c *Controller) enqueuePolicyKey(key string) {
+	c.policies.AddAfter(key, PeerCoalesce)
 }
 
 func (c *Controller) enqueuePolicy(obj any) {
@@ -144,7 +167,7 @@ func (c *Controller) enqueuePolicy(obj any) {
 	if !ok || !c.reconciler.ServesNamespace(p.Namespace) {
 		return
 	}
-	c.policies.Add(p.Namespace + "/" + p.Name)
+	c.enqueuePolicyKey(p.Namespace + "/" + p.Name)
 }
 
 func (c *Controller) enqueueNamespaceOf(obj any) {
@@ -249,7 +272,7 @@ func (c *Controller) resyncPolicies(ctx context.Context) {
 	}
 	for _, p := range list {
 		if c.reconciler.ServesNamespace(p.Namespace) {
-			c.policies.Add(p.Namespace + "/" + p.Name)
+			c.enqueuePolicyKey(p.Namespace + "/" + p.Name)
 		}
 	}
 }
