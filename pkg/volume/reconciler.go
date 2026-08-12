@@ -283,7 +283,13 @@ func (r *Reconciler) expandIfAsked(ctx context.Context, claim *corev1.Persistent
 	}
 	have := claim.Status.Capacity[corev1.ResourceStorage]
 	if want.Cmp(have) <= 0 {
-		return nil
+		// ⚠️ Nothing to grow, which is not the same as nothing to do. A claim
+		// whose request was raised, failed, and then lowered again is left
+		// with an allocation naming the size that was never reached -- and
+		// quota counts the larger of that and the request, so it bills for a
+		// size nobody has. Correcting it only on the next expansion means a
+		// claim that is never grown again is never corrected.
+		return r.settleAllocation(ctx, claim, want, have)
 	}
 
 	pv, err := r.Volumes.Get(claim.Spec.VolumeName)
@@ -304,8 +310,27 @@ func (r *Reconciler) expandIfAsked(ctx context.Context, claim *corev1.Persistent
 		WithField("from", have.String()).WithField("to", want.String()).
 		Info("growing the storage behind this claim")
 
+	// ⚠️ Said before the work, not after. allocatedResources is what this has
+	// undertaken to reach, and Kubernetes reads it two ways: quota counts the
+	// larger of it and the request, so leaving it unset undercounts a tenant
+	// mid-expansion; and it is the floor a request may be lowered to, which is
+	// how a tenant escapes an expansion that cannot succeed. A field only
+	// written on success cannot serve either purpose, both of which exist for
+	// the failure case.
+	if err := r.recordAllocation(ctx, claim, want,
+		corev1.PersistentVolumeClaimControllerResizeInProgress); err != nil {
+		return err
+	}
+
 	got, err := r.Backend.Expand(ctx, kind, id, gib)
 	if err != nil {
+		// Infeasible rather than in-progress: the size asked for is one this
+		// backend will not reach, and saying so is what lets the tenant lower
+		// the request instead of waiting for a retry that cannot work.
+		if rerr := r.recordAllocation(ctx, claim, want,
+			corev1.PersistentVolumeClaimControllerResizeInfeasible); rerr != nil {
+			log.G(ctx).WithError(rerr).Debug("could not record the failed allocation")
+		}
 		r.report(ctx, claim, "ExpansionFailed", err.Error())
 		return err
 	}
@@ -328,7 +353,11 @@ func (r *Reconciler) expandIfAsked(ctx context.Context, claim *corev1.Persistent
 		// filesystem is mounted on the compute node, so growing it can only
 		// happen there -- and until it does, the pod sees the old size however
 		// large the volume is, which looks exactly like an expansion that
-		// failed.
+		// failed. Saying so is the difference between the two.
+		if err := r.recordAllocation(ctx, claim, want,
+			corev1.PersistentVolumeClaimNodeResizeInProgress); err != nil {
+			return err
+		}
 		if err := r.growFilesystems(ctx, claim, id, got); err != nil {
 			r.report(ctx, claim, "FileSystemResizePending",
 				"the volume is now "+actual.String()+" but the filesystem has "+
@@ -337,6 +366,86 @@ func (r *Reconciler) expandIfAsked(ctx context.Context, claim *corev1.Persistent
 		}
 	}
 	return r.recordClaimSize(ctx, claim, *actual)
+}
+
+// settleAllocation brings a finished claim's allocation back in line.
+//
+// Kubernetes' rule: lower it only when nothing is in progress and the volume is
+// no larger than the request (core/types.go:793-797).
+func (r *Reconciler) settleAllocation(ctx context.Context,
+	claim *corev1.PersistentVolumeClaim, want, have resource.Quantity) error {
+	allocated, ok := claim.Status.AllocatedResources[corev1.ResourceStorage]
+	if !ok || allocated.Cmp(want) <= 0 {
+		return nil
+	}
+	if _, busy := claim.Status.AllocatedResourceStatuses[corev1.ResourceStorage]; busy {
+		return nil
+	}
+	if have.Cmp(want) > 0 {
+		return nil
+	}
+	fresh, err := r.Client.PersistentVolumeClaims(claim.Namespace).Get(
+		ctx, claim.Name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	fresh.Status.AllocatedResources[corev1.ResourceStorage] = want
+	log.G(ctx).WithField("claim", claim.Namespace+"/"+claim.Name).
+		WithField("from", allocated.String()).WithField("to", want.String()).
+		Info("lowering the allocation left behind by an expansion that did not happen")
+	_, err = r.Client.PersistentVolumeClaims(claim.Namespace).UpdateStatus(
+		ctx, fresh, metav1.UpdateOptions{})
+	return err
+}
+
+// recordAllocation says what this has undertaken to reach, and how far it has
+// got.
+//
+// ⚠️ The status entry is removed when the size is finally recorded, not set to
+// some "done" value. Kubernetes reads the presence of a key as "still
+// happening"; a key left behind saying it finished is a claim that describes
+// itself as permanently mid-resize.
+func (r *Reconciler) recordAllocation(ctx context.Context,
+	claim *corev1.PersistentVolumeClaim, size resource.Quantity,
+	state corev1.ClaimResourceStatus) error {
+	fresh, err := r.Client.PersistentVolumeClaims(claim.Namespace).Get(
+		ctx, claim.Name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if fresh.Status.AllocatedResources == nil {
+		fresh.Status.AllocatedResources = corev1.ResourceList{}
+	}
+	if fresh.Status.AllocatedResourceStatuses == nil {
+		fresh.Status.AllocatedResourceStatuses = map[corev1.ResourceName]corev1.ClaimResourceStatus{}
+	}
+	was := fresh.Status.AllocatedResourceStatuses[corev1.ResourceStorage]
+	already, had := fresh.Status.AllocatedResources[corev1.ResourceStorage]
+	if had && already.Cmp(size) >= 0 && was == state {
+		return nil
+	}
+	// ⚠️ Infeasible is not walked back to in-progress for the same target. The
+	// retry loop would otherwise overwrite it on every pass, and a tenant
+	// watching would see a resize that is perpetually starting rather than one
+	// that cannot succeed -- which is the difference between waiting and
+	// lowering the request. A new, different target starts afresh.
+	if had && already.Cmp(size) == 0 &&
+		was == corev1.PersistentVolumeClaimControllerResizeInfeasible &&
+		state == corev1.PersistentVolumeClaimControllerResizeInProgress {
+		return nil
+	}
+	// ⚠️ Never lowered here. It is the floor a tenant may lower a request to,
+	// so moving it down would move that floor out from under them.
+	if already, ok := fresh.Status.AllocatedResources[corev1.ResourceStorage]; !ok || already.Cmp(size) < 0 {
+		fresh.Status.AllocatedResources[corev1.ResourceStorage] = size
+	}
+	fresh.Status.AllocatedResourceStatuses[corev1.ResourceStorage] = state
+	if _, err := r.Client.PersistentVolumeClaims(claim.Namespace).UpdateStatus(
+		ctx, fresh, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("recording what %s/%s is being grown to: %w",
+			claim.Namespace, claim.Name, err)
+	}
+	return nil
 }
 
 // growFilesystems tells every capsule using this volume to grow the filesystem
@@ -408,6 +517,24 @@ func (r *Reconciler) recordClaimSize(ctx context.Context,
 		fresh.Status.Capacity = corev1.ResourceList{}
 	}
 	fresh.Status.Capacity[corev1.ResourceStorage] = size
+	// ⚠️ And brought back down, now that nothing is in progress and the volume
+	// is no larger than the request. Quota counts the larger of this and the
+	// request, so an allocation left at a size that was asked for once and
+	// never reached bills the tenant for it for ever. The rule is Kubernetes'
+	// own (core/types.go:793-797); leaving it high is not the safe direction,
+	// it is the expensive one.
+	if want, ok := fresh.Spec.Resources.Requests[corev1.ResourceStorage]; ok {
+		if allocated, had := fresh.Status.AllocatedResources[corev1.ResourceStorage]; had &&
+			allocated.Cmp(want) > 0 && size.Cmp(want) <= 0 {
+			fresh.Status.AllocatedResources[corev1.ResourceStorage] = want
+		}
+	}
+	// Finished, which Kubernetes reads as the key being gone rather than as a
+	// value meaning finished.
+	delete(fresh.Status.AllocatedResourceStatuses, corev1.ResourceStorage)
+	if len(fresh.Status.AllocatedResourceStatuses) == 0 {
+		fresh.Status.AllocatedResourceStatuses = nil
+	}
 	if _, err := r.Client.PersistentVolumeClaims(claim.Namespace).UpdateStatus(
 		ctx, fresh, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("recording the new size on claim %s/%s: %w",
