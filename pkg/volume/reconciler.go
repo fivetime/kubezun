@@ -12,6 +12,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+
+	"github.com/fivetime/kubezun/pkg/zun"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	storagev1listers "k8s.io/client-go/listers/storage/v1"
@@ -50,6 +52,14 @@ type Reconciler struct {
 	// Events reports expansion progress where a tenant looks for it. Nil
 	// falls back to the log, which is where nobody looks.
 	Events record.EventRecorder
+
+	// Capsules grows the filesystem on a block volume after the volume itself
+	// has grown. Nil leaves that half undone, and says so on the claim.
+	Capsules *zun.CapsuleAPI
+
+	// Pods finds which capsules are using a claim, since the filesystem has to
+	// be grown wherever the volume is attached.
+	Pods corev1listers.PodLister
 
 	// PlacementOf says where a virtual node puts what it runs. Nil, or a node
 	// it does not recognise, leaves the deployment default in force.
@@ -304,36 +314,91 @@ func (r *Reconciler) expandIfAsked(ctx context.Context, claim *corev1.Persistent
 	// the request would make a partial expansion look complete, and the
 	// difference is only discovered when the filesystem fills.
 	actual := resource.NewQuantity(int64(got)<<30, resource.BinarySI)
-	if err := r.recordSize(ctx, pv, claim, *actual); err != nil {
+
+	// The volume is bigger, so the volume object says so. ⚠️ The claim does
+	// not, yet: for a block volume there is a second step, and writing the new
+	// size on the claim before it happens makes the request look satisfied --
+	// after which nothing comes back, and the filesystem stays small for ever.
+	// Leaving the claim at the old size is what makes the next pass retry.
+	if err := r.recordVolumeSize(ctx, pv, *actual); err != nil {
 		return err
 	}
 	if kind == Block {
-		// ⚠️ The device is bigger and the filesystem inside it is not. It is
-		// mounted on the compute node, not in the capsule, so growing it is
-		// Zun's to do -- and until it does, the pod sees the old size however
-		// large the volume is. Reported rather than left silent.
-		r.report(ctx, claim, "FileSystemResizePending",
-			"the volume is now "+actual.String()+"; the filesystem grows when "+
-				"the node next attaches it")
+		// ⚠️ The device is bigger and the filesystem inside it is not. The
+		// filesystem is mounted on the compute node, so growing it can only
+		// happen there -- and until it does, the pod sees the old size however
+		// large the volume is, which looks exactly like an expansion that
+		// failed.
+		if err := r.growFilesystems(ctx, claim, id, got); err != nil {
+			r.report(ctx, claim, "FileSystemResizePending",
+				"the volume is now "+actual.String()+" but the filesystem has "+
+					"not been grown yet: "+err.Error())
+			return err
+		}
+	}
+	return r.recordClaimSize(ctx, claim, *actual)
+}
+
+// growFilesystems tells every capsule using this volume to grow the filesystem
+// on it.
+//
+// Every one, because ReadWriteOnce is a Kubernetes rule and not a Cinder one:
+// a volume can be attached to more than one capsule, and one left with the old
+// filesystem is one whose pod cannot use the space it was given.
+func (r *Reconciler) growFilesystems(ctx context.Context, claim *corev1.PersistentVolumeClaim, volumeID string, gib int) error {
+	if r.Capsules == nil || r.Pods == nil {
+		return nil
+	}
+	pods, err := r.Pods.Pods(claim.Namespace).List(labels.Everything())
+	if err != nil {
+		return err
+	}
+	var failed error
+	for _, pod := range pods {
+		if !usesClaim(pod, claim.Name) {
+			continue
+		}
+		if err := r.Capsules.ExtendVolume(ctx, string(pod.UID), volumeID, gib); err != nil {
+			// Reported, not swallowed: the pod is running on a volume whose
+			// filesystem is the old size, and nothing else will notice.
+			log.G(ctx).WithError(err).WithField("pod", pod.Namespace+"/"+pod.Name).
+				Warn("could not grow the filesystem on this pod's volume")
+			failed = err
+		}
+	}
+	return failed
+}
+
+func usesClaim(pod *corev1.Pod, claim string) bool {
+	for _, v := range pod.Spec.Volumes {
+		if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == claim {
+			return true
+		}
+	}
+	return false
+}
+
+// recordVolumeSize says how big the storage is. Written as soon as it is true,
+// because it is true whether or not the filesystem has caught up.
+func (r *Reconciler) recordVolumeSize(ctx context.Context, pv *corev1.PersistentVolume,
+	size resource.Quantity) error {
+	if pv.Spec.Capacity[corev1.ResourceStorage] == size {
+		return nil
+	}
+	updated := pv.DeepCopy()
+	updated.Spec.Capacity[corev1.ResourceStorage] = size
+	if _, err := r.Client.PersistentVolumes().Update(ctx, updated,
+		metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("recording the new size on %s: %w", pv.Name, err)
 	}
 	return nil
 }
 
-// recordSize tells Kubernetes what the storage now is.
-//
-// Both objects: the volume's capacity is what a scheduler and a human read,
-// and the claim's status is what `kubectl get pvc` shows. Updating one and not
-// the other leaves them disagreeing with no way to tell which is true.
-func (r *Reconciler) recordSize(ctx context.Context, pv *corev1.PersistentVolume,
+// recordClaimSize says how much space the workload can actually use, which is
+// only true once the filesystem has been grown. ⚠️ This is also what stops the
+// retry: while it says the old size, the request still looks unsatisfied.
+func (r *Reconciler) recordClaimSize(ctx context.Context,
 	claim *corev1.PersistentVolumeClaim, size resource.Quantity) error {
-	if pv.Spec.Capacity[corev1.ResourceStorage] != size {
-		updated := pv.DeepCopy()
-		updated.Spec.Capacity[corev1.ResourceStorage] = size
-		if _, err := r.Client.PersistentVolumes().Update(ctx, updated,
-			metav1.UpdateOptions{}); err != nil {
-			return fmt.Errorf("recording the new size on %s: %w", pv.Name, err)
-		}
-	}
 	fresh, err := r.Client.PersistentVolumeClaims(claim.Namespace).Get(
 		ctx, claim.Name, metav1.GetOptions{})
 	if err != nil {

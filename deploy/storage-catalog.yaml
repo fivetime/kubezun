@@ -57,13 +57,10 @@ metadata:
 provisioner: cinder.knaas.io
 parameters:
   type: ceph
-# ⚠️ false until expansion is actually implemented. Declaring it true is a
-# promise the platform does not keep: Kubernetes accepts the edit, nothing
-# ever acts on it, and no condition or event is set either -- the conditions
-# come from a resizer, and there is none. The tenant is left with a spec
-# asking for more, a status showing the old size, and no explanation. Set to
-# false, the same edit is refused up front with a message naming the class.
-allowVolumeExpansion: false
+# Growing a block volume is two steps: the volume service extends it, and then
+# the filesystem inside it is grown where it is attached -- on the compute
+# node, since that is where it is mounted, not inside the capsule.
+allowVolumeExpansion: true
 volumeBindingMode: WaitForFirstConsumer
 ---
 apiVersion: storage.k8s.io/v1
@@ -75,13 +72,10 @@ metadata:
 provisioner: cinder.knaas.io
 parameters:
   type: ceph-nvme-test
-# ⚠️ false until expansion is actually implemented. Declaring it true is a
-# promise the platform does not keep: Kubernetes accepts the edit, nothing
-# ever acts on it, and no condition or event is set either -- the conditions
-# come from a resizer, and there is none. The tenant is left with a spec
-# asking for more, a status showing the old size, and no explanation. Set to
-# false, the same edit is refused up front with a message naming the class.
-allowVolumeExpansion: false
+# Growing a block volume is two steps: the volume service extends it, and then
+# the filesystem inside it is grown where it is attached -- on the compute
+# node, since that is where it is mounted, not inside the capsule.
+allowVolumeExpansion: true
 volumeBindingMode: WaitForFirstConsumer
 ---
 apiVersion: storage.k8s.io/v1

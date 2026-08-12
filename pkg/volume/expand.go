@@ -38,7 +38,19 @@ func (b *Backend) Expand(ctx context.Context, kind Kind, id string, gib int) (in
 			// extend, which Cinder refuses.
 			return current.Size, nil
 		}
-		if err := volumes.ExtendSize(ctx, b.Block, id,
+		// ⚠️ Extending a volume that is in use needs microversion 3.42; below
+		// it Cinder answers "status must be available to extend", which reads
+		// as a rule about the volume rather than about the request. Asked for
+		// on a copy of the client, because raising it on the shared one would
+		// change every other call this process makes. Same shape as
+		// cloud-provider-openstack pkg/csi/cinder/openstack/openstack_volumes.go:383-405.
+		client := b.Block
+		if current.Status == "in-use" {
+			copied := *b.Block
+			copied.Microversion = "3.42"
+			client = &copied
+		}
+		if err := volumes.ExtendSize(ctx, client, id,
 			volumes.ExtendSizeOpts{NewSize: gib}).ExtractErr(); err != nil {
 			return current.Size, fmt.Errorf("extending volume %s to %dGiB: %w", id, gib, err)
 		}
