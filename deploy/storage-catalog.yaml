@@ -26,6 +26,13 @@
 #   - a bound claim never re-reads its class, so editing a class here changes
 #     future claims only.
 #
+# ⚠️ allowVolumeExpansion is false on every class here. Growing a Cinder
+# volume is not just an extend call: the block device is handed to a running
+# Kata VM, so the filesystem inside it has to be grown too, and there is no
+# resizer in this deployment to sequence any of it. A Manila share is the easy
+# case -- the file server owns the filesystem -- and would be the one to do
+# first.
+#
 # volumeBindingMode: WaitForFirstConsumer holds the placement decision until a
 # pod using the claim is scheduled, so the storage is created in the zone the
 # workload actually landed in. With Immediate it is created when the claim is,
@@ -50,7 +57,13 @@ metadata:
 provisioner: cinder.knaas.io
 parameters:
   type: ceph
-allowVolumeExpansion: true
+# ⚠️ false until expansion is actually implemented. Declaring it true is a
+# promise the platform does not keep: Kubernetes accepts the edit, nothing
+# ever acts on it, and no condition or event is set either -- the conditions
+# come from a resizer, and there is none. The tenant is left with a spec
+# asking for more, a status showing the old size, and no explanation. Set to
+# false, the same edit is refused up front with a message naming the class.
+allowVolumeExpansion: false
 volumeBindingMode: WaitForFirstConsumer
 ---
 apiVersion: storage.k8s.io/v1
@@ -62,7 +75,13 @@ metadata:
 provisioner: cinder.knaas.io
 parameters:
   type: ceph-nvme-test
-allowVolumeExpansion: true
+# ⚠️ false until expansion is actually implemented. Declaring it true is a
+# promise the platform does not keep: Kubernetes accepts the edit, nothing
+# ever acts on it, and no condition or event is set either -- the conditions
+# come from a resizer, and there is none. The tenant is left with a spec
+# asking for more, a status showing the old size, and no explanation. Set to
+# false, the same edit is refused up front with a message naming the class.
+allowVolumeExpansion: false
 volumeBindingMode: WaitForFirstConsumer
 ---
 apiVersion: storage.k8s.io/v1
