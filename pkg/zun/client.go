@@ -98,6 +98,15 @@ func NewClient(ctx context.Context, creds Credentials) (*Client, error) {
 	return &Client{sc: sc, provider: pc, region: creds.Region}, nil
 }
 
+// NewClientAt wraps an already-built service client, for a caller that holds a
+// session of its own and for tests that need the capsule calls pointed at a
+// server they control. Whether a code path talks to Zun at all is otherwise
+// unobservable, and "it did nothing because it was guarded" and "it did nothing
+// because it silently failed" leave the same trace.
+func NewClientAt(sc *gophercloud.ServiceClient) *Client {
+	return &Client{sc: sc, provider: sc.ProviderClient}
+}
+
 // Provider is the authenticated session, for building clients for the other
 // OpenStack services this tenant uses.
 func (c *Client) Provider() *gophercloud.ProviderClient { return c.provider }

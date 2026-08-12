@@ -432,8 +432,9 @@ func run(o options) error {
 					CreateToken(ctx, account, req, metav1.CreateOptions{})
 			},
 		}, zunClient, provider.Caches{
-			Pods:    set.PodsForNode(spec.name).Lister(),
-			Objects: set.Objects(),
+			Pods:       set.PodsForNode(spec.name).Lister(),
+			PodsSynced: set.PodsForNode(spec.name).Informer().HasSynced,
+			Objects:    set.Objects(),
 		})
 		if err != nil {
 			return err

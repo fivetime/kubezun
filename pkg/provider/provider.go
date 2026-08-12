@@ -89,6 +89,9 @@ type Provider struct {
 	// podLister is the cluster's view of pods, used to tell a capsule whose
 	// pod is gone from one whose pod this process simply has not seen yet.
 	podLister corev1listers.PodLister
+	// podsSynced guards the orphan sweep against an unsynced podLister. See
+	// Caches.PodsSynced.
+	podsSynced func() bool
 
 	// objects backs the pod's file volumes. A capsule has no kubelet to project
 	// them, so their content is read here and sent with it.
@@ -146,6 +149,21 @@ type ObjectReader interface {
 type Caches struct {
 	Pods    corev1listers.PodLister
 	Objects ObjectReader
+
+	// PodsSynced reports whether Pods has finished its initial list. ⚠️ This is
+	// load-bearing, not hygiene: an informer that has been started but has not
+	// listed yet answers NotFound for every pod, and the orphan sweep reads
+	// NotFound as "the pod is gone". The library hands the provider its
+	// callback before it waits for that sync (podcontroller.go:306 registers,
+	// :312 waits), so the sweep would be looking at an empty cache with every
+	// capsule on the node judged against it. On a restart every capsule is
+	// past the grace period, so the first sweep would delete the whole node's
+	// workload -- and a slow API server, which is what makes the sync take
+	// long enough to matter, is also what makes the restart happen.
+	//
+	// Nil means "assume synced", which is what the tests want and what a
+	// caller passing a static lister means.
+	PodsSynced func() bool
 }
 
 // New builds a provider for one tenant.
@@ -154,9 +172,10 @@ func New(cfg Config, client *zun.Client, caches Caches) (*Provider, error) {
 		return nil, fmt.Errorf("a namespace check is required")
 	}
 	return &Provider{
-		cfg:       cfg,
-		podLister: caches.Pods,
-		objects:   caches.Objects,
+		cfg:        cfg,
+		podLister:  caches.Pods,
+		podsSynced: caches.PodsSynced,
+		objects:    caches.Objects,
 		capsules:  zun.NewCapsuleAPI(client),
 		pods:      make(map[string]*corev1.Pod),
 		deleted:   make(map[string]types.UID),

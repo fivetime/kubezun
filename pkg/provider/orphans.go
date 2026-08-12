@@ -37,6 +37,19 @@ func (p *Provider) sweepOrphans(ctx context.Context) {
 		// capsule would look orphaned.
 		return
 	}
+	// ⚠️ A cache that has been started but has not finished its first list
+	// answers NotFound for every pod, which this sweep reads as "the pod is
+	// gone". The library registers this provider's callback -- where the sweep
+	// is started -- before it waits for that sync, so an unguarded sweep runs
+	// against an empty cache. On a restart every capsule is already past the
+	// grace period, so the first sweep would delete the entire node's
+	// workload; the slow API server that makes a sync take minutes is the same
+	// one that makes the restart happen. Waiting costs an unclean capsule a
+	// couple more minutes.
+	if p.podsSynced != nil && !p.podsSynced() {
+		log.G(ctx).Debug("orphan sweep skipped: the pod cache has not synced yet")
+		return
+	}
 
 	managed, err := p.capsules.ListManagedAll(ctx)
 	if err != nil {

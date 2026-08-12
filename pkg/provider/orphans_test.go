@@ -1,8 +1,13 @@
 package provider
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/gophercloud/gophercloud/v2"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -169,5 +174,54 @@ func TestOrphanSweepSparesUnlabelledCapsules(t *testing.T) {
 
 	if got := p.orphansAmong(t.Context(), "111111-default/web", []*zun.Capsule{old}); len(got) != 0 {
 		t.Fatalf("deleted a capsule of unknown ownership: %v", names(got))
+	}
+}
+
+// countingZun is a stand-in for the capsule API that records whether it was
+// reached at all. The sweep's guard is invisible from the outside otherwise:
+// "skipped because the cache had not synced" and "ran and found no orphans"
+// both end with nothing deleted.
+func countingZun(t *testing.T, calls *int) *zun.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*calls++
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"capsules":[]}`)
+	}))
+	t.Cleanup(srv.Close)
+	return zun.NewClientAt(&gophercloud.ServiceClient{
+		ProviderClient: &gophercloud.ProviderClient{},
+		Endpoint:       srv.URL + "/v1/",
+	})
+}
+
+// TestOrphanSweepWaitsForThePodCache is the restart safety net.
+//
+// ⚠️ The library registers this provider's pod callback -- where the sweep is
+// started -- before it waits for the pod informer to sync
+// (podcontroller.go:306 registers, :312 waits). A started-but-unsynced lister
+// answers NotFound for every pod, and this sweep reads NotFound as "the pod is
+// gone". On a restart every capsule is already past the grace period, so an
+// unguarded first sweep deletes the whole node's running workload.
+func TestOrphanSweepWaitsForThePodCache(t *testing.T) {
+	calls := 0
+	p := newTestProvider(t, "111111-default")
+	p.capsules = zun.NewCapsuleAPI(countingZun(t, &calls))
+	// An empty cache, exactly as an unsynced informer presents itself.
+	p.podLister = listerWith(t)
+	p.podsSynced = func() bool { return false }
+
+	p.sweepOrphans(t.Context())
+	if calls != 0 {
+		t.Fatalf("the sweep judged capsules against an unsynced cache: %d calls to Zun", calls)
+	}
+
+	// The other half of the criterion: with the cache synced it must actually
+	// run, or the test above would pass just as well against a sweep that was
+	// broken outright.
+	p.podsSynced = func() bool { return true }
+	p.sweepOrphans(t.Context())
+	if calls == 0 {
+		t.Fatal("the sweep never ran even with a synced cache, so the check above proves nothing")
 	}
 }
