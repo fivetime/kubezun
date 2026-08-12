@@ -832,6 +832,30 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       停 Pending。⚠️ **纠错**:kubezoo 对 storageClassName **原样透传**(用户 grep 坐实,
       无任何前缀逻辑)——我此前从 IngressClass 的前缀行为错误外推;PVC 里的 `111111-`
       是当初测试时字面写进去的,不是网关加的。带前缀查找保留为容错,不再是依据
+- [x] **卷扩容 Cinder + Manila 全部实现并端到端实测(2026-08-12,kubezun `c68311f` + fork `4cd39aa3`)**:
+      ⚠️ 起点是**声明了但零实现**:`allowVolumeExpansion: true` 写在两个 Cinder 类上,
+      而 `pkg/volume` 里扩容代码一行没有。**实测**:PVC 1Gi→2Gi 被 API 收下、90 秒后
+      PVC 仍 1Gi、卷仍 1GiB、**一条 condition 都没有**(`Resizing` 由 resizer 设,本部署没有)。
+      比"卡在 Resizing"更糟——**没有任何信号**。先撤回承诺,再实现,**实现完才重新声明**。
+      **Manila**:extend share 即完,文件系统归文件服务器——pod 里 `df` 不做任何操作就变
+      (1Gi→3Gi:share 1→3、`df` 974M→2.9G、数据在)。这就是 CPO 的 Manila node 侧
+      只有三行 `Unimplemented` 的原因。
+      **Cinder**:两步——extend 卷 + **os-brick `connector.extend_volume()` 重扫 +
+      节点上 `resize2fs`**(实测 1Gi→3Gi:卷 1→3、**pod 里 `df` 973M→2.9G**、数据在)。
+      借鉴来源见 CLAUDE.md:rescan 抄 nova-incus(os-brick 白送)、两段式与 microversion
+      抄 CPO、fail-closed 尺寸校验抄 nova。
+      ⚠️ **四个只有实测才撞得到的点**:
+      ① **in-use 卷扩容要 microversion 3.42**,否则 Cinder 报 "status must be available",
+      读起来像卷的状态问题而不是请求的版本问题;且要用**客户端副本**,别改共享的;
+      ② **capsule 的卷挂在里面的容器上,不在 capsule 上**——按 capsule uuid 查一无所获;
+      ③ **PVC status 必须等文件系统长完才写**:先写就等于宣布完成,reconciler 再也不回来,
+      文件系统永远小。PV 容量可以立刻写(卷确实大了)。这条让重试自然发生;
+      ④ ⚠️ **AZ 那次改动一直在把计算 AZ 送给存储服务**,而 OpenStack 有三个 AZ 名字空间
+      (Nova/Cinder 都叫 `nova`,**Manila 是 `manila-zone-0`**)——**所有 RWX 供给从那次
+      改动起就一直失败**,报 "No storage could be allocated",读起来像后端满了。
+      已修:存储 AZ 只来自配置,绝不从计算 AZ 推
+      ⚠️ **另有一处部署债**:四台的 `/opt/stack/zun` 各缺文件(控制面缺 3 个、每个计算
+      节点缺 1 个),今天才因 `manila.py` 缺失撞出 zun-api 起不来。已全量同步 24 个改动文件
 - [x] **AZ 拓扑 / WaitForFirstConsumer(2026-08-11,`21fc675`)**:卷不再在 PVC 创建时
       就开——**那时还没有任何东西决定 pod 去哪**,zone 只能从配置里猜。一个 AZ 时永远
       猜对;两个 AZ 时猜错**不可逆**:卷不能换 AZ,PVC 一直 Bound、pod 一直 Pending,
