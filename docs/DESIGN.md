@@ -57,6 +57,19 @@ kubelet API（logs/exec）。
 
 ### 1.2 为什么放弃每租户虚拟节点与 DaemonSet（2026-08-13）
 
+> ⚠️⚠️ **先澄清一个已经被误读两次的点：放弃的是"每租户一个节点"，不是"节点"。**
+> **节点仍然存在，而且不能不存在。** 变的只有三样：不再属于租户、租户看不见、数量不随
+> 租户增长（`regions × K × AZs × archs`，§3.4）。
+>
+> **为什么零节点走不通**（两条都已查证，不是推理）：
+> - `PodGC` 会删掉 `spec.NodeName` 指向不存在节点的 pod（k8s `podgc/gc_controller.go:228`
+>   `gcOrphaned`，隔离期 40s）。没有 Node 对象，capsule pod 会被上游当孤儿清掉。
+> - VK 靠 `spec.nodeName` 的 informer 过滤认领 pod（`nodeutil/client.go:53-58`）。
+>   没有节点名就没有认领边界——而这个边界正是 §4 里"唯一不可绕过的授权边界"的依据。
+>
+> 要真的拿掉 Node，就得让 pod 根本不进上游控制面，那意味着 kubezoo 自己终结整套 pod API
+> 并重写控制器栈——是 cell / Kamaji 那个量级的另一种产品形态（§13）。
+
 **不是因为做不到——已经做出来并端到端跑通了——而是因为它的成本与它买到的东西不成比例。**
 
 **成本（实测，非估算）**：虚拟节点是每租户的（`NodePoolFor(tenantID) = tenantID`，
