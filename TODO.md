@@ -19,10 +19,16 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 | **0** | PoC：OpenStack 侧手工验证既定路线 | 不通则清掉待定项前不动代码 |
 | **1** | MVP 单租户：新骨架重写 | provider 主链路成立 |
 | **2** | 多租户：凭据/策略/视图接入 | 渗透用例过，才能对外 |
-| **3** | DS + 探针（依赖 Zun fork 门槛项） | KNaaS 差异化体验成立 |
+| **3** | ~~DS +~~ 探针（依赖 Zun fork 门槛项） | ⚠️ **租户 DS 已废弃**（DESIGN §9）——本阶段只剩探针 |
+| **3.5** | **共享节点形态**（2026-08-13 新增，DESIGN §1.2 定案的落地面） | 一个进程服务多租户且各落各 project |
 | **4** | 生产化 | 规模/计费/可运维 |
 | **F** | Zun fork（独立工作流，与 1–4 并行推进） | 门槛两项卡阶段 3 |
 | **P** | 平台侧配套（代码不在本仓库，进度在此跟踪） | — |
+
+> ⚠️ **2026-08-13 形态变更**：放弃每租户虚拟节点与 DaemonSet，节点变成平台对象
+> （`regions × K × AZs × archs`，与租户数无关）。**DESIGN §1.2 是定案，§4.6 是落地面。**
+> 本文件里凡涉及"每租户一个节点/一个 VK 进程/租户看得见节点/租户 DS"的条目，
+> 已就地标注或改写；**已完成的历史条目保留原文并加注**，不要按它们的字面意思继续做。
 
 ---
 
@@ -325,36 +331,50 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       ⚠️ 原"按对象 GET 避免 403"的顾虑已由共享 informer 的 namespace 作用域解决（见上）
 - [ ] SA token：Kyverno 默认强制 automountServiceAccountToken=false；显式开启者创建时
       注入一次性 TokenRequest token + TTL 文档（§8.1）
-- [ ] Kyverno validate 策略集：禁 spec.nodeName、禁指向外租户节点的 nodeSelector/toleration、
-      RBAC 收回 pods/binding create（§4.2）
+- [ ] Kyverno validate 策略集：禁 spec.nodeName、RBAC 收回 pods/binding create（§4.2）。
+      ⚠️ **"禁指向外租户节点的 nodeSelector/toleration"随节点去租户化失效**——没有"外租户
+      节点"这回事了。但**容量面的攻击没有消失、受害面还扩大了**：任一租户可以用大 limits
+      的垃圾 pod 耗尽整个分片共享节点的可调度容量（旧实测：一个 limits=4CPU/8Gi 的 pod
+      占掉 12%）。⇒ **这一层要改成按 namespace 的 ResourceQuota 拦截**（DESIGN §4 第 2 条）
 - [ ] ⚠️ 核查 kube-system 控制器 SA 创建的 pod 实测经过 Kyverno
       （resourceFilters/excludeGroups）→ 回写 DESIGN §14.3
-- [ ] VAP：nodes/status 仅 VK 凭据可写；受保护标签/污点前缀仅平台可写（§4.3）
+- [ ] VAP：nodes/status 仅 VK 凭据可写；受保护标签/污点前缀仅平台可写（§4.3）。
+      ⚠️ 理由变了：租户已看不到节点，防的是平台内部误写与其他控制器
 - [ ] placement 注入对接：(kubezoo) convert/placement.go 机制扩展至租户 pod 注入
-      pool selector + tenant toleration（§4.4）
-- [ ] kubezoo 视图验证：`<tid>-` 前缀节点在租户 `kubectl get no` 正确显示/翻译
-- [ ] **渗透验收**：两租户互相无法经 nodeName/binding/nodeSelector 到对方节点；A 的
-      capsule 在 A 的 project、走 A 的网络；租户 `get no` 只见自己节点（§12）
+      nodeSelector + toleration（§4.4）。⚠️ **`NodePoolFor(tenantID) = tenantID` 必须改**
+      ——池不再等于租户；该函数注释写明**三处必须一致**（Kyverno 策略 / kubezoo 注入 /
+      手工打标），改它要三处同动
+- [~] ~~kubezoo 视图验证：`<tid>-` 前缀节点在租户 `kubectl get no` 正确显示/翻译~~ ——
+      **反过来了**：节点是平台对象、不带 `<tid>-` 前缀，验收判据改为**租户 `get no` 为空**
+      （与 B1 一致）
+- [ ] **渗透验收**：两租户互相无法经 nodeName/binding/nodeSelector 触及对方**资源**；A 的
+      capsule 在 A 的 project、走 A 的网络；租户 `get no` **为空**（§12）。
+      ⚠️ 判据要能分辨"隔离住了"和"两边都没建成"——旧版靠"B 的 project 里零 capsule"，
+      这个判据在"什么都没发生"时同样成立，需要配一个**正向对照**（A 自己的 capsule 建成了）
 
 ---
 
-## 阶段 3：DaemonSet + 探针（§6/§9，依赖 F 门槛两项）
+## 阶段 3：探针（§6，依赖 F 门槛两项）
 
-- [ ] ⚠️ DS 策略改造：**mutate 作用于 DaemonSet.spec.template，不是 Pod**（Pod 级注入与
-      DS controller 的 nodeAffinity 矛盾 → 真实节点永久 Pending）；存量 DS 需
-      mutateExisting 或触发模板更新（§9）
-- [ ] 配套 Pod 级 validate 双保险（落虚拟节点的 pod 带正确 toleration/selector）（§9）
+> ⚠️ **2026-08-13：本阶段的 DaemonSet 部分整体废弃**（DESIGN §9）。下面三条已完成的 DS
+> 条目**保留为历史记录**，不要按字面继续做；未完成的两条已划掉。
+> ⚠️ **但"系统 DS 排除"不在废弃之列**——租户 DS 废弃 ≠ 平台自己的 DS 不会来。
+
+- [~] ~~DS 策略改造：mutate 作用于 DaemonSet.spec.template~~ —— **废弃**（§9）：不再为租户
+      DS 注入任何东西
+- [~] ~~配套 Pod 级 validate 双保险~~ —— **废弃**（§9）
+- [~] ~~B1/B2' 分档：tenant-deny-daemonset.yaml 对 B2' 租户放行~~ —— **废弃**：
+      **两档统一 deny**，B2' 不再放行租户 DS
 - [x] **系统 DS 排除已验证生效（2026-08-07）**：cilium/cilium-envoy/cilium-node-init/
       konnectivity-agent/kube-multus-ds/ovs-cni/ovn-chassis **全部 3/3 只落三台真实
-      worker**，虚拟节点上零系统 pod
-- [x] **租户 DS 实测（2026-08-07）**：`DESIRED=2`（每虚拟节点一份），amd64 节点上
-      1/1 Running 拿到 OVN IP，arm64 节点上 `CapsuleUnschedulable`——扇出与失败均正确。
-      ⚠️ **由此得出一条供给规则**：**不要为没有对应宿主机的架构创建虚拟节点**。
-      DS 控制器会不停重建那个必然失败的 pod（实测约 40–60s 一轮），
-      持续消耗 API 与 Zun 调用。租户 VK 用的是租户 appcred，**看不到 Placement/host
-      清单**（且按 §4 严禁 admin 凭据），所以这条只能在平台开通侧把关，
-      provider 无法自检
-- [ ] B1/B2' 分档：tenant-deny-daemonset.yaml 对 B2' 租户放行（堵 kaaas §7.3 洞的同时放行）
+      worker**，虚拟节点上零系统 pod。
+      ⚠️ **这条继续有效且必须保留**——它防的是平台 DS，与租户 DS 废弃无关（DESIGN §9）
+- [x] ~~**租户 DS 实测（2026-08-07）**~~（历史记录）：`DESIRED=2`（每虚拟节点一份），
+      amd64 节点上 1/1 Running 拿到 OVN IP，arm64 节点上 `CapsuleUnschedulable`——
+      扇出与失败均正确。⚠️ **当时由此得出的供给规则"不要为没有对应宿主机的架构创建虚拟
+      节点"仍然成立**，但理由变了：现在没有租户 DS 会去反复重建那个必然失败的 pod，
+      剩下的是"注册一个没有任何宿主机能满足的架构标签 → 落到它上面的 pod 永远
+      `CapsuleUnschedulable`"（DESIGN §3.6 启动期校验 `--arch` 那条）
 - [x] **readiness → EndpointSlice 实测打通（2026-08-07）**——**这才是流量摘除的真实通道**
       （kubetron 的 LB reconciler 是 EndpointSlice 驱动的，`pkg/service/members.go:25,107`）：
       同一个 Service 选中 r-good/r-bad 两个 pod，EndpointSlice 里
@@ -580,8 +600,9 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       K8s 自己有：`ContainerStatusUnknown`（kubelet 判断不出容器结局时用的）、
       `FailedCreatePodSandBox`（sandbox 始终没建起来）。
       惯例是 **Reason 用标准词、Message 放细节**，capsule UUID 留在我们日志里
-- [ ] **验收**：去特权 fluent-bit DS 在租户节点起一份 capsule；系统 DS 不落虚拟节点；
-      真实节点无 Pending 残留；liveness 失败触发重启；HM 摘除未就绪 member（§12）
+- [ ] **验收**：~~去特权 fluent-bit DS 在租户节点起一份 capsule~~（DS 已废弃）；
+      系统 DS 不落虚拟节点、真实节点无 Pending 残留；liveness 失败触发重启；
+      readiness 结果回写 pod Ready 并驱动 EndpointSlice；HM 摘除未就绪 member（§12）
 
 ---
 
@@ -594,9 +615,11 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 - [x] **✅ 抄 kubetron `pkg/ingress/` 完成（2026-08-08，`8abc1b6`+`684ee25`+`9353aca`）**：
       `l7.go`/`barbican.go`/`tuning.go` 基本平移；`reconciler.go` 剥掉了 kubetron 的
       `NSConfig`/`ResolveNamespaceConfig`（每 namespace ConfigMap）和 `webhook.NamespaceShard`
-      （分片）——kubezun 每租户一进程，作用域是服务命名空间集。teardown 不用 finalizer，
+      （分片）——kubezun 的作用域是**服务命名空间集**。teardown 不用 finalizer，
       改走 pkg/service 的**名字派生 + 孤儿 sweep**（一套恢复模型盖两种 LB）；FIP 归属从
       Ingress 注解移到 **FIP 的 description**（sweep 没有对象也能判 delete/detach）。
+      ⚠️ **2026-08-13 复核：剥掉 `NamespaceShard` 的决定在共享节点形态下依然成立**，
+      别修回去——进程服务的命名空间集**就是**分片，没有第二层分片要表达。
       `BuildMembers` 与 Service 复用同一个（member 取 capsule 地址与 subnet）。
       ⚠️ **Service sweep 的 `parseLBName` 必须拒绝 ing 名字**：两种名字共享租户前缀，
       按第一个下划线切会把 "ing" 读成 namespace、找不到同名 Service，然后把每个
@@ -932,6 +955,59 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 - [ ] ⚠️ **契约测试有真实偶发性**：有一轮失败的检查后面两轮原样重跑全过，中间什么
       都没改。**单独一轮全绿不算证据**，查偶发之前先确认自己看的是不是同一个东西。
 
+## 阶段 3.5：共享节点形态（2026-08-13 新增，DESIGN §1.2 定案 / §4.6 落地面）
+
+**放弃每租户虚拟节点。** 节点从 `∝ 租户数` 变成 `regions × K × AZs × archs`，与租户数无关。
+保住的是唯一那条真差异——算力归属 OpenStack project。租户体验退回与 B1 一致
+（`get no` 为空、无 DS）。
+
+⚠️ **卡在前面的两个决定**（没定就别开工，它们改变实现）：
+- **有没有客户真要节点可见性 / DaemonSet** —— 决定这刀能不能砍
+- **K 取多少** —— 唯一自由度，同时定爆炸半径与节点数；⚠️ **一次定死**，
+  改 K 要重分配租户，过渡期违反 DESIGN §7.7.5c（同租户 peer 同步只能有一个所有者）
+
+- [ ] **（P0）凭据按 namespace 解析**（§4.6）：`zunClient` 从**单值**变成
+      `namespace → project → Secret → clients` 的解析器。
+      - ⚠️ 影响面已量过：`main.go` 里 19 处引用、8 个子系统构造点（capsules / 块存储 /
+        共享存储 / netpol / Octavia / Neutron / KeyManager / Subnets）
+      - ✅ **namespace/授权侧不用改**：`--namespace-selector` 是标签选择器，
+        写成 `kubezoo.io/tenant in (a,b,c)` 现在就能服务多租户；`Serves()` 按集合判定
+      - ⚠️ `authorize(namespace)` 从"允不允许"升级为**同时选凭据**——选错 = 拿 A 的凭据
+        操作 B 的资源。`vknode/namespaces.go:105-109` 的注释早就点名了这个后果，
+        只是当时防的是启动竞态，现在落在日常主路径上
+      - **验收判据**：一个进程服务两个租户，各自 capsule 落各自 project。
+        ⚠️ 判据必须能分辨"落对了"和"两边都没建成"——要有正向证据，不能只看"没串"
+- [ ] **（P0）project 绑定三态校验**（§4.6.3）：
+      ```
+      无记录         → 写入（首次绑定）
+      有记录且一致   → 正常
+      有记录且不一致 → fail closed，拒绝启动 + 报警
+      ```
+      - ⚠️ **校验对象是 token 里的 project id，不是 Secret 哈希/版本**——
+        否则会顺手禁掉凭据轮换（同 project 换 appcred 必须允许）
+      - ⚠️ **"不一致就覆盖"是错的，而它恰好是随手会写出来的那一版**
+      - ⚠️ **位置必须在同步循环之前**：晚一步，第一个周期就已经把所有 pod 判成 `Failed`
+        （`sync.go:91-99`），ReplicaSet 立刻建替补
+      - **为什么必须做**：kubezun 现在**从不记录也从不校验自己认到了哪个 project**
+        （全仓零处引用）。凭据一换：旧 project 的 capsule 全部不可见 → 全部 pod 判 Failed
+        → 重建；而旧 capsule **继续跑、继续计费、永远不会被回收**（孤儿清扫用新凭据 list，
+        看不见它们）；Service 还会**复制一份 LB**（`ensureLoadBalancer` 得到 NotFound
+        就 fall through 新建，旧的继续持有 VIP）
+- [ ] **（P1）节点补 `topology.kubernetes.io/region`** + PV nodeAffinity 加一条
+      MatchExpression（§3.1）。⚠️ **必须先于第二个 region 上线**——今天 PV 只按 zone 匹配
+      （`volume/reconciler.go:632-634`），多 region 下 `r1/az1` 与 `r2/az1` 会撞，
+      症状是 `reconciler.go:623-627` 注释描述的那个：**claim Bound、pod Pending、
+      两个对象都不说为什么**。改动很小，但**晚做就是静默错配**
+- [ ] **（P1）节点身份去租户化**（§3.1）：名字改 `knaas-<region>-<shard>-<az>-<arch>`；
+      去掉 `kubezoo.io/pool`；污点 `knaas.io/tenant=<tid>` → `knaas.io/serverless=true`；
+      新增 `knaas.io/shard`
+- [ ] **（P1）容量改静态大额**（§3.2）：`capacity = 配额镜像` 作废——共享节点镜像不了任一
+      租户的配额。把关落到 K8s ResourceQuota 准入 + Zun project 配额两道闸门
+- [ ] **（P2）分片装配**：按租户稳定哈希分配到 K 个进程。
+      ⚠️ **分片键必须是租户，不是 namespace**——按 namespace 哈希会把同租户的
+      `<tid>-default` 与 `<tid>-kube-system` 分到不同进程，**当场违反 §7.7.5c**
+- [ ] **（P2）systemd 单元实例名** 从租户改为分片（`kubezun@<region>-<shard>`）
+
 ## 阶段 4：生产化（§12）
 
 - [x] Zun capsule 容器名 minLength=2，K8s 允许单字符容器名 → 租户写 `name: c` 得到一个
@@ -958,10 +1034,16 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 - [ ] Barbican secret ref 注入（对接 fork，替代 Secret 明文过 Zun DB）（§8.1）
 - [ ] capsule 预热池：kubetron NetworkPortPool 水位模型作蓝本，"预绑 host_id"换"预建
       capsule"，对标 kata 冷启动数十秒 → 秒级（§11 P3）
-- [ ] 心跳调优：lease 间隔放宽 30–60s（逻辑节点独有红利，写 QPS 降 3–6 倍）（§3.5）
-- [ ] DS 扇出进计费模型；节点数按套餐限额（§3.5）
-- [ ] **验收**：50 租户规模 apiserver watch 数与 Zun QPS 达标；单租户 VK 崩溃不影响他租户
-      （故障注入）；kubectl logs 可用（§12）
+- [ ] 心跳调优：lease 间隔放宽——⚠️ **上限 50 秒不是 60**。`nodeMonitorGracePeriod` 是 KCM
+      **全局** flag、默认 50s、无按节点粒度（`nodelifecycle/config/v1alpha1/defaults.go:46`），
+      续约间隔超过它每个 VK 节点**永久 NotReady**；要更长得抬全局值，而它同时管着 B1 的
+      真实 kata 池。**旧文写的"30–60s"横跨这堵墙**（§3.5）
+- [~] ~~DS 扇出进计费模型；节点数按套餐限额~~ —— **两项均废弃**（§3.5/§9）：DS 没了，
+      节点也不再是租户资产、无从按套餐限起
+- [ ] **规模实测**（§3.5 至今未测项）：用 `/root/kwok-scale-lab` 量单集群虚拟节点天花板
+      与 lease QPS/watch 扇出曲线。⚠️ 这个数决定 K 怎么取
+- [ ] **验收**：规模实测有结论；**单分片 VK 崩溃只影响该分片**（故障注入，⚠️ 判据要能
+      分辨"其他分片正常"和"故障注入没生效"）；kubectl logs 可用（§12）
 
 ---
 
@@ -1157,21 +1239,43 @@ Container API 划为不维护区；主干 = capsule + CRI + zun-cni。
       Secret → 拉起 VK → 状态写回 Tenant 注解。**凭据从头到尾不进 kubezoo 进程**。
       ✅ 顺带解决了开通的时序：CoreDNS 可以先建，Pending 到虚拟节点出现，自愈，无需协调
       ⚠️ 命名核对过：环境上的项目叫 `knaas-t1`/`knaas-t2`，不是 `knaas-<租户id>`
-- [ ] Tenant CRD 其余扩展：节点 spec / VK Deployment / Kyverno 实例 / ResourceQuota（§11）
+- [ ] Tenant CRD 其余扩展：Kyverno 实例 / ResourceQuota（§11）。
+      ⚠️ **不再包含"节点 spec / 每租户 VK Deployment"**——节点与进程都不再是租户资产（§1.2）
+- [ ] **（新）Tenant CRD 记录 project id**（§4.6.3）——绑定的真相源。
+      落点选 Tenant CRD 而非每个 namespace 打注解：**后者会漂移**
+      （有的 namespace 认 A、有的认 B）。⚠️ **不能挂 Node 上**：Node 不再是每租户一个
+- [ ] **（新）appcred Secret 写平台命名空间**（§4.6.2），⛔ **不是租户命名空间**。
+      ⚠️ "让 kubezoo 视图过滤掉"不成立——Secret **不需要被看见就能被使用**：
+      pod spec 引用即可，而该路径不经 kubezoo（`provider/files.go:35` 由 kubezun 用
+      自己的凭据按名 GET）。放平台命名空间是**结构性**的：pod 只能挂自己命名空间的 Secret
+- [ ] **（新）重绑运维流程**（§4.6.4）：`① 旧绑定下清空工作负载 → ② 核验旧 project 归零
+      → ③ 才改绑定`。⚠️ **顺序反了会造成永久失联**——`provider.go:316` 把 Delete 的
+      NotFound 当成功吞掉，用新凭据删旧 capsule 会 404 → K8s 侧干净删除 →
+      **旧 capsule 继续跑，而最后一份记录它存在过的东西刚被删掉**
+- [ ] **（新）kubezoo：`NodePoolFor(tenantID) = tenantID` 改造** + 节点从租户视图移除。
+      ⚠️ 该函数注释写明**三处必须一致**（Kyverno 策略 / kubezoo 注入 / 手工打标）
+- [~] ~~tenant-deny-daemonset 分档~~ → **两档统一 deny**（§9 废弃）
+- [ ] **（新，产品侧确认）第三档与 B2' 是不是同一个 OpenStack project？**（§1.2 / §4.6.5）
+      是的话，**基于安全组的 NetworkPolicy 执行对双档租户本来就是建议性的**——
+      租户经 Horizon 持有 project 凭据即可改掉 kubezun 建的安全组。
+      ⚠️ 实测确认可达性不是理论问题：**capsule 能连到 Keystone 并拿到真实 API 响应**。
+      要么接受并写进租户文档，要么给两档分不同 project。**不要假装严密**
 - [ ] kubetron 租户 DNS 分发通道改造：DNS 跑租户网内 capsule、控制器直推 zone
       （无 kubelet 挂 ConfigMap）（§7）
 - [ ] kubetron M8 顺带：Service/DNS 编排半边可独立部署（kubezun-only 形态只拉编排层）（§7）
-- [ ] kubezoo 层：InternalIP 展示值是否改写（§14.5）
+- [~] ~~kubezoo 层：InternalIP 展示值是否改写（§14.5）~~ —— **不再需要**：
+      节点对租户不可见，管理网地址不会外露
 
 ## 待定项镜像（详见 DESIGN §14，清掉一项这里勾一项）
 
 - [ ] §14.1 nets 可传递性（阶段 0 实测）
 - [ ] §14.2 liveness 重启保 IP（阶段 0 实测）
 - [ ] §14.3 kube-system pod 过 Kyverno（阶段 2 核查）
-- [ ] §14.4 租户业务标签写自己节点（MVP 禁，有需求再议）
-- [ ] §14.5 InternalIP 展示值改写
+- [~] ~~§14.4 租户业务标签写自己节点~~ —— **失效**：租户没有"自己的节点"了（§1.2）
+- [~] ~~§14.5 InternalIP 展示值改写~~ —— **失效**：节点对租户不可见，管理网地址不外露
 - [ ] §14.6 SA token 长期轮换通道（等 F/ExecSync 落地）
-- [ ] §14.7 单进程多节点 informer 共享形态（阶段 2 定）
+- [ ] §14.7 单进程多节点 informer 共享形态（阶段 2 定）。
+      ⚠️ 共享节点形态下这项**从优化变成必需**——一个进程要带 `K × AZs × archs` 个节点
 - [ ] §14.8 PVC 供给流程（cinder-csi provision-only vs provider 直管；阶段 2 有状态负载需求时定）
 
 ---
