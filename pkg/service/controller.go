@@ -31,6 +31,43 @@ type Controller struct {
 	synced         []cache.InformerSynced
 }
 
+// EventSource is the scoped alternative to a pair of informers: something
+// that can deliver Service and EndpointSlice events for every namespace this
+// process serves — including namespaces that appear later, which a fixed
+// informer pair cannot do.
+type EventSource interface {
+	OnServices(cache.ResourceEventHandler)
+	OnEndpointSlices(cache.ResourceEventHandler)
+	HasSynced() bool
+}
+
+// NewControllerFromSource wires the reconciler to a scoped event source
+// (vknode.ScopedFactories) instead of cluster-wide informers. The reconciler's
+// own Services/Slices listers must come from the same source, or the events
+// and the reads would disagree about which namespaces exist.
+func NewControllerFromSource(r *Reconciler, src EventSource) (*Controller, error) {
+	if r == nil {
+		return nil, fmt.Errorf("a reconciler is required")
+	}
+	c := &Controller{
+		reconciler: r,
+		queue: workqueue.NewTypedRateLimitingQueue(
+			workqueue.DefaultTypedControllerRateLimiter[string]()),
+	}
+	src.OnServices(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj any) { c.enqueueService(obj) },
+		UpdateFunc: func(_, obj any) { c.enqueueService(obj) },
+		DeleteFunc: func(obj any) { c.enqueueService(obj) },
+	})
+	src.OnEndpointSlices(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj any) { c.enqueueSlice(obj) },
+		UpdateFunc: func(_, obj any) { c.enqueueSlice(obj) },
+		DeleteFunc: func(obj any) { c.enqueueSlice(obj) },
+	})
+	c.synced = []cache.InformerSynced{src.HasSynced}
+	return c, nil
+}
+
 // NewController wires a reconciler to the informers a node already runs.
 func NewController(
 	r *Reconciler,

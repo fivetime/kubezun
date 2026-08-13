@@ -31,6 +31,8 @@ import (
 type multiTenant struct {
 	resolver *tenant.Resolver
 	watcher  *vkset.Namespaces
+	// scoped holds the per-namespace Service/EndpointSlice caches (§2.2).
+	scoped *vkset.ScopedFactories
 
 	// Templates: copied per tenant, never used to serve traffic themselves.
 	volume  *kvolume.Reconciler
@@ -196,18 +198,25 @@ func (m *multiTenant) serviceFor(ctx context.Context, namespace string) (*kservi
 	if err != nil {
 		return nil, err
 	}
+	// ⚠️ No fallback to the template's VIP subnet: that is another tenant's.
+	// Measured before this check existed: tenant 222222's kube-dns tried to
+	// build its load balancer on 111111's VIP subnet — Octavia refused, but
+	// the refusal has to be ours, before the call, with a reason that names
+	// the missing annotation. The error path retries with backoff, which is
+	// what onboarding order needs: the annotation may simply not be there yet.
+	if b.VIPSubnetID == "" {
+		return nil, fmt.Errorf("tenant %s has no VIP subnet in its binding "+
+			"(annotate the credential Secret with %s); its Services get no "+
+			"load balancer until it does", t, tenant.VIPSubnetIDAnnotation)
+	}
 	r := *m.service
 	r.Octavia, r.Neutron = octavia, neutron
 	r.Subnets = kservice.NewCapsuleSubnets(capsules)
 	r.Tenant = t
 	r.ServesNamespace = m.servesTenant(t)
 	r.Namespaces = func() []string { return m.watcher.NamespacesOfTenant(t) }
-	if b.VIPSubnetID != "" {
-		r.VIPSubnetID = b.VIPSubnetID
-	}
-	if b.VIPNetworkID != "" {
-		r.VIPNetworkID = b.VIPNetworkID
-	}
+	r.VIPSubnetID = b.VIPSubnetID
+	r.VIPNetworkID = b.VIPNetworkID
 	m.services[t] = &r
 	return &r, nil
 }
@@ -239,6 +248,11 @@ func (m *multiTenant) ingressFor(ctx context.Context, namespace string) (*kingre
 	if err != nil {
 		return nil, err
 	}
+	// Same rule as serviceFor: no falling back to the template's VIP subnet.
+	if b.VIPSubnetID == "" {
+		return nil, fmt.Errorf("tenant %s has no VIP subnet in its binding "+
+			"(annotate the credential Secret with %s)", t, tenant.VIPSubnetIDAnnotation)
+	}
 	r := *m.ingress
 	r.Octavia, r.Neutron = octavia, neutron
 	r.Subnets = kservice.NewCapsuleSubnets(capsules)
@@ -251,9 +265,7 @@ func (m *multiTenant) ingressFor(ctx context.Context, namespace string) (*kingre
 	r.Tenant = t
 	r.ServesNamespace = m.servesTenant(t)
 	r.Namespaces = func() []string { return m.watcher.NamespacesOfTenant(t) }
-	if b.VIPSubnetID != "" {
-		r.VIPSubnetID = b.VIPSubnetID
-	}
+	r.VIPSubnetID = b.VIPSubnetID
 	m.ingresses[t] = &r
 	return &r, nil
 }

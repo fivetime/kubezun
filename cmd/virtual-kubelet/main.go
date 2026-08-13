@@ -328,6 +328,12 @@ func run(o options) error {
 				"per-tenant credentials are resolved through the namespaces' tenant label")
 		}
 		mt = newMultiTenant(client, watcher, o.platformNamespace)
+		// Scoped caches (DESIGN §2.2): Services and EndpointSlices are watched
+		// per served namespace instead of cluster-wide. Wired to the watcher
+		// BEFORE it starts, so the initial namespaces arrive as Track calls.
+		mt.scoped = vkset.NewScopedFactories(client, 0)
+		watcher.OnChange(mt.scoped.Track)
+		mt.scoped.Start(ctx)
 	}
 
 	set, err := vkset.NewSet(vkset.SetOptions{
@@ -577,7 +583,16 @@ func run(o options) error {
 			Events:            set.EventRecorder("service-controller"),
 			Tenant:            o.tenant,
 		}
-		controller, err := kservice.NewController(svcRec, set.ServiceInformer(), set.EndpointSliceInformer())
+		var controller *kservice.Controller
+		if mt != nil {
+			// The reconciler must read from the same source the events come
+			// from, or reads and events disagree about which namespaces exist.
+			svcRec.Services = mt.scoped.ServiceLister()
+			svcRec.Slices = mt.scoped.EndpointSliceLister()
+			controller, err = kservice.NewControllerFromSource(svcRec, mt.scoped)
+		} else {
+			controller, err = kservice.NewController(svcRec, set.ServiceInformer(), set.EndpointSliceInformer())
+		}
 		if err != nil {
 			return err
 		}
