@@ -16,8 +16,15 @@ import (
 // Controller keeps a tenant's claims and the storage behind them in step.
 type Controller struct {
 	reconciler *Reconciler
-	queue      workqueue.TypedRateLimitingInterface[string]
-	synced     []cache.InformerSynced
+
+	// ReconcilerFor and EachReconciler are the multi-tenant seams, same
+	// contract as the Service controller's: per-namespace resolution for
+	// claims, a walk for the released-volume sweep. Nil means the one fixed
+	// reconciler serves everything.
+	ReconcilerFor  func(ctx context.Context, namespace string) (*Reconciler, error)
+	EachReconciler func(ctx context.Context, fn func(*Reconciler) error) error
+	queue          workqueue.TypedRateLimitingInterface[string]
+	synced         []cache.InformerSynced
 }
 
 // NewController wires the reconciler to the informers the process already runs.
@@ -79,7 +86,11 @@ func (c *Controller) processNext(ctx context.Context) {
 		}
 		namespace, name, err := cache.SplitMetaNamespaceKey(key)
 		if err == nil {
-			if err = c.reconciler.Reconcile(ctx, namespace, name); err != nil {
+			var r *Reconciler
+			if r, err = c.reconcilerOf(ctx, namespace); err == nil {
+				err = r.Reconcile(ctx, namespace, name)
+			}
+			if err != nil {
 				log.G(ctx).WithError(err).WithField("claim", key).
 					Warn("provisioning the claim failed; will retry")
 				c.queue.AddRateLimited(key)
@@ -106,7 +117,24 @@ func (c *Controller) RunGC(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			c.reconciler.SweepReleased(ctx)
+			_ = c.eachReconciler(ctx, func(r *Reconciler) error {
+				r.SweepReleased(ctx)
+				return nil
+			})
 		}
 	}
+}
+
+func (c *Controller) reconcilerOf(ctx context.Context, namespace string) (*Reconciler, error) {
+	if c.ReconcilerFor == nil {
+		return c.reconciler, nil
+	}
+	return c.ReconcilerFor(ctx, namespace)
+}
+
+func (c *Controller) eachReconciler(ctx context.Context, fn func(*Reconciler) error) error {
+	if c.EachReconciler == nil {
+		return fn(c.reconciler)
+	}
+	return c.EachReconciler(ctx, fn)
 }

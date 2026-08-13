@@ -28,6 +28,13 @@ import (
 // policy that does nothing is a bug someone notices.
 type Controller struct {
 	reconciler *Reconciler
+
+	// ReconcilerFor and EachReconciler: the multi-tenant seams. A policy's
+	// groups live in its tenant's project, so peer sync resolves through the
+	// policy's namespace; the baseline and the sweep visit every tenant.
+	// Nil means the fixed reconciler serves everything.
+	ReconcilerFor  func(ctx context.Context, namespace string) (*Reconciler, error)
+	EachReconciler func(ctx context.Context, fn func(*Reconciler) error) error
 	// pods carries "which groups should this port hold".
 	queue workqueue.TypedRateLimitingInterface[string]
 	// policies carries "what is in the address groups this policy refers to".
@@ -195,8 +202,11 @@ func (c *Controller) Run(ctx context.Context, workers int) error {
 		return fmt.Errorf("the caches this needs never synced")
 	}
 	// The baseline has to exist before any pod is judged: computing groups
-	// without it yields nothing, and nothing means deny-all.
-	if err := c.reconciler.EnsureBaseline(ctx); err != nil {
+	// without it yields nothing, and nothing means deny-all. One baseline per
+	// tenant — the groups live in each tenant's own project.
+	if err := c.eachReconciler(ctx, func(r *Reconciler) error {
+		return r.EnsureBaseline(ctx)
+	}); err != nil {
 		return fmt.Errorf("preparing the baseline security groups: %w", err)
 	}
 	for i := 0; i < workers; i++ {
@@ -262,7 +272,11 @@ func (c *Controller) syncPolicy(ctx context.Context, key string) error {
 		// Gone. Its groups are the sweep's business.
 		return nil
 	}
-	return c.reconciler.SyncPolicyPeers(ctx, p)
+	r, err := c.reconcilerOf(ctx, namespace)
+	if err != nil {
+		return err
+	}
+	return r.SyncPolicyPeers(ctx, p)
 }
 
 func (c *Controller) resyncPolicies(ctx context.Context) {
@@ -291,14 +305,21 @@ func (c *Controller) sweep(ctx context.Context) {
 	// policies, which is ordinary. An empty one because the cache never
 	// synced would delete every group the tenant has, so the sweep runs only
 	// after the caches are up -- which Run has already waited for.
-	removed, err := c.reconciler.Neutron.Sweep(ctx, live, c.reconciler.ServesNamespace)
-	if err != nil {
-		log.G(ctx).WithError(err).Warn("the group sweep did not finish; it will run again")
-	}
-	if removed > 0 {
-		log.G(ctx).WithField("removed", removed).
-			Info("collected security and address groups no policy needs")
-	}
+	// One sweep per tenant: groups live in each tenant's project, and the
+	// live set is filtered by that reconciler's own namespace check, so a
+	// policy of tenant A never keeps a group of tenant B alive.
+	_ = c.eachReconciler(ctx, func(r *Reconciler) error {
+		removed, err := r.Neutron.Sweep(ctx, live, r.ServesNamespace)
+		if err != nil {
+			log.G(ctx).WithError(err).Warn("the group sweep did not finish; it will run again")
+			return nil
+		}
+		if removed > 0 {
+			log.G(ctx).WithField("removed", removed).
+				Info("collected security and address groups no policy needs")
+		}
+		return nil
+	})
 }
 
 func (c *Controller) work(ctx context.Context) {
@@ -307,7 +328,15 @@ func (c *Controller) work(ctx context.Context) {
 		if quit {
 			return
 		}
-		if err := c.reconciler.ReconcilePod(ctx, key); err != nil {
+		r, rerr := c.reconcilerForKey(ctx, key)
+		if rerr != nil {
+			log.G(ctx).WithError(rerr).WithField("pod", key).
+				Warn("no credential resolves for this pod's namespace; will retry")
+			c.queue.AddRateLimited(key)
+			c.queue.Done(key)
+			continue
+		}
+		if err := r.ReconcilePod(ctx, key); err != nil {
 			log.G(ctx).WithError(err).WithField("pod", key).
 				Warn("could not align this pod's security groups; will retry")
 			c.queue.AddRateLimited(key)
@@ -392,4 +421,27 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func (c *Controller) reconcilerOf(ctx context.Context, namespace string) (*Reconciler, error) {
+	if c.ReconcilerFor == nil {
+		return c.reconciler, nil
+	}
+	return c.ReconcilerFor(ctx, namespace)
+}
+
+// reconcilerForKey resolves through a namespace/name key.
+func (c *Controller) reconcilerForKey(ctx context.Context, key string) (*Reconciler, error) {
+	namespace, _, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return nil, err
+	}
+	return c.reconcilerOf(ctx, namespace)
+}
+
+func (c *Controller) eachReconciler(ctx context.Context, fn func(*Reconciler) error) error {
+	if c.EachReconciler == nil {
+		return fn(c.reconciler)
+	}
+	return c.EachReconciler(ctx, fn)
 }

@@ -18,8 +18,17 @@ import (
 // Controller keeps a tenant's load balancers in step with their Services.
 type Controller struct {
 	reconciler *Reconciler
-	queue      workqueue.TypedRateLimitingInterface[string]
-	synced     []cache.InformerSynced
+
+	// ReconcilerFor returns the reconciler serving one namespace, for a
+	// process serving several tenants: a tenant's load balancers are built
+	// with that tenant's credential and nobody else's. Nil serves everything
+	// from the fixed reconciler above.
+	ReconcilerFor func(ctx context.Context, namespace string) (*Reconciler, error)
+	// EachReconciler visits every tenant's reconciler once, for the sweeps.
+	// Nil visits the fixed one.
+	EachReconciler func(ctx context.Context, fn func(*Reconciler) error) error
+	queue          workqueue.TypedRateLimitingInterface[string]
+	synced         []cache.InformerSynced
 }
 
 // NewController wires a reconciler to the informers a node already runs.
@@ -158,7 +167,14 @@ func (c *Controller) reconcile(ctx context.Context, key string) {
 		return
 	}
 
-	if err := c.reconciler.Reconcile(ctx, namespace, name); err != nil {
+	r, err := c.reconcilerOf(ctx, namespace)
+	if err != nil {
+		log.G(ctx).WithError(err).WithField("service", key).
+			Warn("no credential resolves for this namespace; will retry")
+		c.queue.AddRateLimited(key)
+		return
+	}
+	if err := r.Reconcile(ctx, namespace, name); err != nil {
 		// Retried with backoff rather than dropped: a load balancer that is
 		// still provisioning, or an OpenStack call that failed once, resolves
 		// itself, and giving up would leave the Service pointing at nothing
@@ -173,4 +189,20 @@ func (c *Controller) reconcile(ctx context.Context, key string) {
 		return
 	}
 	c.queue.Forget(key)
+}
+
+// reconcilerOf picks the reconciler a namespace's work belongs to.
+func (c *Controller) reconcilerOf(ctx context.Context, namespace string) (*Reconciler, error) {
+	if c.ReconcilerFor == nil {
+		return c.reconciler, nil
+	}
+	return c.ReconcilerFor(ctx, namespace)
+}
+
+// eachReconciler visits every reconciler that holds OpenStack state.
+func (c *Controller) eachReconciler(ctx context.Context, fn func(*Reconciler) error) error {
+	if c.EachReconciler == nil {
+		return fn(c.reconciler)
+	}
+	return c.EachReconciler(ctx, fn)
 }

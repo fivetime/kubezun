@@ -36,8 +36,13 @@ func (c *Controller) RunGC(ctx context.Context) {
 }
 
 func (c *Controller) sweep(ctx context.Context) {
-	r := c.reconciler
+	_ = c.eachReconciler(ctx, func(r *Reconciler) error {
+		c.sweepOne(ctx, r)
+		return nil
+	})
+}
 
+func (c *Controller) sweepOne(ctx context.Context, r *Reconciler) {
 	// ⚠️ An empty served set is not "serves nothing", it is "does not know
 	// yet" — the watch behind it fails closed. Sweeping on that would read
 	// every one of the tenant's load balancers as belonging to a namespace it

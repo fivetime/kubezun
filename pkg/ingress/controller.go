@@ -26,8 +26,14 @@ func isNotFoundErr(err error) bool { return apierrors.IsNotFound(err) }
 // Controller keeps a tenant's L7 load balancers in step with their Ingresses.
 type Controller struct {
 	reconciler *Reconciler
-	queue      workqueue.TypedRateLimitingInterface[string]
-	synced     []cache.InformerSynced
+
+	// ReconcilerFor and EachReconciler: the multi-tenant seams, same contract
+	// as the Service controller's. Nil means the fixed reconciler serves
+	// everything.
+	ReconcilerFor  func(ctx context.Context, namespace string) (*Reconciler, error)
+	EachReconciler func(ctx context.Context, fn func(*Reconciler) error) error
+	queue          workqueue.TypedRateLimitingInterface[string]
+	synced         []cache.InformerSynced
 }
 
 // NewController wires a reconciler to the informers the process already runs.
@@ -188,7 +194,14 @@ func (c *Controller) reconcile(ctx context.Context, key string) {
 		c.queue.Forget(key)
 		return
 	}
-	if err := c.reconciler.Reconcile(ctx, namespace, name); err != nil {
+	r, err := c.reconcilerOf(ctx, namespace)
+	if err != nil {
+		log.G(ctx).WithError(err).WithField("ingress", key).
+			Warn("no credential resolves for this namespace; will retry")
+		c.queue.AddRateLimited(key)
+		return
+	}
+	if err := r.Reconcile(ctx, namespace, name); err != nil {
 		log.G(ctx).WithError(err).WithField("ingress", key).
 			Warn("reconciling the ingress load balancer failed; will retry")
 		c.recordFailure(namespace, name, err)
@@ -218,7 +231,13 @@ func (c *Controller) RunGC(ctx context.Context) {
 }
 
 func (c *Controller) sweep(ctx context.Context) {
-	r := c.reconciler
+	_ = c.eachReconciler(ctx, func(r *Reconciler) error {
+		c.sweepOne(ctx, r)
+		return nil
+	})
+}
+
+func (c *Controller) sweepOne(ctx context.Context, r *Reconciler) {
 
 	// An empty served set means "does not know yet", never "serves nothing" —
 	// sweeping on it would delete every live load balancer the tenant has.
@@ -264,4 +283,18 @@ func (c *Controller) sweep(ctx context.Context) {
 				Warn("could not delete an orphaned ingress load balancer")
 		}
 	}
+}
+
+func (c *Controller) reconcilerOf(ctx context.Context, namespace string) (*Reconciler, error) {
+	if c.ReconcilerFor == nil {
+		return c.reconciler, nil
+	}
+	return c.ReconcilerFor(ctx, namespace)
+}
+
+func (c *Controller) eachReconciler(ctx context.Context, fn func(*Reconciler) error) error {
+	if c.EachReconciler == nil {
+		return fn(c.reconciler)
+	}
+	return c.EachReconciler(ctx, fn)
 }
