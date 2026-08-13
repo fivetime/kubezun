@@ -263,8 +263,8 @@ kubezoo M8 分片 + 多上游集群（M8 优先级据此重估）。空节点在
 - ✅ 原样工作：nodeSelector/nodeAffinity（按其节点标签）、topologySpread 按 zone（真容灾
   语义）、pod 亲和以 zone 为 topologyKey、PriorityClass 抢占、Pending 事件。
 - ⚠️ 语义重解释：hostname 反亲和 = 分布到不同**逻辑节点**（配额分区/AZ），非不同物理机；
-  同一逻辑节点内副本的物理分布由 Zun/Nova 决定——物理 HA 平台侧兜底（Zun 调度层对同
-  owner capsule 软反亲和，fork 候选项 §10）；"节点资源压力" = 配额余量。
+  同一逻辑节点内副本的物理分布由 Zun 决定——物理 HA 由**平台默认启用的 Zun 侧反亲和**
+  兜底（§4.5，⚠️ 尚未实现：实测三副本全堆在一台机器上）；"节点资源压力" = 配额余量。
 - ⛔ 禁止：spec.nodeName 直写；改受保护标签/污点。
 
 ---
@@ -303,6 +303,44 @@ kubectl 优先显示容器状态而非 pod phase，所以两个方向都会说�
 
 > ⚠️ 已经处于 `Failed` 的 pod 不会被追认：VK 不再同步终态 pod
 > （`node/podcontroller.go` "Ignore the pod if it is in the Failed or Succeeded state"）。
+
+### 4.5 反亲和：平台默认启用，落在 Zun 调度层（2026-08-13 定案）
+
+**定案：同 owner 的 capsule 之间反亲和，平台默认开启，不是租户选项。** 之前 §10 把它记作
+"候选"，现在不是了——因为它不是锦上添花，是**当前行为主动地反 HA**。
+
+**实测（2026-08-13，开发环境）**：8 个 capsule **全部**落在 `incus-node-04`，其中包含
+一个 3 副本 StatefulSet（keeper-0/1/2）和一个 2 副本 Deployment（coredns）。
+⚠️ 判据排除过"只有一台可用"：三个 `zun-compute` 服务全部 `up`、同一个 AZ（`nova`）、
+无 disabled，而 node-05/06 的 Placement 用量是 `0 0 0`——**完全空着**。
+
+原因在 `scheduler/filter_scheduler.py:75-105`：`_get_filtered_hosts` 之后**没有任何排序**
+（注释写着 "looping over the **sorted** list of possible hosts"，但没有任何代码 sort——
+又一句从 Nova 抄来而 Zun 没有对应实现的话），然后 `for host in hosts` 取**第一个** claim
+成功的。于是同一工作负载的副本**堆在同一台机器上直到它装满**。三副本的数据库，物理 HA
+是零。
+
+**为什么不能在 K8s 侧解决**：两层都堵死。① kubezoo 的 `place()` 把 `spec.Affinity` 和
+`spec.TopologySpreadConstraints` 整个丢掉（`placement.go:167-168`），租户写的反亲和从来
+没到过后端；② 即使不丢，**K8s 看不见物理机**——一个逻辑节点背后是这个 AZ 里的全部 Zun
+计算节点，`topologyKey: hostname` 在 K8s 侧只能区分逻辑节点。**只有 Zun 的调度器同时看得见
+副本和物理主机**，所以这一刀只能落在 fork 侧。
+
+**⚠️ 实现约束一：Zun 没有 weigher，"软"表达不出来。** `zun/scheduler/` 下只有 `filters/`，
+**没有 `weights/`**；filter 是硬判定，返回空就是 `NoValidHost`。而默认启用**必须是软的**——
+单机实验床上做成硬的，第二个副本直接调度失败。两条路：
+
+- **(a) 补 weigher 框架**（推荐）。比听起来便宜：`scheduler/loadables.py` 就是 Nova 那套
+  通用加载器，`base_filters.py:58` 的 `BaseFilterHandler` 已经继承它。加 `base_weights.py`
+  + `weights/` 是同一个模式再走一遍，且此后所有"偏好"类需求都有地方放。
+- **(b) 降级 filter**：先按反亲和过滤，结果为空则退回不过滤。省事，但把"偏好"塞进
+  硬判定的框里，下一个偏好还得再塞一次。
+
+**⚠️ 实现约束二：capsule 上没有 owner 标识。** 现有标签只有 `managed-by` / `pod-namespace`
+/ `pod-name` / `pod-uid` / `node-name`（`template.go:16-26`）。**`pod-name` 不能用**——
+keeper-0/1/2 三个名字互不相同，要的是它们**共同的 owner**。所以 kubezun 侧要补一个
+owner key（ownerReference 根的 UID，即 ReplicaSet/StatefulSet 身份），Zun 侧按它分组。
+两侧都要动，缺一边都是静默无效。
 
 ---
 
@@ -1007,7 +1045,7 @@ capsule + CRI + zun-cni（正是以下各刀要动的地方）。
 | P2 | Barbican secret ref 注入 | §8.1；与上面两刀同动 cri/driver.py sandbox 路径 |
 | P3 | Manila/RWX（virtiofs） | §8.2 |
 | ✅ 已做 | 架构上报 + capsule 架构约束 | §3.6；`driver.py` 上报 architecture/trait，capsule 模板加 `architecture` → `trait:COMPUTE_ARCH_*=required` |
-| 候选 | 同 owner capsule 软反亲和 | §4 物理 HA 兜底 |
+| **P1** | 同 owner capsule 反亲和（**平台默认启用**） | §4.5；⚠️ 不是锦上添花——实测 8/8 capsule 堆在一台，三个计算节点两个全空。Zun 无 weigher（只有 `filters/`），filter 后不排序取首个可 claim 的主机（`filter_scheduler.py:75-105`）。两侧都要动：Zun 补 weigher + 反亲和实现，kubezun 补 owner 标签 |
 | 候选 | nets/固定 IP 传递核实与补齐 | §5 待实测后定 |
 | 顺手 | linux_net.py ovs-vsctl → ovsdb | 上游自己的 TODO（linux_net.py:48）；规模下省每次 fork 进程 |
 

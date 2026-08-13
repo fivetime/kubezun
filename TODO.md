@@ -968,9 +968,28 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 ## F：Zun fork 工作流（独立推进，§10）
 
 fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/fivetime/openstack-zun`
-（master 基点 e79265e8，与 origin 同步）。**每项功能开 feature 分支，勿直接踩 master。**
-维护边界先立：docker driver / kuryr_network / Container API 划为不维护区；
-主干 = capsule + CRI + zun-cni。
+（master 基点 e79265e8，与 origin 同步）。**直接在 master 上做，不要开 feature 分支**
+（2026-08-08 定，见 CLAUDE.md：六条分支合回时两条已被主线重做取代，只换来冲突；
+这是一条线性工作且只整体部署）。维护边界先立：docker driver / kuryr_network /
+Container API 划为不维护区；主干 = capsule + CRI + zun-cni。
+
+- [ ] **反亲和（平台默认启用，DESIGN §4.5）**——⚠️ 这不是新能力，是**现行为主动反 HA**：
+      实测 8/8 capsule 全落 `incus-node-04`，含 3 副本 StatefulSet（keeper-0/1/2）和
+      2 副本 Deployment（coredns）；判据已排除"只有一台可用"——三个 `zun-compute` 全部
+      `up`、同 AZ、无 disabled，node-05/06 的 Placement 用量 `0 0 0` 完全空着。
+      根因：`scheduler/filter_scheduler.py:75-105` 在 `_get_filtered_hosts` 之后
+      **不排序**（注释说 "sorted list" 但无任何 sort，是从 Nova 抄来的死话），
+      取第一个 claim 成功的主机 → 副本堆到装满为止。
+      **两侧都要动，缺一边静默无效**：
+      - Zun 侧：先补 weigher 框架（`scheduler/loadables.py` 就是 Nova 那套通用加载器，
+        `base_filters.py:58` 已在用；加 `base_weights.py` + `weights/` 是同模式再走一遍），
+        再写按 owner 分组的反亲和权重。⚠️ **必须是软的**——`filters/` 是硬判定，返回空
+        即 `NoValidHost`，单机实验床上第二个副本就调度失败
+      - kubezun 侧：capsule 补 owner 标签（ownerReference 根 UID）。⚠️ **`pod-name` 不能用**
+        ——keeper-0/1/2 名字互不相同，要的是它们共同的 owner；现有标签
+        （`template.go:16-26`）里没有任何一个能分组
+      - 验收判据：3 副本 StatefulSet 落在 ≥2 台计算节点上；**且**把可用计算节点缩到 1 台时
+        仍能调度成功（证明是软的，不是把 HA 换成了调度失败）
 
 - [ ] **（门槛，卡阶段 1）CriDriver.update_containers_states**：capsule 状态同步（现无实现
       → 状态不刷新，kubezun GetPodStatus 会读到陈旧值）；积木已有
@@ -1116,7 +1135,8 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
       `-f` 明确拒绝（Zun 一次性返回全量，轮询会在每个边界重复行）
 - [ ] Barbican secret ref：sandbox 创建时服务端拉取挂 tmpfs，DB 只存引用（§8.1）
 - [ ] （P3）Manila/RWX：virtiofs 透传（参考 CPO pkg/csi/manila）（§8.2）
-- [ ] （候选）同 owner capsule 软反亲和——逻辑节点内物理 HA 兜底（§4）
+- [ ] 同 owner capsule 反亲和——**不再是候选，已定为平台默认启用**（2026-08-13，DESIGN §4.5）。
+      条目正文见本文件 F 段第一项：实测 8/8 capsule 堆在一台，两个计算节点全空
 - [ ] （候选，已降级）CRI socket 可配置：cri/driver.py:44-45 硬编码改 conf 选项——
       2026-08-06 运行时分家（kubelet→CRI-O）后默认 socket 即 Zun 专属，仅当某环境
       kubelet 必须保留 containerd 时才需要（DESIGN §7）
