@@ -1079,7 +1079,20 @@ kubetron），K 可以先取一个小值、以后逐个租户迁进新分片。~
         上没有任何租户标签（kubezoo 不打），而 informer 无法按"namespace 的标签"过滤
         对象。唯一路径 = **动态 per-namespace informer 工厂 + 聚合 lister**：
         `vknode.Namespaces.OnChange` 已有启停机制（per-node pod 工厂就是这么做的），
-        缺的是跨 namespace 的聚合 Lister 实现。是一件完整的中型工程，勿顺手做
+        缺的是跨 namespace 的聚合 Lister 实现。是一件完整的中型工程，勿顺手做。
+        **实现草图（2026-08-13 定，下次直接照此开工）**：
+        ① 每 kind 一个**共享 `cache.Indexer`**（`MetaNamespaceIndexFunc`），标准 lister
+           （`corev1listers.NewServiceLister(indexer)` 等）直接包它——**消费方零改动**，
+           这是整个方案成立的关键；
+        ② 每 (namespace, kind) 一个 reflector（`cache.NewReflector` + 按 namespace 的
+           ListWatch），全部喂同一个 indexer；
+        ③ `Namespaces.OnChange` 启停 reflector；⚠️ **namespace 移除时必须清掉 indexer
+           里它的对象**——reflector 停了不会自己清，残留对象 = 已退租租户的 pod 继续
+           出现在 peer 集合里；
+        ④ ⚠️ `HasSynced` 语义要自己定义：动态集合下"synced"= 当前已知的每个 namespace
+           的首次 list 都完成。⚠️ 新 namespace 加入时不得把全局 HasSynced 翻回 false——
+           那会让等它的控制器全部卡住；
+        ⑤ 顺序：先 `services`+`slices`（Service controller 最吃扇出），跑通再推其余六类
       - ⚠️ **`allPods` 是例外，只能收窄到分片、不能到单租户**——它的注释写明
         "A policy's peers are pods wherever they run"
 - [ ] **（P2）分片装配：声明式归属**（§2.1，抄 kubetron
