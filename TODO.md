@@ -961,10 +961,12 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 保住的是唯一那条真差异——算力归属 OpenStack project。租户体验退回与 B1 一致
 （`get no` 为空、无 DS）。
 
-⚠️ **卡在前面的两个决定**（没定就别开工，它们改变实现）：
+⚠️ **卡在前面的决定**（没定就别开工，它改变实现）：
 - **有没有客户真要节点可见性 / DaemonSet** —— 决定这刀能不能砍
-- **K 取多少** —— 唯一自由度，同时定爆炸半径与节点数；⚠️ **一次定死**，
-  改 K 要重分配租户，过渡期违反 DESIGN §7.7.5c（同租户 peer 同步只能有一个所有者）
+
+✅ **"K 取多少"不再是开工前提**（2026-08-13）：分片归属改成**声明式**之后（§2.1，抄
+kubetron），K 可以先取一个小值、以后逐个租户迁进新分片。~~"K 一次定死"~~ 那条限制随
+哈希取模一起作废——它是哈希的限制，不是分片本身的。
 
 - [ ] **（P0）凭据按 namespace 解析**（§4.6）：`zunClient` 从**单值**变成
       `namespace → project → Secret → clients` 的解析器。
@@ -1003,9 +1005,31 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       新增 `knaas.io/shard`
 - [ ] **（P1）容量改静态大额**（§3.2）：`capacity = 配额镜像` 作废——共享节点镜像不了任一
       租户的配额。把关落到 K8s ResourceQuota 准入 + Zun project 配额两道闸门
-- [ ] **（P2）分片装配**：按租户稳定哈希分配到 K 个进程。
-      ⚠️ **分片键必须是租户，不是 namespace**——按 namespace 哈希会把同租户的
-      `<tid>-default` 与 `<tid>-kube-system` 分到不同进程，**当场违反 §7.7.5c**
+- [ ] **（P1）informer 收窄**（§2.2）——⚠️ **现存缺陷，不是新形态才引入的**：
+      `vknode.go:143` 的 `scmFactory` 无任何过滤，八类对象全集群缓存
+      （services / endpointslices / ingresses / networkpolicies / **allPods** /
+      pvc / pv / storageclasses）。
+      - **与 §2 自己的论证矛盾**：`ObjectReader` 特意不做 lister，注释写着"a cache wide
+        enough to answer for every namespace the tenant may create is also wide enough to
+        answer for another tenant's"——同一个担忧，ConfigMap/Secret 严防死守，
+        这八类却照单全收
+      - **实测（2026-08-13，仅 2 个租户）**：全集群 67 个 pod，属于 111111 的只有 11 个；
+        Services 26 / 6。**两个租户时就已经 6 倍过取**
+      - ⚠️ **分片形态下会从"浪费"变成"抵消"**：`K × 集群规模` 而非 `集群规模`。
+        分片本来是为了省，这样反而更贵
+      - **修法**：抄 kubetron 的服务端过滤（`WithTweakListOptions`）
+      - ⚠️ **`allPods` 是例外，只能收窄到分片、不能到单租户**——它的注释写明
+        "A policy's peers are pods wherever they run"
+- [ ] **（P2）分片装配：声明式归属**（§2.1，抄 kubetron
+      `pkg/webhook/claim_webhook.go:15-27` + `NamespaceShard()`）。
+      ⚠️ **粒度必须是租户，不是 namespace**——按 namespace 分配会把同租户的
+      `<tid>-default` 与 `<tid>-kube-system` 分到不同进程，**当场违反 §7.7.5c**。
+      这一条正是**不能整段照抄 kubetron** 的地方：它的 `NamespaceShard()` 就是按 namespace
+      解析的（对它成立，因为它的分片轴是 AZ 且没有跨 namespace 求并集的地址组）
+      ⚠️ **归属判定只能有一套**——kubetron 有两套（claim 创建时打标 vs Service reconciler
+      每次读 ConfigMap），同一 namespace 可能"claim 归 A、Service 归 B"，那**就是**双所有者。
+      我们只存一处：Tenant CRD，与 project id 同处
+      ⚠️ **迁移仍必须"先停旧、再起新"**，声明式只是把单位从"全体"缩到"一个租户"
 - [ ] **（P2）systemd 单元实例名** 从租户改为分片（`kubezun@<region>-<shard>`）
 
 ## 阶段 4：生产化（§12）

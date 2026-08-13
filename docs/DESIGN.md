@@ -154,14 +154,15 @@ $$\text{进程数} = \text{regions} \times K \qquad \text{节点数} = \text{进
   （`volume/client.go:19,29`）、Octavia、Barbican。一个进程跨不了 region。
   ⚠️ token 本身不受 region 约束（Keystone 认证与 catalog 选点是两步），所以"一 region
   一进程"是工程上的干净选择，不是身份层强制。
-- **K 是唯一自由度**，租户按稳定哈希分片。它**同时**决定两件事，往哪边拧都要付另一边的价：
+- **K 是唯一自由度**，租户分配到 K 个分片（分配方式见 §2.1）。它**同时**决定两件事，
+  往哪边拧都要付另一边的价：
   | K | 爆炸半径 | 节点数 |
   |---|---|---|
   | = 租户数 | 1 个租户 | ∝ 租户数 ← 旧形态，规模墙 |
   | 中间值 | 1/K 租户 | 与租户数**无关** |
   | = 1 | 整个 region | 最省、最脆 |
-- ⚠️ **K 一次定死，不要当运行时可调参数**：改 K 要在进程间重分配租户，过渡期同一租户会
-  短暂有两个所有者，直接违反 §7.7.5c 的不变式。
+- **分配方式：声明式，不是哈希取模**（2026-08-13 改，见 §2.1）。⚠️ 曾经写过"K 一次定死、
+  不要当运行时可调参数"——**那是哈希取模的限制，声明式没有这个限制**，已作废。
 - **一个进程死了会怎样**（已验证，不是推演）：capsule 继续跑；探针继续执行、liveness 继续
   重启容器（zun-compute 自己的周期任务 `manager.py:1393` + `driver.py:992`，不经控制面）。
   **冻结的是**：pod status 回写、pod 创建/删除、NetworkPolicy 同步、Service 的 Octavia
@@ -173,13 +174,13 @@ per-node 身份三件事完成后可作为成本优化重评*）：
 
 | 条件 | 状态 |
 |---|---|
-| informer 白名单 | ✅ **早已完成**。我们不用 nodeutil 的默认全集群 informer——`ObjectReader` 是按对象 GET，注释明写 *"Deliberately not a lister"*（`provider.go:132-144`）；`pkg/vknode` 就是为绕开 `nodeutil.NewNode` 自建 informer 而写的 |
+| informer 白名单 | ⚠️ **只完成了一半，见 §2.2**。ConfigMap/Secret 走 `ObjectReader` 按对象 GET（对），但 Services/EndpointSlices/Ingresses/NetworkPolicies/**全部 Pod**/PVC/PV/StorageClass **仍是全集群缓存**（`vknode.go:143` 的 `scmFactory` 无任何过滤）——**这是要补的第二刀** |
 | per-node 身份 | ✅ 不受影响。节点仍然存在（只是不再每租户一个），per-node `:10250` + 独立证书 + `WebhookAuth(nodeName)` 照旧 |
 | 凭据外置 | ⏳ **这次要做的**，见 §4.6 |
 
-⚠️ 原否决理由里"全集群 secret 缓存集中"这一条**在我们的实现上从来不成立**——它描述的是
-VK 库的默认行为，而我们第一天就绕开了。真正剩下的代价是**凭据集中**与**panic 爆炸半径**，
-这两条由 K 这个旋钮定价，不再是"有或无"。
+⚠️ 原否决理由里"全集群 secret 缓存集中"**只对了一半**：ConfigMap/Secret 那一半我们第一天
+就绕开了（`ObjectReader`），但另外八类对象至今仍是全集群缓存（§2.2）。真正剩下的代价是
+**凭据集中**与**panic 爆炸半径**，这两条由 K 这个旋钮定价，不再是"有或无"。
 
 **凭据纪律**：每租户一份 Keystone application credential（unrestricted=false、限定 role、
 设 expires_at）。**严禁 admin 凭据**——Zun admin context 强制 all_projects=True
@@ -187,6 +188,70 @@ VK 库的默认行为，而我们第一天就绕开了。真正剩下的代价�
 + 按名跨项目查找（同文件 215-228），是现成的跨租户读/删洞。客户端构造直接复用
 (kubetron) pkg/neutron/provider.go 的 `NewClientFromAppCred`（gophercloud v2）。
 **存放位置与绑定规则见 §4.6——那一节是本次改动的承重件。**
+
+### 2.1 分片分配：声明式，抄 kubetron（2026-08-13 定案）
+
+**租户属于哪个分片是声明出来的，不是算出来的。**
+
+原方案是"租户稳定哈希 % K"。改掉它的理由只有一条，但是决定性的：**改 K 就是重新取模，
+绝大多数租户要同时搬家**，而搬家的过渡期里同一租户短暂有两个所有者——直接违反 §7.7.5c。
+于是 K 变成一次性的、不可调的、而且没有依据可定的数（§3.5 的规模实测至今未做）。
+
+**kubetron 已经解决过这个问题**（`pkg/webhook/claim_webhook.go:15-27`、
+`NamespaceShard()` :77-89）：分片写在 namespace 的 `kubetron-network` ConfigMap
+`shard` 键上，缺省落 `DefaultShard`，operator 可以显式覆盖。
+
+抄过来的三条：
+
+| 抄什么 | 为什么 |
+|---|---|
+| **声明式归属** | **重分配的单位变成一个租户**，一个一个搬，不惊动其他人。"K 一次定死"这条限制随之消失——K 可以随时增加，把租户逐个迁进新分片 |
+| **服务端标签过滤** | kubetron 注释：*"a shard neither receives nor stores the other shards' objects"*。见 §2.2 |
+| **缺省分片** | 没声明的落缺省，不是启动失败——开通流程有先后，不该因为一个字段没写好就拒绝服务 |
+
+⚠️ **有一条不能抄：kubetron 的归属判定有两套，我们只能有一套。**
+它的 claim 是**创建时打标**（之后不变，粘滞），而 Service/DNS reconciler 是
+**每次 reconcile 读 ConfigMap**（立即翻转）。于是同一个 namespace 可能出现
+"claim 归分片 A、Service 归分片 B"。对 kubetron 或许无害，**对我们是禁止的**——
+§7.7.5c 要求一个租户的 peer 同步只能有一个所有者，两套判定不一致**就是**双所有者。
+⇒ **单一真相源：租户的分片归属只存一处**（Tenant CRD，与 project id 同处，§4.6.3），
+所有控制器读同一个字段。
+
+⚠️ **声明式没有消除交接问题，只缩小了它**。把租户从分片 A 移到 B 仍然必须
+**先停 A、确认停干净、再起 B**，不能重叠。区别是：以前这个动作的单位是"全体租户"，
+现在是"一个租户"，可以逐个做、可以回滚、出问题只影响一个。
+
+### 2.2 ⚠️ informer 收窄：现存缺陷，不是新形态才有的
+
+`vknode.go:143` 的 `scmFactory` 是 `NewSharedInformerFactoryWithOptions(client, resync)`
+——**没有 namespace 限制、没有 tweak、没有任何过滤**。它背后是八类对象：
+
+`services` / `endpointslices` / `ingresses` / `networkpolicies` / **`allPods`** /
+`persistentvolumeclaims` / `persistentvolumes` / `storageclasses`
+
+**全部全集群缓存。** 只有 per-node 的那个 pod informer 有 `spec.nodeName` 字段选择器
+（`vknode.go:204-206`）。
+
+**这与 §2 自己的论证自相矛盾。** `ObjectReader` 特意不用 lister，注释写着：
+
+> Deliberately not a lister. ... this process serves one tenant: a cache wide enough to
+> answer for every namespace the tenant may create is also wide enough to answer for
+> another tenant's
+
+**同一个担忧，两种做法**：ConfigMap/Secret 严防死守，Services/NetworkPolicies/全部 Pod/PVC
+却照单全收。
+
+**实测（2026-08-13，实验床仅 2 个租户）**：全集群 67 个 pod，属于租户 111111 的只有 11 个
+——它的进程缓存了全部 67 个。Services 26 / 6。**在只有两个租户时就已经是 6 倍过取。**
+
+⚠️ **分片形态下这会从"浪费"变成"抵消"**：K 个进程 × 全集群缓存 = 内存与 watch 流量按
+`K × 集群规模` 增长，而不是按集群规模。**分片本来是为了省，这样反而更贵。**
+
+**修法**：抄 kubetron 的服务端过滤——按分片标签或服务命名空间集做 `WithTweakListOptions`。
+⚠️ **但 `allPods` 是个例外，不能按 namespace 收窄到"本进程服务的租户"**：它的注释写明
+*"A policy's peers are pods wherever they run"*。收窄它之前先确认 peer 选择器的作用域——
+NetworkPolicy 的 peer 不跨租户（选择器带 namespace 限定，§7.7.1），所以按**分片**收窄
+是安全的，按**单个租户**收窄不是。
 
 ---
 
@@ -1198,14 +1263,19 @@ fork，买进一个定案变更和一份新的生命周期责任。**
 
 **⚠️ 2026-08-13 共享节点形态下,这条不变式的满足方式变了,而且更脆:**
 
-它现在依赖**分片函数的稳定性**——一个租户的全部 namespace 必须**恒定落在同一个分片**。
-所以:
+它现在依赖**一个租户的全部 namespace 恒定属于同一个分片**。所以:
 
-- 分片键必须是**租户**,不能是 namespace。按 namespace 哈希会把同租户的
+- **归属粒度必须是租户,不能是 namespace。** 按 namespace 分配会把同租户的
   `<tid>-default` 与 `<tid>-kube-system` 分到不同进程,**当场违反本不变式**。
-- ⚠️ **改 K 会在过渡期违反它**:重分配期间同一租户短暂有两个所有者,正是本节禁止的情况。
-  这是 §2 说"K 一次定死、不要当运行时可调参数"的直接原因。真要改 K,必须设计一个
-  **先停旧所有者、再起新所有者**的交接,而不是让两者重叠。
+  ⚠️ 这一条正是我们**不能整段照抄 kubetron** 的地方:它的 `NamespaceShard()`
+  就是按 namespace 解析的(`claim_webhook.go:81`)——对它成立是因为它的分片轴是 AZ、
+  且它没有"跨 namespace 求并集"的地址组;对我们不成立。
+- **归属判定只能有一套。** ⚠️ kubetron 有两套(claim 创建时打标、Service reconciler
+  每次读 ConfigMap),同一 namespace 可能出现"claim 归 A、Service 归 B"——那**就是**
+  双所有者。我们的归属只存一处(Tenant CRD,与 project id 同处,§2.1/§4.6.3)。
+- ⚠️ **迁移仍然必须"先停旧、再起新",不能重叠。** 声明式分配(§2.1)没有消除这个要求,
+  只是把它的单位从"全体租户"缩小到"一个租户"——可以逐个做、可以回滚、出问题只影响一个。
+  ~~"K 一次定死"~~ 那条限制随哈希取模一起作废。
 
 #### 7.7.5d ⚠️ 一个分片**一个**进程,不能靠多副本做高可用(2026-08-12 查证)
 
@@ -1424,7 +1494,8 @@ config.go:20-56 loadConfig 是死代码，弃。
 | **P0** | **project 绑定三态校验**（无记录→写入 / 一致→放行 / **不一致→拒绝启动**）。⚠️ 必须在同步循环之前；⚠️ 校验对象是 token 里的 project id，**不是 Secret 哈希**（否则禁掉轮换） | 小 | §4.6.3 |
 | **P1** | 节点补 `topology.kubernetes.io/region` + PV nodeAffinity 加一条 MatchExpression。⚠️ **必须先于第二个 region 上线**，否则同名 AZ 静默错配 | 小 | §3.1 |
 | P1 | 节点身份改造：名字/标签/污点去租户化（`knaas.io/serverless` 取代 `knaas.io/tenant`），加 `knaas.io/shard` | 小 | §3.1 |
-| P2 | 分片装配：按租户稳定哈希，⚠️ 分片键必须是**租户**不是 namespace | 中 | §7.7.5c |
+| P2 | 分片装配：**声明式**归属（Tenant CRD 上一个字段），⚠️ 粒度必须是**租户**不是 namespace，且**归属判定只能有一套** | 中 | §2.1/§7.7.5c |
+| **P1** | **informer 收窄**：`scmFactory` 八类对象仍是全集群缓存（实测 2 租户时已 6 倍过取）。⚠️ **现存缺陷，不是新形态才有的**；⚠️ `allPods` 只能收窄到**分片**不能到单租户 | 中 | §2.2 |
 
 平台侧配套（不在本仓库）：
 
