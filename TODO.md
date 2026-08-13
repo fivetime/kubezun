@@ -1077,8 +1077,15 @@ kubetron），K 可以先取一个小值、以后逐个租户迁进新分片。~
       条件装配（mt 分支从头不碰 `set.XInformer()` 访问器——调用即物化）。netpol 的
       handler 提取为 podHandler/policyHandler 供两个构造器共用，防双份漂移。
       PV/StorageClass 集群域保持 informer。实验床 mt 单元：零 panic、service 路径验证过；
-      ⚠️ **claims 路径只有单测**——实测里 WFFC 的 Pending 分辨不出"看见了在等"和"没看见"，
-      带消费 pod 的完整 PVC 供给回归留给下一次 mt 会话。
+      ✅ **claims 路径完整回归已做（2026-08-13，mt 单元实测）**：WFFC PVC + 消费 pod →
+      Bound + 1/1 Running;判据全部带出处——PV 注解 `knaas.io/storage-kind=cinder`（证明是
+      我们的 reconciler 经 scoped claims 供给）、卷名 `kubezun_111111_pvc_…` 且 111111
+      凭据可见（project 归属）、PV nodeAffinity 单 term 含 region+zone、写入 take3 回读
+      成功。删除闭环:PVC 删除 → PV Released（观察到），卷回收归周期清扫（与 LB GC 同
+      恢复模型），异步完成。
+      ⚠️ 过程中两次差点误判:① reader 撞上卷异步 detach 的 `volume-in-use`（竞态非缺陷，
+      VK 退避重建）;② 无 fsGroup 时 Permission denied 起初当成 bug——**是标准 K8s 语义**
+      （无 fsGroup 即无 chown），加 fsGroup 即通。
       ⚠️ **接线时的坑已查明**：svcRec 构造处无条件调 `set.XInformer().Lister()` 会**物化**
       集群级 informer（调用即创建，Start 就会启动它）——mt 分支必须从头就不碰那些访问器，
       否则收窄名存实亡。PV/StorageClass 是集群域资源，天然不收窄。
@@ -1181,6 +1188,11 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
 这是一条线性工作且只整体部署）。维护边界先立：docker driver / kuryr_network /
 Container API 划为不维护区；主干 = capsule + CRI + zun-cni。
 
+- [ ] ⚠️ **（P1，2026-08-13 发现）容器退出码不保真**：容器内命令失败（`echo > /d/proof`
+      Permission denied → sh 退出 1），pod 却报 `Completed / exitCode 0 / startedAt null`。
+      **调用方会把失败读成成功**——Job 控制器按它判成败，这是 fail-open 方向。落点大概率
+      在 fork 的状态映射或 CRI 退出码传递（`_populate_container_state` 一带）；先复现
+      再定位，⚠️ 判据要能区分"Zun 没给退出码"和"我们丢了它"
 - [ ] **反亲和（平台默认启用，DESIGN §4.5）**——⚠️ 这不是新能力，是**现行为主动反 HA**：
       实测 8/8 capsule 全落 `incus-node-04`，含 3 副本 StatefulSet（keeper-0/1/2）和
       2 副本 Deployment（coredns）；判据已排除"只有一台可用"——三个 `zun-compute` 全部
