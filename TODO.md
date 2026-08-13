@@ -1404,8 +1404,18 @@ Container API 划为不维护区；主干 = capsule + CRI + zun-cni。
       ⚠️ 模板只对新建组生效,存量租户 default SG 要手工补 ingress 全开并清 remote_group
       规则。完整命令与注释已交用户笔记。kubezun 侧防御已验证:deny-all 无条件清空、
       baseline 删反方向、EnsureRuleSet 删外来规则(`neutron.go:273-279`)
-- [ ] ⑧ 333333 按本清单完整开通（project/appcred/网络/VIP/router+豁免/单元/证书/RBAC/
-      Secret/coredns placement）——它从未开通过
+- [x] ⑧ **333333 完整开通 —— 已做并验收（2026-08-13,首次全清单执行,零返工路径可复制）**：
+      project `knaas-t3`(ac7ca689)/user+member/appcred;t3-net `192.168.120.0/24` +
+      t3-vip `220.0/24`;t3-router 挂外网+双接口;**⑦ SNAT 豁免照 t2 定式**
+      (删 VIP 子网 snat + `knaas_t3_east_west` 豁免集);单元照 222222 抄
+      (`--listen :10252`,证书复用 SAN=IP);SA+两条 ClusterRoleBinding;
+      knaas-system Secret+注解;coredns placement。
+      **验收**:LB `ACTIVE ONLINE`;capsule 内 nslookup 由 `192.168.220.63`(自己的
+      kube-dns VIP)答出;logs 可读(即③④⑤通);出网 OK。
+      ⚠️ 一个执行坑:SA kubeconfig 手写 YAML 两次被格式咬
+      (flow-style 里 URL 冒号/源文件格式与 grep 假设不符)——**用
+      `kubectl config view -o jsonpath` 读值,写块式,起服务前先
+      `kubectl --kubeconfig=... get` 自验**,这条并入开通控制器规格
 
 ## P：平台侧配套（代码不在本仓库）
 
