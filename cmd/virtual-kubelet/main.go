@@ -7,9 +7,11 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -486,6 +488,11 @@ func run(o options) error {
 			Arch:       spec.arch,
 			Version:    version,
 			InternalIP: o.internalIP,
+			// The advertised kubelet port must follow the listen address:
+			// the API server dials what the node advertises, and a node
+			// listening on one port while advertising another has logs and
+			// exec fail with a NotFound that looks like a missing pod.
+			KubeletPort: kubeletPortOf(spec.listen),
 			Capacity: knode.Capacity{
 				CPU:    o.capacityCPU,
 				Memory: o.capacityMem,
@@ -934,4 +941,18 @@ func splitList(v string) []string {
 		}
 	}
 	return out
+}
+
+// kubeletPortOf reads the port out of a listen address, for the node to
+// advertise. Zero lets the node default stand (10250).
+func kubeletPortOf(listen string) int32 {
+	_, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.ParseInt(port, 10, 32)
+	if err != nil {
+		return 0
+	}
+	return int32(n)
 }

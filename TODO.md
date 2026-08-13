@@ -1369,6 +1369,35 @@ Container API 划为不维护区；主干 = capsule + CRI + zun-cni。
 - [ ] （候选）nets/固定 IP 按 PoC 结论补齐
 - [ ] （顺手）linux_net.py ovs-vsctl → ovsdb（上游自己的 TODO，linux_net.py:48）
 
+## O：租户开通清单（2026-08-13，给 222222 补齐时逐项踩出来的——开通控制器的规格）
+
+> 背景:222222 名义上"已开通"（openrc + 单元 + 节点），但 **7 项缺失**让它的 coredns 留在
+> B1、DNS 完全不可用、logs/exec 从未工作过。每一项都是实测踩到才发现的，这就是开通
+> 控制器必须覆盖的清单（111111 当年手工做过、没记下来的部分）：
+
+- [x] ① coredns Deployment 模板注 placement（pool selector + tenant toleration）——
+      缺失 = coredns 落 B1 真实节点（Cilium IP），根本不在租户网里
+- [x] ② 单元带 `--vip-subnet-id`/`--vip-network-id`（t2 的 VIP 网早建好了但从没接上）——
+      缺失 = Service 全部无 LB，DNS 无从谈起
+- [x] ③ 单元带 `--listen :1025X`（**每进程独立端口**）——缺失 = 两进程抢 :10250，
+      输家的 kubelet API 静默死亡；且 **KubeletPort 上报要跟 listen 走**（发现 main 从未
+      赋值，恒报 10250——已修，`kubeletPortOf`）
+- [x] ④ TLS 三件套（tls.crt/tls.key/client-ca.crt，SAN=IP 可跨租户复用）——
+      缺失 = kubelet API 不监听，logs/exec 对该租户从未工作，症状是 NotFound 不是拒绝
+- [x] ⑤ `<sa>-auth-delegator` ClusterRoleBinding（system:auth-delegator）——
+      缺失 = WebhookAuth 的 SubjectAccessReview 被拒
+- [x] ⑥ 平台 Secret 注解（project/region/network-id/vip-*）——mt 形态的绑定
+- [x] ⑦ ⭐ **东西向 SNAT 豁免**（本次最深的一坑，t1 修过但没记档）：Neutron 建的
+      snat 行会把 pod→VIP 的东西向流量 SNAT 成外部 IP → LB 通路死。修法 =
+      `address_set knaas_<t>_east_west = [pod子网, VIP子网]` + NAT 行
+      `exempted_ext_ips` 指向它（生成 lr_out_snat priority-27 豁免流）。
+      缺失 = Service/DNS 全部超时，而 NB 拓扑与工作租户**逐字段一致**——只有 SB 的
+      lr_out_snat 流能看出差异。⚠️ 排障中三次判据坑：ovn-trace 的 ct_lb 默认不选后端
+      （分辨不出 DNAT）、busybox nslookup 对 NXDOMAIN 返回非零、
+      `port list -c security_group_ids` 列名无效静默为空
+- [ ] ⑧ 333333 按本清单完整开通（project/appcred/网络/VIP/router+豁免/单元/证书/RBAC/
+      Secret/coredns placement）——它从未开通过
+
 ## P：平台侧配套（代码不在本仓库）
 
 > ⭐ **2026-08-13：需求已成文** → [`docs/requirements-platform-cn.md`](docs/requirements-platform-cn.md)
