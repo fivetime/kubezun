@@ -228,6 +228,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, namespace, name string) erro
 type Placement struct {
 	Zone string
 	AZ   string
+	// Region is the OpenStack region the volume is created in.
+	//
+	// ⚠️ A zone name identifies a zone only within its region: OVN carries a
+	// zone as a string in ovn-cms-options on the chassis row and every zone of
+	// a region shares one northbound database, so two regions can each have an
+	// "az1". A volume placed in one region and matched on zone alone therefore
+	// also matches the other region's node, where it cannot be attached at all
+	// -- volumes do not cross regions. Empty on a single-region deployment,
+	// where there is nothing to disambiguate.
+	Region string
 }
 
 // waitingForConsumer reports whether this claim's class defers placement and
@@ -265,6 +275,7 @@ func (r *Reconciler) placementFor(claim *corev1.PersistentVolumeClaim) Placement
 	}
 	if p, ok := r.PlacementOf(node); ok {
 		where.Zone = p.Zone
+		where.Region = p.Region
 	}
 	return where
 }
@@ -620,23 +631,7 @@ func (r *Reconciler) provision(ctx context.Context, claim *corev1.PersistentVolu
 			},
 		},
 	}
-	if where.Zone != "" {
-		// ⚠️ Without this the volume is placed once and then forgotten: a pod
-		// deleted and recreated can be scheduled into another zone, and a
-		// volume cannot follow it. The claim stays Bound and the pod stays
-		// Pending, with nothing in either object saying why.
-		pv.Spec.NodeAffinity = &corev1.VolumeNodeAffinity{
-			Required: &corev1.NodeSelector{
-				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
-					MatchExpressions: []corev1.NodeSelectorRequirement{{
-						Key:      corev1.LabelTopologyZone,
-						Operator: corev1.NodeSelectorOpIn,
-						Values:   []string{where.Zone},
-					}},
-				}},
-			},
-		}
-	}
+	pv.Spec.NodeAffinity = nodeAffinityFor(where)
 	if policy := claim.Annotations["knaas.io/reclaim-policy"]; policy == "Retain" {
 		pv.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimRetain
 	}
@@ -770,4 +765,52 @@ func ExportHost(export string) string {
 		return export[:i]
 	}
 	return ""
+}
+
+// nodeAffinityFor pins a volume to the nodes it can actually be attached on.
+//
+// ⚠️ Without it a volume is placed once and then forgotten: a pod deleted and
+// recreated can be scheduled somewhere the volume cannot follow, and the
+// symptom is a claim that stays Bound beside a pod that stays Pending, with
+// nothing in either object saying why.
+//
+// ⚠️ Region is named alongside zone, and omitting it is the same bug one level
+// up. A zone name identifies a zone only within its region -- OVN carries a
+// zone as a string in ovn-cms-options on the chassis row and every zone of a
+// region shares one northbound database -- so "az1" matches az1 in every region
+// the cluster reaches, and the volume cannot be attached in the others at all.
+// Same Bound-and-Pending pair, same silence. A single-region deployment carries
+// no region label and loses nothing: the requirement is simply absent.
+//
+// ⚠️ Both requirements go in ONE term. Terms are ORed and requirements within a
+// term are ANDed, so two terms would say "the right zone OR the right region",
+// which is wider than either alone -- the widening this exists to prevent.
+func nodeAffinityFor(where Placement) *corev1.VolumeNodeAffinity {
+	var match []corev1.NodeSelectorRequirement
+	for _, r := range []struct {
+		key   string
+		value string
+	}{
+		{corev1.LabelTopologyRegion, where.Region},
+		{corev1.LabelTopologyZone, where.Zone},
+	} {
+		if r.value == "" {
+			continue
+		}
+		match = append(match, corev1.NodeSelectorRequirement{
+			Key:      r.key,
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   []string{r.value},
+		})
+	}
+	if len(match) == 0 {
+		// Nowhere to pin it: a term with no requirements matches every node,
+		// which is the opposite of what an empty placement means.
+		return nil
+	}
+	return &corev1.VolumeNodeAffinity{
+		Required: &corev1.NodeSelector{
+			NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: match}},
+		},
+	}
 }

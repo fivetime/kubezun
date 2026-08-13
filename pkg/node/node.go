@@ -42,10 +42,23 @@ type Capacity struct {
 
 // Options describes a tenant's virtual node.
 type Options struct {
-	Name     string
-	Tenant   string
-	Zone     string
-	Version  string
+	Name   string
+	Tenant string
+	Zone   string
+	// Region is the OpenStack region this node's capsules are created in. It
+	// comes from the credential, which resolves every service endpoint within
+	// one region and cannot reach another.
+	//
+	// ⚠️ Load-bearing once a second region exists, and silent before then. An
+	// availability zone name is only unique inside its region -- OVN treats a
+	// zone as a string in ovn-cms-options on the chassis row, and every zone of
+	// a region shares one northbound database. So two regions can both call a
+	// zone "az1", and a volume provisioned in one would match the other's node
+	// on zone alone. The failure is a claim that stays Bound and a pod that
+	// stays Pending with neither object saying why -- the same shape §14 of the
+	// volume reconciler already documents for the cross-zone case.
+	Region  string
+	Version string
 	OS       string
 	Arch     string
 	Capacity Capacity
@@ -82,6 +95,12 @@ func Build(o Options) *corev1.Node {
 	}
 	if o.Tenant != "" {
 		labels[PoolLabelKey] = o.Tenant
+	}
+	if o.Region != "" {
+		// Paired with the zone below, and the pairing is the point: a zone name
+		// identifies a zone only within its region, so anything that matches on
+		// zone alone matches across regions too.
+		labels[corev1.LabelTopologyRegion] = o.Region
 	}
 	if o.Zone != "" {
 		// A real zone, not decoration: capsules are placed in the matching

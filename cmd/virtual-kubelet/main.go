@@ -337,7 +337,7 @@ func run(o options) error {
 			Volumes:     set.VolumeInformer().Lister(),
 			Classes:     set.ClassInformer().Lister(),
 			Client:      client.CoreV1(),
-			PlacementOf: placementOf(specs),
+			PlacementOf: placementOf(specs, zunClient.Region()),
 			// Growing a block volume needs a second step where it is attached,
 			// which only the capsule service can do.
 			Capsules:        zun.NewCapsuleAPI(zunClient),
@@ -385,10 +385,15 @@ func run(o options) error {
 
 	for _, spec := range specs {
 		nodeObj := knode.Build(knode.Options{
-			Name:       spec.name,
-			Tenant:     o.tenant,
-			Zone:       spec.zone,
-			Arch:       spec.arch,
+			Name:   spec.name,
+			Tenant: o.tenant,
+			Zone:   spec.zone,
+			// From the credential rather than a flag of its own: one set of
+			// credentials resolves every service endpoint within one region
+			// and cannot reach another, so the region is a property of the
+			// process, not of the node. A flag could disagree with it.
+			Region: zunClient.Region(),
+			Arch:   spec.arch,
 			Version:    version,
 			InternalIP: o.internalIP,
 			Capacity: knode.Capacity{
@@ -710,10 +715,10 @@ func convertTenant(ctx context.Context, zunClient *zun.Client, phase netpol.Phas
 // is asked for -- only appear together here, in the flags that set both. A
 // claim scheduled onto a node we do not run gets no answer, and falls back to
 // whatever the deployment configured.
-func placementOf(specs []nodeSpec) func(string) (kvolume.Placement, bool) {
+func placementOf(specs []nodeSpec, region string) func(string) (kvolume.Placement, bool) {
 	where := make(map[string]kvolume.Placement, len(specs))
 	for _, spec := range specs {
-		where[spec.name] = kvolume.Placement{Zone: spec.zone, AZ: spec.zunAZ}
+		where[spec.name] = kvolume.Placement{Zone: spec.zone, AZ: spec.zunAZ, Region: region}
 	}
 	return func(node string) (kvolume.Placement, bool) {
 		p, ok := where[node]

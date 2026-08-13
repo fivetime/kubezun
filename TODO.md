@@ -1005,7 +1005,16 @@ kubetron），K 可以先取一个小值、以后逐个租户迁进新分片。~
         → 重建；而旧 capsule **继续跑、继续计费、永远不会被回收**（孤儿清扫用新凭据 list，
         看不见它们）；Service 还会**复制一份 LB**（`ensureLoadBalancer` 得到 NotFound
         就 fall through 新建，旧的继续持有 VIP）
-- [ ] ⭐ **（P0，从 P1 上调）节点补 `topology.kubernetes.io/region`** + PV nodeAffinity
+- [x] ⭐ **（P0）节点补 `topology.kubernetes.io/region` —— 已做并实测（2026-08-13）**：
+      节点标签实测变为 `region=RegionOne` + `zone=az1`（⚠️ VK 会更新已注册节点的标签，
+      不存在陈旧标签的升级隐患）；新建 PV 的 nodeAffinity 实测为
+      `[{matchExpressions:[region In RegionOne, zone In az1]}]` —— **一个 term 两条要求**，
+      且**消费它的 pod 1/1 Running**（后半句才是判据：亲和写对 ≠ 能用，写错的亲和会让 pod
+      永远 Pending 而两个对象都不说话）。region 取自 `zunClient.Region()` 而非新开 flag——
+      一份凭据只解析一个 region 的端点，region 是进程属性，flag 可能与它不一致。
+      单测三条并逐一验证过会红：漏 region、拆成两个 term（变成 OR）、空 Placement 产生
+      匹配一切的空 term。原条目正文：
+- [~] ~~（P1 原文）节点补 `topology.kubernetes.io/region`~~ + PV nodeAffinity
       加一条 MatchExpression（§3.1）。⚠️ **必须先于第二个 region 上线**——今天 PV 只按
       zone 匹配（`volume/reconciler.go:632-634`），多 region 下 `r1/az1` 与 `r2/az1` 会撞，
       症状是 `reconciler.go:623-627` 注释描述的那个：**claim Bound、pod Pending、

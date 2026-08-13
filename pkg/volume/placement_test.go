@@ -116,3 +116,63 @@ func TestStorageFollowsTheNodeThatWillUseIt(t *testing.T) {
 		t.Errorf("the deployment setting did not win: %+v", got)
 	}
 }
+
+// TestVolumeIsPinnedToItsRegionAndZone is the multi-region safety net.
+//
+// ⚠️ A zone name is unique only inside its region: OVN carries a zone as a
+// string on the chassis row and every zone of a region shares one northbound
+// database, so two regions can each call a zone "az1". Matching on zone alone
+// therefore also matches the other region's node, where the volume cannot be
+// attached at all -- and the symptom is a claim that stays Bound beside a pod
+// that stays Pending, with nothing in either object saying why.
+func TestVolumeIsPinnedToItsRegionAndZone(t *testing.T) {
+	got := nodeAffinityFor(Placement{Region: "r1", Zone: "az1"})
+	if got == nil || got.Required == nil {
+		t.Fatal("a placed volume was left free to bind anywhere")
+	}
+	terms := got.Required.NodeSelectorTerms
+	// ⚠️ One term, not two. Terms are ORed and requirements inside a term are
+	// ANDed, so splitting them says "the right zone OR the right region" --
+	// wider than either, and wider is the failure this exists to prevent.
+	if len(terms) != 1 {
+		t.Fatalf("the requirements were split across %d terms, which ORs them", len(terms))
+	}
+	have := map[string]string{}
+	for _, m := range terms[0].MatchExpressions {
+		if len(m.Values) != 1 {
+			t.Fatalf("%s should name exactly one value: %+v", m.Key, m.Values)
+		}
+		have[m.Key] = m.Values[0]
+	}
+	if have[corev1.LabelTopologyRegion] != "r1" {
+		t.Errorf("the region was not required: %+v", have)
+	}
+	if have[corev1.LabelTopologyZone] != "az1" {
+		t.Errorf("the zone was not required: %+v", have)
+	}
+}
+
+// TestSingleRegionVolumeStillPinsItsZone keeps the region requirement from
+// becoming a demand no node can satisfy: a deployment with one region labels
+// nothing with a region, so requiring one would strand every volume.
+func TestSingleRegionVolumeStillPinsItsZone(t *testing.T) {
+	got := nodeAffinityFor(Placement{Zone: "az1"})
+	if got == nil {
+		t.Fatal("a zoned volume was left free to bind anywhere")
+	}
+	for _, m := range got.Required.NodeSelectorTerms[0].MatchExpressions {
+		if m.Key == corev1.LabelTopologyRegion {
+			t.Fatal("a region was required on a deployment that has none, " +
+				"which no node can match")
+		}
+	}
+}
+
+// TestUnplacedVolumeHasNoAffinity guards the other direction: an empty term
+// list matches every node, so "nowhere in particular" must produce no affinity
+// at all rather than an empty requirement.
+func TestUnplacedVolumeHasNoAffinity(t *testing.T) {
+	if got := nodeAffinityFor(Placement{}); got != nil {
+		t.Fatalf("an unplaced volume got an affinity: %+v", got)
+	}
+}
