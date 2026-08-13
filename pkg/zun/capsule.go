@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
+
+	"github.com/fivetime/kubezun/pkg/tenant"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 )
 
@@ -163,21 +165,35 @@ func (t *Time) UnmarshalJSON(b []byte) error {
 
 // CapsuleAPI wraps the capsule calls this provider makes.
 type CapsuleAPI struct {
-	client *Client
+	sc *gophercloud.ServiceClient
 }
 
-// NewCapsuleAPI returns an API bound to a tenant client.
-func NewCapsuleAPI(c *Client) *CapsuleAPI { return &CapsuleAPI{client: c} }
+// NewCapsuleAPI returns an API bound to one tenant's session.
+func NewCapsuleAPI(s *tenant.Session) (*CapsuleAPI, error) {
+	sc, err := NewServiceClient(s)
+	if err != nil {
+		return nil, err
+	}
+	return &CapsuleAPI{sc: sc}, nil
+}
+
+// NewCapsuleAPIAt binds to an already-built endpoint, for a caller that holds
+// one and for tests that need the calls pointed at a server they control.
+// Whether a code path talks to Zun at all is otherwise unobservable, and
+// "guarded, so it did nothing" leaves the same trace as "ran and found nothing".
+func NewCapsuleAPIAt(sc *gophercloud.ServiceClient) *CapsuleAPI {
+	return &CapsuleAPI{sc: sc}
+}
 
 func (a *CapsuleAPI) url(parts ...string) string {
-	return a.client.ServiceClient().ServiceURL(append([]string{"capsules"}, parts...)...)
+	return a.sc.ServiceURL(append([]string{"capsules"}, parts...)...)
 }
 
 // Create submits a capsule template. Zun answers 202 and builds the capsule
 // asynchronously, so the returned capsule carries little beyond its identity.
 func (a *CapsuleAPI) Create(ctx context.Context, tpl []byte) (*Capsule, error) {
 	var out Capsule
-	_, err := a.client.ServiceClient().Post(ctx, a.url(), map[string]any{
+	_, err := a.sc.Post(ctx, a.url(), map[string]any{
 		"template": string(tpl),
 	}, &out, &gophercloud.RequestOpts{OkCodes: []int{200, 201, 202}})
 	if err != nil {
@@ -189,7 +205,7 @@ func (a *CapsuleAPI) Create(ctx context.Context, tpl []byte) (*Capsule, error) {
 // Get fetches one capsule by name or UUID.
 func (a *CapsuleAPI) Get(ctx context.Context, id string) (*Capsule, error) {
 	var out Capsule
-	_, err := a.client.ServiceClient().Get(ctx, a.url(id), &out,
+	_, err := a.sc.Get(ctx, a.url(id), &out,
 		&gophercloud.RequestOpts{OkCodes: []int{200, 203}})
 	if err != nil {
 		return nil, translate(err)
@@ -201,7 +217,7 @@ func (a *CapsuleAPI) Get(ctx context.Context, id string) (*Capsule, error) {
 // capsule that is not already stopped, which is every capsule backing a
 // running pod: without it the pod would hang in Terminating forever.
 func (a *CapsuleAPI) Delete(ctx context.Context, id string) error {
-	_, err := a.client.ServiceClient().Delete(ctx, a.url(id)+"?force=True",
+	_, err := a.sc.Delete(ctx, a.url(id)+"?force=True",
 		&gophercloud.RequestOpts{OkCodes: []int{200, 202, 204}})
 	return translate(err)
 }
@@ -216,7 +232,7 @@ func (a *CapsuleAPI) ListManagedAll(ctx context.Context) (map[string][]*Capsule,
 	var body struct {
 		Capsules []Capsule `json:"capsules"`
 	}
-	_, err := a.client.ServiceClient().Get(ctx, a.url(), &body,
+	_, err := a.sc.Get(ctx, a.url(), &body,
 		&gophercloud.RequestOpts{OkCodes: []int{200, 203}})
 	if err != nil {
 		return nil, translate(err)

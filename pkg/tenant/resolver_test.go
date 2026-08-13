@@ -9,8 +9,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
-
-	"github.com/fivetime/kubezun/pkg/zun"
 )
 
 // fixture builds a resolver over one platform namespace holding the given
@@ -37,9 +35,9 @@ func fixture(t *testing.T, project, region string, secrets ...*corev1.Secret) (*
 			}
 			return "", false
 		},
-		Connect: func(context.Context, zun.Credentials) (*zun.Client, error) {
+		Connect: func(context.Context, Credentials) (*Session, error) {
 			calls++
-			return zun.NewClientForTest(project, region), nil
+			return NewSessionForTest(project, region), nil
 		},
 	}
 	return r, client, &calls

@@ -23,8 +23,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
-
-	"github.com/fivetime/kubezun/pkg/zun"
 )
 
 const (
@@ -73,18 +71,18 @@ type Resolver struct {
 	// after the tenant.
 	SecretName func(tenant string) string
 
-	// Connect builds a session. Nil uses zun.NewClient; tests replace it.
-	Connect func(ctx context.Context, creds zun.Credentials) (*zun.Client, error)
+	// Connect builds a session. Nil uses NewSession; tests replace it.
+	Connect func(ctx context.Context, creds Credentials) (*Session, error)
 
 	mu    sync.Mutex
-	built map[string]*zun.Client
+	built map[string]*Session
 	// refused remembers tenants whose binding did not check out, so the
 	// refusal is reported once rather than on every pod.
 	refused map[string]struct{}
 }
 
 // For returns the session a namespace's OpenStack work belongs in.
-func (r *Resolver) For(ctx context.Context, namespace string) (*zun.Client, error) {
+func (r *Resolver) For(ctx context.Context, namespace string) (*Session, error) {
 	tenant, served := r.TenantOf(namespace)
 	if !served {
 		// Not this process's namespace. Deliberately not an error about
@@ -120,7 +118,7 @@ func (r *Resolver) For(ctx context.Context, namespace string) (*zun.Client, erro
 		return c, nil
 	}
 	if r.built == nil {
-		r.built = map[string]*zun.Client{}
+		r.built = map[string]*Session{}
 	}
 	r.built[tenant] = client
 	return client, nil
@@ -133,7 +131,7 @@ func (r *Resolver) secretName(tenant string) string {
 	return tenant
 }
 
-func (r *Resolver) connect(ctx context.Context, tenant string) (*zun.Client, error) {
+func (r *Resolver) connect(ctx context.Context, tenant string) (*Session, error) {
 	name := r.secretName(tenant)
 	secret, err := r.Secrets.Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
@@ -146,7 +144,7 @@ func (r *Resolver) connect(ctx context.Context, tenant string) (*zun.Client, err
 	creds := credentialsFrom(secret)
 	connect := r.Connect
 	if connect == nil {
-		connect = zun.NewClient
+		connect = NewSession
 	}
 	client, err := connect(ctx, creds)
 	if err != nil {
@@ -159,9 +157,9 @@ func (r *Resolver) connect(ctx context.Context, tenant string) (*zun.Client, err
 	return client, nil
 }
 
-func credentialsFrom(s *corev1.Secret) zun.Credentials {
+func credentialsFrom(s *corev1.Secret) Credentials {
 	get := func(k string) string { return string(s.Data[k]) }
-	return zun.Credentials{
+	return Credentials{
 		AuthURL:               get(keyAuthURL),
 		ApplicationCredID:     get(keyAppCredID),
 		ApplicationCredName:   get(keyAppCredNam),
@@ -192,7 +190,7 @@ func credentialsFrom(s *corev1.Secret) zun.Credentials {
 // running pod is judged to have lost its capsule and is failed and replaced,
 // while the old capsules keep running, keep billing, and can never be reclaimed
 // because nothing that can see them is looking (DESIGN §4.6.3).
-func (r *Resolver) checkBinding(ctx context.Context, tenant string, secret *corev1.Secret, client *zun.Client) error {
+func (r *Resolver) checkBinding(ctx context.Context, tenant string, secret *corev1.Secret, client *Session) error {
 	want := map[string]string{
 		ProjectAnnotation: client.Project(),
 		RegionAnnotation:  client.Region(),

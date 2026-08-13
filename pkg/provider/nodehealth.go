@@ -44,9 +44,9 @@ type NodeHealth struct {
 }
 
 // NewNodeHealth builds a node provider that tracks Zun reachability.
-func NewNodeHealth(client *zun.Client, node *corev1.Node) *NodeHealth {
+func NewNodeHealth(capsules *zun.CapsuleAPI, node *corev1.Node) *NodeHealth {
 	return &NodeHealth{
-		capsules: zun.NewCapsuleAPI(client),
+		capsules: capsules,
 		healthy:  true,
 		node:     node,
 		notify:   func(*corev1.Node) {},

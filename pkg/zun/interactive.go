@@ -52,7 +52,7 @@ func (a *CapsuleAPI) ExecInteractive(ctx context.Context, podUID string, index i
 	q.Set("interactive", "true")
 
 	var out InteractiveSession
-	if _, err := a.client.ServiceClient().Post(ctx,
+	if _, err := a.sc.Post(ctx,
 		a.url(name, "execute")+"?"+q.Encode(), nil, &out,
 		&gophercloud.RequestOpts{OkCodes: []int{200, 202}}); err != nil {
 		return nil, translate(err)

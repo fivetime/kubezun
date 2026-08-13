@@ -8,13 +8,13 @@ import (
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack"
 
-	"github.com/fivetime/kubezun/pkg/zun"
+	"github.com/fivetime/kubezun/pkg/tenant"
 )
 
 // NewOctaviaClient builds the load balancer client for a tenant from the
 // session it already holds for Zun, so a tenant authenticates once and carries
 // one token rather than one per service.
-func NewOctaviaClient(client *zun.Client) (*gophercloud.ServiceClient, error) {
+func NewOctaviaClient(client *tenant.Session) (*gophercloud.ServiceClient, error) {
 	if client == nil || client.Provider() == nil {
 		return nil, fmt.Errorf("an authenticated OpenStack session is required")
 	}
@@ -45,7 +45,7 @@ func NewOctaviaClient(client *zun.Client) (*gophercloud.ServiceClient, error) {
 
 // NewNetworkClient builds the Neutron client, from the same session, for
 // allocating the public addresses a Service asks for.
-func NewNetworkClient(client *zun.Client) (*gophercloud.ServiceClient, error) {
+func NewNetworkClient(client *tenant.Session) (*gophercloud.ServiceClient, error) {
 	if client == nil || client.Provider() == nil {
 		return nil, fmt.Errorf("an authenticated OpenStack session is required")
 	}
@@ -70,7 +70,7 @@ func NewNetworkClient(client *zun.Client) (*gophercloud.ServiceClient, error) {
 // Absence is not an error: a deployment without Barbican serves plain-HTTP
 // Ingress perfectly well, and the caller keeps a nil client to refuse TLS
 // with a readable message instead.
-func NewKeyManagerClient(client *zun.Client) (*gophercloud.ServiceClient, error) {
+func NewKeyManagerClient(client *tenant.Session) (*gophercloud.ServiceClient, error) {
 	if client == nil || client.Provider() == nil {
 		return nil, fmt.Errorf("an authenticated OpenStack session is required")
 	}

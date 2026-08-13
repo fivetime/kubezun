@@ -54,7 +54,7 @@ func (a *CapsuleAPI) Logs(ctx context.Context, id string, opts LogOptions) ([]by
 	// Zun sends a bare JSON string, which gophercloud's JSON decoding handles
 	// but its struct-shaped helpers do not.
 	var body string
-	if _, err := a.client.ServiceClient().Get(ctx, u, &body,
+	if _, err := a.sc.Get(ctx, u, &body,
 		&gophercloud.RequestOpts{OkCodes: []int{200}}); err != nil {
 		return nil, translate(err)
 	}
@@ -126,7 +126,7 @@ func (a *CapsuleAPI) Exec(ctx context.Context, podUID string, index int, cmd []s
 	q.Set("run", "True")
 
 	var out ExecResult
-	if _, err := a.client.ServiceClient().Post(ctx,
+	if _, err := a.sc.Post(ctx,
 		a.url(name, "execute")+"?"+q.Encode(), nil, &out,
 		&gophercloud.RequestOpts{OkCodes: []int{200}}); err != nil {
 		return nil, translate(err)

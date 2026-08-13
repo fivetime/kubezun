@@ -181,7 +181,7 @@ func TestOrphanSweepSparesUnlabelledCapsules(t *testing.T) {
 // reached at all. The sweep's guard is invisible from the outside otherwise:
 // "skipped because the cache had not synced" and "ran and found no orphans"
 // both end with nothing deleted.
-func countingZun(t *testing.T, calls *int) *zun.Client {
+func countingZun(t *testing.T, calls *int) *zun.CapsuleAPI {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		*calls++
@@ -189,7 +189,7 @@ func countingZun(t *testing.T, calls *int) *zun.Client {
 		fmt.Fprint(w, `{"capsules":[]}`)
 	}))
 	t.Cleanup(srv.Close)
-	return zun.NewClientAt(&gophercloud.ServiceClient{
+	return zun.NewCapsuleAPIAt(&gophercloud.ServiceClient{
 		ProviderClient: &gophercloud.ProviderClient{},
 		Endpoint:       srv.URL + "/v1/",
 	})
@@ -206,7 +206,7 @@ func countingZun(t *testing.T, calls *int) *zun.Client {
 func TestOrphanSweepWaitsForThePodCache(t *testing.T) {
 	calls := 0
 	p := newTestProvider(t, "111111-default")
-	p.capsules = zun.NewCapsuleAPI(countingZun(t, &calls))
+	p.capsules = countingZun(t, &calls)
 	// An empty cache, exactly as an unsynced informer presents itself.
 	p.podLister = listerWith(t)
 	p.podsSynced = func() bool { return false }

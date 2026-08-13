@@ -40,7 +40,7 @@ func (a *CapsuleAPI) Stats(ctx context.Context, id string) ([]ContainerStats, er
 	var body struct {
 		Stats []ContainerStats `json:"stats"`
 	}
-	if _, err := a.client.ServiceClient().Get(ctx, a.url(id, "stats"), &body,
+	if _, err := a.sc.Get(ctx, a.url(id, "stats"), &body,
 		&gophercloud.RequestOpts{OkCodes: []int{200}}); err != nil {
 		return nil, translate(err)
 	}
@@ -58,7 +58,7 @@ func (a *CapsuleAPI) UpdateFile(ctx context.Context, id, containerPath string, c
 	q.Set("contents", base64.StdEncoding.EncodeToString(contents))
 
 	var body any
-	_, err := a.client.ServiceClient().Post(ctx, a.url(id, "update_file")+"?"+q.Encode(),
+	_, err := a.sc.Post(ctx, a.url(id, "update_file")+"?"+q.Encode(),
 		nil, &body, &gophercloud.RequestOpts{OkCodes: []int{200, 202}})
 	if err != nil {
 		return translate(err)

@@ -57,8 +57,8 @@ type Options struct {
 	// on zone alone. The failure is a claim that stays Bound and a pod that
 	// stays Pending with neither object saying why -- the same shape §14 of the
 	// volume reconciler already documents for the cross-zone case.
-	Region  string
-	Version string
+	Region   string
+	Version  string
 	OS       string
 	Arch     string
 	Capacity Capacity

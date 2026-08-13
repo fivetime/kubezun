@@ -6,12 +6,12 @@ import (
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack"
 
-	"github.com/fivetime/kubezun/pkg/zun"
+	"github.com/fivetime/kubezun/pkg/tenant"
 )
 
 // NewBlockStorageClient builds the Cinder client, on the same session and the
 // same tenant credential as everything else here.
-func NewBlockStorageClient(client *zun.Client) (*gophercloud.ServiceClient, error) {
+func NewBlockStorageClient(client *tenant.Session) (*gophercloud.ServiceClient, error) {
 	if client == nil || client.Provider() == nil {
 		return nil, fmt.Errorf("an authenticated OpenStack session is required")
 	}
@@ -21,7 +21,7 @@ func NewBlockStorageClient(client *zun.Client) (*gophercloud.ServiceClient, erro
 
 // NewSharedFSClient builds the Manila client. A deployment without Manila
 // still serves ReadWriteOnce claims; only ReadWriteMany needs this.
-func NewSharedFSClient(client *zun.Client) (*gophercloud.ServiceClient, error) {
+func NewSharedFSClient(client *tenant.Session) (*gophercloud.ServiceClient, error) {
 	if client == nil || client.Provider() == nil {
 		return nil, fmt.Errorf("an authenticated OpenStack session is required")
 	}

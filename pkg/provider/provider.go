@@ -167,7 +167,11 @@ type Caches struct {
 }
 
 // New builds a provider for one tenant.
-func New(cfg Config, client *zun.Client, caches Caches) (*Provider, error) {
+//
+// It takes the capsule API rather than the session it was built from: that is
+// all this needs, and asking for the session would make every caller build the
+// same endpoint again.
+func New(cfg Config, capsules *zun.CapsuleAPI, caches Caches) (*Provider, error) {
 	if cfg.ServesNamespace == nil {
 		return nil, fmt.Errorf("a namespace check is required")
 	}
@@ -176,12 +180,12 @@ func New(cfg Config, client *zun.Client, caches Caches) (*Provider, error) {
 		podLister:  caches.Pods,
 		podsSynced: caches.PodsSynced,
 		objects:    caches.Objects,
-		capsules:  zun.NewCapsuleAPI(client),
-		pods:      make(map[string]*corev1.Pod),
-		deleted:   make(map[string]types.UID),
-		notify:    func(*corev1.Pod) {},
-		cpuRates:  newRates(),
-		tokens:    cfg.Tokens,
+		capsules:   capsules,
+		pods:       make(map[string]*corev1.Pod),
+		deleted:    make(map[string]types.UID),
+		notify:     func(*corev1.Pod) {},
+		cpuRates:   newRates(),
+		tokens:     cfg.Tokens,
 
 		tokenExpiries: make(map[string]tokenExpiry),
 	}, nil

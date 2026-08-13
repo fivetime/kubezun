@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"github.com/gophercloud/gophercloud/v2"
+
+	"github.com/fivetime/kubezun/pkg/tenant"
 )
 
 // CheckAvailabilityZone confirms Zun offers the zone this node claims.
@@ -22,11 +24,15 @@ import (
 // Zun's hosts API is admin-only and this process holds a tenant credential, on
 // purpose. ValidateArchitecture catches a typo; a well-spelled architecture
 // nobody runs is provisioning's to get right.
-func (c *Client) CheckAvailabilityZone(ctx context.Context, zone string) error {
+func CheckAvailabilityZone(ctx context.Context, s *tenant.Session, zone string) error {
 	if zone == "" {
 		return nil
 	}
-	zones, err := c.availabilityZones(ctx)
+	sc, err := NewServiceClient(s)
+	if err != nil {
+		return err
+	}
+	zones, err := availabilityZones(ctx, sc)
 	if err != nil || len(zones) == 0 {
 		// Not being able to ask, or not recognising the answer, is not
 		// evidence the zone is missing. Refusing on it would take a working
@@ -64,14 +70,14 @@ func refuseUnknownZone(zone string, zones []string) error {
 // perfectly real. Entries without a name are dropped rather than kept as "",
 // so a shape that is not understood ends as an empty list, which the caller
 // treats as "could not ask".
-func (c *Client) availabilityZones(ctx context.Context) ([]string, error) {
+func availabilityZones(ctx context.Context, sc *gophercloud.ServiceClient) ([]string, error) {
 	var body struct {
 		AvailabilityZones []struct {
 			Zone string `json:"availability_zone"`
 			Name string `json:"name"`
 		} `json:"availability_zones"`
 	}
-	_, err := c.sc.Get(ctx, c.sc.ServiceURL("availability_zones"), &body,
+	_, err := sc.Get(ctx, sc.ServiceURL("availability_zones"), &body,
 		&gophercloud.RequestOpts{OkCodes: []int{200}})
 	if err != nil {
 		return nil, err

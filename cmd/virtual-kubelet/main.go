@@ -27,6 +27,7 @@ import (
 	knode "github.com/fivetime/kubezun/pkg/node"
 	"github.com/fivetime/kubezun/pkg/provider"
 	kservice "github.com/fivetime/kubezun/pkg/service"
+	"github.com/fivetime/kubezun/pkg/tenant"
 	vkset "github.com/fivetime/kubezun/pkg/vknode"
 	kvolume "github.com/fivetime/kubezun/pkg/volume"
 	"github.com/fivetime/kubezun/pkg/zun"
@@ -221,15 +222,15 @@ func run(o options) error {
 		ctx, cancel := signal.NotifyContext(context.Background(),
 			syscall.SIGINT, syscall.SIGTERM)
 		defer cancel()
-		creds, err := zun.CredentialsFromEnv()
+		creds, err := tenant.CredentialsFromEnv()
 		if err != nil {
 			return fmt.Errorf("read OpenStack credentials: %w", err)
 		}
-		zunClient, err := zun.NewClient(ctx, creds)
+		session, err := tenant.NewSession(ctx, creds)
 		if err != nil {
 			return err
 		}
-		return convertTenant(ctx, zunClient, netpol.Phase(o.convertNetworkPolicy),
+		return convertTenant(ctx, session, netpol.Phase(o.convertNetworkPolicy),
 			o.convertConfirm)
 	}
 
@@ -259,11 +260,18 @@ func run(o options) error {
 		syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	creds, err := zun.CredentialsFromEnv()
+	creds, err := tenant.CredentialsFromEnv()
 	if err != nil {
 		return fmt.Errorf("read OpenStack credentials: %w", err)
 	}
-	zunClient, err := zun.NewClient(ctx, creds)
+	session, err := tenant.NewSession(ctx, creds)
+	if err != nil {
+		return err
+	}
+	// One endpoint per process, shared by everything that talks to Zun: the
+	// capsule API, the node's health check and the Service reconciler's subnet
+	// lookup all resolve the same catalog entry.
+	capsuleAPI, err := zun.NewCapsuleAPI(session)
 	if err != nil {
 		return err
 	}
@@ -303,7 +311,7 @@ func run(o options) error {
 	// valid host", which reads like a full cluster rather than a typo in a
 	// flag. Refusing to start says which zone and which ones exist.
 	for _, spec := range specs {
-		if err := zunClient.CheckAvailabilityZone(ctx, spec.zunAZ); err != nil {
+		if err := zun.CheckAvailabilityZone(ctx, session, spec.zunAZ); err != nil {
 			return fmt.Errorf("node %q: %w", spec.name, err)
 		}
 	}
@@ -313,13 +321,13 @@ func run(o options) error {
 	// resolves claims through it.
 	var volRec *kvolume.Reconciler
 	if o.storageClass != "" {
-		blockC, err := kvolume.NewBlockStorageClient(zunClient)
+		blockC, err := kvolume.NewBlockStorageClient(session)
 		if err != nil {
 			vklog.G(ctx).WithError(err).Warn(
 				"no block storage endpoint; ReadWriteOnce claims will be refused")
 			blockC = nil
 		}
-		sharedC, err := kvolume.NewSharedFSClient(zunClient)
+		sharedC, err := kvolume.NewSharedFSClient(session)
 		if err != nil {
 			vklog.G(ctx).WithError(err).Warn(
 				"no shared filesystem endpoint; ReadWriteMany claims will be refused")
@@ -337,10 +345,10 @@ func run(o options) error {
 			Volumes:     set.VolumeInformer().Lister(),
 			Classes:     set.ClassInformer().Lister(),
 			Client:      client.CoreV1(),
-			PlacementOf: placementOf(specs, zunClient.Region()),
+			PlacementOf: placementOf(specs, session.Region()),
 			// Growing a block volume needs a second step where it is attached,
 			// which only the capsule service can do.
-			Capsules:        zun.NewCapsuleAPI(zunClient),
+			Capsules:        capsuleAPI,
 			Pods:            set.AllPodsInformer().Lister(),
 			Tenant:          o.tenant,
 			ServesNamespace: set.Serves,
@@ -360,7 +368,7 @@ func run(o options) error {
 	// failure lands on whichever side is still in the old group.
 	var netpolRec *netpol.Reconciler
 	if o.enforceNetworkPolicy {
-		netC, err := netpol.NewClient(zunClient)
+		netC, err := netpol.NewClient(session)
 		if err != nil {
 			return fmt.Errorf("no network endpoint, which NetworkPolicy needs: %w", err)
 		}
@@ -392,8 +400,8 @@ func run(o options) error {
 			// credentials resolves every service endpoint within one region
 			// and cannot reach another, so the region is a property of the
 			// process, not of the node. A flag could disagree with it.
-			Region: zunClient.Region(),
-			Arch:   spec.arch,
+			Region:     session.Region(),
+			Arch:       spec.arch,
 			Version:    version,
 			InternalIP: o.internalIP,
 			Capacity: knode.Capacity{
@@ -436,7 +444,7 @@ func run(o options) error {
 				return client.CoreV1().ServiceAccounts(namespace).
 					CreateToken(ctx, account, req, metav1.CreateOptions{})
 			},
-		}, zunClient, provider.Caches{
+		}, capsuleAPI, provider.Caches{
 			Pods:       set.PodsForNode(spec.name).Lister(),
 			PodsSynced: set.PodsForNode(spec.name).Informer().HasSynced,
 			Objects:    set.Objects(),
@@ -468,7 +476,7 @@ func run(o options) error {
 			// whether Zun can be reached: with the default one the node stays
 			// Ready no matter what and the scheduler keeps sending pods to a
 			// node that cannot create a capsule.
-			NodeProvider: provider.NewNodeHealth(zunClient, nodeObj),
+			NodeProvider: provider.NewNodeHealth(capsuleAPI, nodeObj),
 			ListenAddr:   spec.listen,
 			TLSConfig:    tlsConfig,
 		}); err != nil {
@@ -480,18 +488,18 @@ func run(o options) error {
 		// One controller per process, not per node: a load balancer belongs to
 		// the tenant, and every one of their virtual nodes serves the same
 		// Services.
-		octavia, err := kservice.NewOctaviaClient(zunClient)
+		octavia, err := kservice.NewOctaviaClient(session)
 		if err != nil {
 			return fmt.Errorf("build the load balancer client: %w", err)
 		}
-		neutron, err := kservice.NewNetworkClient(zunClient)
+		neutron, err := kservice.NewNetworkClient(session)
 		if err != nil {
 			return fmt.Errorf("build the network client: %w", err)
 		}
 		controller, err := kservice.NewController(&kservice.Reconciler{
 			Octavia:           octavia,
 			Neutron:           neutron,
-			Subnets:           kservice.NewCapsuleSubnets(zun.NewCapsuleAPI(zunClient)),
+			Subnets:           kservice.NewCapsuleSubnets(capsuleAPI),
 			Services:          set.ServiceInformer().Lister(),
 			Slices:            set.EndpointSliceInformer().Lister(),
 			ServiceClient:     client.CoreV1(),
@@ -522,17 +530,17 @@ func run(o options) error {
 				"is L4-only and refuses every L7 object; use amphora, or incus where " +
 				"its driver serves L7")
 		}
-		octavia, err := kservice.NewOctaviaClient(zunClient)
+		octavia, err := kservice.NewOctaviaClient(session)
 		if err != nil {
 			return fmt.Errorf("build the load balancer client: %w", err)
 		}
-		neutron, err := kservice.NewNetworkClient(zunClient)
+		neutron, err := kservice.NewNetworkClient(session)
 		if err != nil {
 			return fmt.Errorf("build the network client: %w", err)
 		}
 		// Barbican is optional: without it plain-HTTP Ingress still works and
 		// TLS is refused with a readable error.
-		keymanager, kmErr := kservice.NewKeyManagerClient(zunClient)
+		keymanager, kmErr := kservice.NewKeyManagerClient(session)
 		if kmErr != nil {
 			vklog.G(ctx).WithError(kmErr).Warn(
 				"no key-manager endpoint; TLS Ingress will be refused")
@@ -547,7 +555,7 @@ func run(o options) error {
 			Slices:            set.EndpointSliceInformer().Lister(),
 			IngressClient:     client.NetworkingV1(),
 			Secrets:           set.Objects().Secret,
-			Subnets:           kservice.NewCapsuleSubnets(zun.NewCapsuleAPI(zunClient)),
+			Subnets:           kservice.NewCapsuleSubnets(capsuleAPI),
 			VIPSubnetID:       o.vipSubnet,
 			FloatingNetworkID: o.floatingNet,
 			Provider:          o.ingressProvider,
@@ -665,14 +673,14 @@ func withClientCA(path string) nodeutil.WebhookAuthOption {
 // it changes every capsule of a tenant at once, the two halves must be run in
 // order with the operator deciding when, and the first thing anyone will want
 // is to see what it would do.
-func convertTenant(ctx context.Context, zunClient *zun.Client, phase netpol.Phase, confirm bool) error {
+func convertTenant(ctx context.Context, session *tenant.Session, phase netpol.Phase, confirm bool) error {
 	switch phase {
 	case netpol.PhaseAttach, netpol.PhaseDetach:
 	default:
 		return fmt.Errorf("the conversion phase must be %q or %q, not %q",
 			netpol.PhaseAttach, netpol.PhaseDetach, phase)
 	}
-	client, err := netpol.NewClient(zunClient)
+	client, err := netpol.NewClient(session)
 	if err != nil {
 		return err
 	}

@@ -26,7 +26,7 @@ func (a *CapsuleAPI) ExtendVolume(ctx context.Context, podUID, volumeID string, 
 	q.Set("volume_id", volumeID)
 	q.Set("size", fmt.Sprintf("%d", gib))
 	name := "kubezun-" + podUID
-	_, err := a.client.ServiceClient().Post(ctx,
+	_, err := a.sc.Post(ctx,
 		a.url(name, "extend_volume")+"?"+q.Encode(), nil, nil,
 		&gophercloud.RequestOpts{OkCodes: []int{200, 202, 204}})
 	if err != nil {
