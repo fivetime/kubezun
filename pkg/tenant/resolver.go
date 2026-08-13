@@ -35,7 +35,29 @@ const (
 	// that resolves another region's endpoints is as wrong as one for another
 	// project — and looks just as correct field by field.
 	RegionAnnotation = "knaas.io/region"
+
+	// The transitional per-tenant configuration, carried on the same Secret
+	// until the Tenant CRD controller owns it (DESIGN §4.6). These are not
+	// part of the binding check: changing a network is reconfiguration, not
+	// a rebind, and refusing on it would block legitimate changes.
+	NetworkIDAnnotation    = "knaas.io/network-id"
+	VIPSubnetIDAnnotation  = "knaas.io/vip-subnet-id"
+	VIPNetworkIDAnnotation = "knaas.io/vip-network-id"
 )
+
+// Binding is one tenant's resolved identity and configuration: the session
+// its calls go out on, and the per-tenant values that used to be process
+// flags. One process serving several tenants cannot take a tenant's network
+// as a flag — every tenant has their own.
+type Binding struct {
+	Session *Session
+	// NetworkID is the tenant Neutron network capsules attach to.
+	NetworkID string
+	// VIPSubnetID and VIPNetworkID are where the tenant's Service load
+	// balancer addresses come from.
+	VIPSubnetID  string
+	VIPNetworkID string
+}
 
 // Credentials names the Secret keys a tenant's credential is read from. They
 // are the standard OS_* names so the same content works in a file, an
@@ -75,7 +97,7 @@ type Resolver struct {
 	Connect func(ctx context.Context, creds Credentials) (*Session, error)
 
 	mu    sync.Mutex
-	built map[string]*Session
+	built map[string]*Binding
 	// refused remembers tenants whose binding did not check out, so the
 	// refusal is reported once rather than on every pod.
 	refused map[string]struct{}
@@ -83,6 +105,15 @@ type Resolver struct {
 
 // For returns the session a namespace's OpenStack work belongs in.
 func (r *Resolver) For(ctx context.Context, namespace string) (*Session, error) {
+	b, err := r.BindingFor(ctx, namespace)
+	if err != nil {
+		return nil, err
+	}
+	return b.Session, nil
+}
+
+// BindingFor returns the session and the per-tenant configuration together.
+func (r *Resolver) BindingFor(ctx context.Context, namespace string) (*Binding, error) {
 	tenant, served := r.TenantOf(namespace)
 	if !served {
 		// Not this process's namespace. Deliberately not an error about
@@ -99,13 +130,13 @@ func (r *Resolver) For(ctx context.Context, namespace string) (*Session, error) 
 	}
 
 	r.mu.Lock()
-	if c, ok := r.built[tenant]; ok {
+	if b, ok := r.built[tenant]; ok {
 		r.mu.Unlock()
-		return c, nil
+		return b, nil
 	}
 	r.mu.Unlock()
 
-	client, err := r.connect(ctx, tenant)
+	binding, err := r.connect(ctx, tenant)
 	if err != nil {
 		return nil, err
 	}
@@ -114,14 +145,14 @@ func (r *Resolver) For(ctx context.Context, namespace string) (*Session, error) 
 	defer r.mu.Unlock()
 	// Another goroutine may have won the race; keeping the first keeps one
 	// session per tenant rather than one per caller.
-	if c, ok := r.built[tenant]; ok {
-		return c, nil
+	if b, ok := r.built[tenant]; ok {
+		return b, nil
 	}
 	if r.built == nil {
-		r.built = map[string]*Session{}
+		r.built = map[string]*Binding{}
 	}
-	r.built[tenant] = client
-	return client, nil
+	r.built[tenant] = binding
+	return binding, nil
 }
 
 func (r *Resolver) secretName(tenant string) string {
@@ -131,7 +162,7 @@ func (r *Resolver) secretName(tenant string) string {
 	return tenant
 }
 
-func (r *Resolver) connect(ctx context.Context, tenant string) (*Session, error) {
+func (r *Resolver) connect(ctx context.Context, tenant string) (*Binding, error) {
 	name := r.secretName(tenant)
 	secret, err := r.Secrets.Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
@@ -154,7 +185,12 @@ func (r *Resolver) connect(ctx context.Context, tenant string) (*Session, error)
 	if err := r.checkBinding(ctx, tenant, secret, client); err != nil {
 		return nil, err
 	}
-	return client, nil
+	return &Binding{
+		Session:      client,
+		NetworkID:    secret.Annotations[NetworkIDAnnotation],
+		VIPSubnetID:  secret.Annotations[VIPSubnetIDAnnotation],
+		VIPNetworkID: secret.Annotations[VIPNetworkIDAnnotation],
+	}, nil
 }
 
 func credentialsFrom(s *corev1.Secret) Credentials {

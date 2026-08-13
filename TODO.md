@@ -978,7 +978,27 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
 kubetron），K 可以先取一个小值、以后逐个租户迁进新分片。~~"K 一次定死"~~ 那条限制随
 哈希取模一起作废——它是哈希的限制，不是分片本身的。
 
-- [ ] **（P0）凭据按 namespace 解析**（§4.6）：`zunClient` 从**单值**变成
+- [x] **（P0）凭据按 namespace 解析 —— 已做并实验床验收（2026-08-13）**：
+      `pkg/tenant.Resolver`（namespace → tenant → Binding → Session），provider 走
+      `Capsules` 接口（`For`/`Each`/`TenantOf`），四个 controller 走
+      `ReconcilerFor`/`EachReconciler` 接缝（每租户一个 Reconciler 实例，包内零改动）。
+      **`--platform-namespace` 未设时一切走 Static 路径，行为与单租户完全一致。**
+      ⚠️ 过程中抓住并修掉三个会静默出事的缺陷：
+      ① Each 跳过坏凭据租户 + sync 把"listing 缺席"读成"capsule 没了"→ 一次凭据抖动
+      判死整租户 pod（与 cff9f8b 同形状，高一层）——Each 现在**报告覆盖了谁**，sync 只判
+      covered 租户；测试先绿后发现没测到（trackPod 盖掉 StartTime 落进宽限期），改直塞
+      p.pods 后验证过会红。
+      ② 每租户 netpol reconciler 必须用**每租户的** ServesNamespace——共享进程级检查会让
+      A 的地址组灌进 B 的 pod IP（B 的 pod 被 A 的策略放行）。
+      ③ 每租户配置不止凭据：network-id / vip-subnet-id 也是租户的，随 Secret 注解走
+      （`knaas.io/network-id` 等），provider 加 `NetworkIDFor`。
+      **实验床验收（一个进程带 111111+222222，同一节点）**：
+      111111 凭据（project 4fb711f8）只见 111111 pod 的 capsule；222222 凭据
+      （project b0f233fd）只见 222222 pod 的 capsule；两 pod 均 1/1 Running、IP 来自
+      各自网段（192.168.100.x / 110.x）——正向对照与隔离同时成立。
+      ⚠️ 验收时判据又踩一次 `OS_CLOUD=devstack-admin` 覆盖 openrc 的坑（本会话第二次）。
+      ⚠️ 原条目正文（含影响面清单）：
+- [~] ~~（原文）凭据按 namespace 解析~~：`zunClient` 从**单值**变成
       `namespace → project → Secret → clients` 的解析器。
       - ⚠️ 影响面已量过：`main.go` 里 19 处引用、8 个子系统构造点（capsules / 块存储 /
         共享存储 / netpol / Octavia / Neutron / KeyManager / Subnets）
@@ -989,7 +1009,14 @@ kubetron），K 可以先取一个小值、以后逐个租户迁进新分片。~
         只是当时防的是启动竞态，现在落在日常主路径上
       - **验收判据**：一个进程服务两个租户，各自 capsule 落各自 project。
         ⚠️ 判据必须能分辨"落对了"和"两边都没建成"——要有正向证据，不能只看"没串"
-- [ ] **（P0）project 绑定三态校验**（§4.6.3）：
+- [x] **（P0）project 绑定三态校验 —— 已实现（2026-08-13，与解析器同体）**：
+      `Resolver.checkBinding` 三态（无记录→写入 Secret 注解 / 一致→放行 / 不一致→拒绝并
+      每租户报一次）；校验对象是 **token 里的 project id + region**，不是 Secret 哈希——
+      同 project 轮换 appcred 实测放行。两个最自然的错误写法都验证过测试会红：
+      "不一致就覆盖"与"比对凭据材料"。记录失败不致命（下次启动再记，warn 一条）。
+      实验床上首连即写入注解（需要 knaas-system 里 secrets 的 get+patch Role）。
+      ⚠️ 原条目正文：
+- [~] ~~（原文）project 绑定三态校验~~：
       ```
       无记录         → 写入（首次绑定）
       有记录且一致   → 正常

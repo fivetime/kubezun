@@ -69,6 +69,8 @@ type options struct {
 	shareType            string
 	volumeType           string
 	storageAZ            string
+	platformNamespace    string
+	tenantLabel          string
 	enforceNetworkPolicy bool
 	convertNetworkPolicy string
 	convertConfirm       bool
@@ -151,6 +153,16 @@ func main() {
 			"what it would do unless --convert-confirm is also given")
 	flag.BoolVar(&o.convertConfirm, "convert-confirm", false,
 		"actually write the conversion, rather than reporting what it would change")
+	flag.StringVar(&o.platformNamespace, "platform-namespace", os.Getenv("KUBEZUN_PLATFORM_NAMESPACE"),
+		"namespace holding per-tenant credential Secrets. Setting it turns on "+
+			"multi-tenant resolution: each namespace's work runs on its own "+
+			"tenant's credential, found in <platform-namespace>/<tenant>. "+
+			"⚠️ Never a tenant-visible namespace: a Secret does not have to be "+
+			"visible to be used, and a pod can mount any Secret of its own "+
+			"namespace (DESIGN §4.6.2)")
+	flag.StringVar(&o.tenantLabel, "tenant-label", envOr("KUBEZUN_TENANT_LABEL", "kubezoo.io/tenant"),
+		"namespace label whose value names the tenant; the gateway writes it "+
+			"and refuses changes, so it is as hard to forge as the namespace name")
 	flag.BoolVar(&o.enforceNetworkPolicy, "enforce-network-policy",
 		os.Getenv("KUBEZUN_ENFORCE_NETWORK_POLICY") == "true",
 		"enforce NetworkPolicy by placing each capsule's port in security groups. "+
@@ -283,7 +295,19 @@ func run(o options) error {
 
 	var watcher *vkset.Namespaces
 	if o.nsSelector != "" {
-		watcher = vkset.NewNamespaces(client, o.nsSelector)
+		watcher = vkset.NewNamespacesWithTenantLabel(client, o.nsSelector, o.tenantLabel)
+	}
+
+	// Multi-tenant resolution. Nil in the single-tenant deployment, and every
+	// seam below treats nil as "the fixed clients serve everything" — which is
+	// what keeps this rollout safe to do in steps.
+	var mt *multiTenant
+	if o.platformNamespace != "" {
+		if watcher == nil {
+			return fmt.Errorf("--platform-namespace needs --namespace-selector: " +
+				"per-tenant credentials are resolved through the namespaces' tenant label")
+		}
+		mt = newMultiTenant(client, watcher, o.platformNamespace)
 	}
 
 	set, err := vkset.NewSet(vkset.SetOptions{
@@ -357,6 +381,13 @@ func run(o options) error {
 		if err != nil {
 			return err
 		}
+		if mt != nil {
+			mt.volume = volRec
+			volCtl.ReconcilerFor = mt.volumeFor
+			volCtl.EachReconciler = func(ctx context.Context, fn func(*kvolume.Reconciler) error) error {
+				return eachTenant(ctx, mt, mt.volumeFor, fn)
+			}
+		}
 		go volCtl.Run(ctx)
 		go volCtl.RunGC(ctx)
 	}
@@ -382,6 +413,13 @@ func run(o options) error {
 			set.AllPodsInformer(), set.PolicyInformer())
 		if err != nil {
 			return err
+		}
+		if mt != nil {
+			mt.netpol = netpolRec
+			netpolCtl.ReconcilerFor = mt.netpolFor
+			netpolCtl.EachReconciler = func(ctx context.Context, fn func(*netpol.Reconciler) error) error {
+				return eachTenant(ctx, mt, mt.netpolFor, fn)
+			}
 		}
 		go func() {
 			if err := netpolCtl.Run(ctx, 2); err != nil {
@@ -422,6 +460,12 @@ func run(o options) error {
 			Tenant:           o.tenant,
 			ClusterDNS:       splitList(o.clusterDNS),
 			DNSService:       o.dnsService,
+			NetworkIDFor: func() func(context.Context, string) (string, error) {
+				if mt == nil {
+					return nil
+				}
+				return mt.networkIDFor
+			}(),
 			ResolveClaim: func(namespace, claim string) (zun.ClaimMount, error) {
 				if volRec == nil {
 					return zun.ClaimMount{}, fmt.Errorf("persistent volumes are not enabled on this deployment")
@@ -444,7 +488,7 @@ func run(o options) error {
 				return client.CoreV1().ServiceAccounts(namespace).
 					CreateToken(ctx, account, req, metav1.CreateOptions{})
 			},
-		}, provider.StaticCapsules{API: capsuleAPI}, provider.Caches{
+		}, providerCapsules(mt, capsuleAPI), provider.Caches{
 			Pods:       set.PodsForNode(spec.name).Lister(),
 			PodsSynced: set.PodsForNode(spec.name).Informer().HasSynced,
 			Objects:    set.Objects(),
@@ -496,7 +540,7 @@ func run(o options) error {
 		if err != nil {
 			return fmt.Errorf("build the network client: %w", err)
 		}
-		controller, err := kservice.NewController(&kservice.Reconciler{
+		svcRec := &kservice.Reconciler{
 			Octavia:           octavia,
 			Neutron:           neutron,
 			Subnets:           kservice.NewCapsuleSubnets(capsuleAPI),
@@ -511,9 +555,17 @@ func run(o options) error {
 			Namespaces:        set.ServedNamespaces,
 			Events:            set.EventRecorder("service-controller"),
 			Tenant:            o.tenant,
-		}, set.ServiceInformer(), set.EndpointSliceInformer())
+		}
+		controller, err := kservice.NewController(svcRec, set.ServiceInformer(), set.EndpointSliceInformer())
 		if err != nil {
 			return err
+		}
+		if mt != nil {
+			mt.service = svcRec
+			controller.ReconcilerFor = mt.serviceFor
+			controller.EachReconciler = func(ctx context.Context, fn func(*kservice.Reconciler) error) error {
+				return eachTenant(ctx, mt, mt.serviceFor, fn)
+			}
 		}
 		go controller.Run(ctx)
 		// Load balancers of Services deleted while this was not running are
@@ -546,7 +598,7 @@ func run(o options) error {
 				"no key-manager endpoint; TLS Ingress will be refused")
 			keymanager = nil
 		}
-		ingressCtl, err := kingress.NewController(&kingress.Reconciler{
+		ingRec := &kingress.Reconciler{
 			Octavia:           octavia,
 			Neutron:           neutron,
 			KeyManager:        keymanager,
@@ -564,9 +616,17 @@ func run(o options) error {
 			ServesNamespace:   set.Serves,
 			Namespaces:        set.ServedNamespaces,
 			Events:            set.EventRecorder("ingress-controller"),
-		}, set.IngressInformer(), set.EndpointSliceInformer())
+		}
+		ingressCtl, err := kingress.NewController(ingRec, set.IngressInformer(), set.EndpointSliceInformer())
 		if err != nil {
 			return err
+		}
+		if mt != nil {
+			mt.ingress = ingRec
+			ingressCtl.ReconcilerFor = mt.ingressFor
+			ingressCtl.EachReconciler = func(ctx context.Context, fn func(*kingress.Reconciler) error) error {
+				return eachTenant(ctx, mt, mt.ingressFor, fn)
+			}
 		}
 		go ingressCtl.Run(ctx)
 		go ingressCtl.RunGC(ctx)

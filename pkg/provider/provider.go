@@ -41,6 +41,14 @@ type Config struct {
 	// NetworkID is the tenant Neutron network capsules attach to.
 	NetworkID string
 
+	// NetworkIDFor resolves the network per namespace, for a process serving
+	// several tenants — every tenant has their own network, so a single value
+	// cannot be right for two of them. Nil, or an empty answer, falls back to
+	// NetworkID. An error refuses the pod: attaching a capsule to the wrong
+	// tenant's network is connectivity into somebody else's address space,
+	// which no later correction can make not have happened.
+	NetworkIDFor func(ctx context.Context, namespace string) (string, error)
+
 	// AvailabilityZone maps this node's topology zone onto Zun.
 	AvailabilityZone string
 
@@ -244,6 +252,17 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 		return err
 	}
 
+	networkID := p.cfg.NetworkID
+	if p.cfg.NetworkIDFor != nil {
+		resolved, err := p.cfg.NetworkIDFor(ctx, pod.Namespace)
+		if err != nil {
+			return err
+		}
+		if resolved != "" {
+			networkID = resolved
+		}
+	}
+
 	// ⚠️ Decided before the capsule exists, not attached to it afterwards. A
 	// tenant's pods reach each other because they share a security group, not
 	// because they share a network, so a capsule created with the wrong groups
@@ -257,7 +276,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 
 	tpl, err := zun.BuildTemplate(pod, zun.TemplateOptions{
 		SecurityGroups:   groups,
-		NetworkID:        p.cfg.NetworkID,
+		NetworkID:        networkID,
 		AvailabilityZone: p.cfg.AvailabilityZone,
 		Architecture:     p.cfg.Architecture,
 		NodeName:         p.cfg.NodeName,

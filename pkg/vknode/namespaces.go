@@ -150,6 +150,41 @@ func (n *Namespaces) TenantOf(namespace string) (string, bool) {
 	return tenant, ok
 }
 
+// Tenants returns the distinct tenants currently served. Namespaces carrying
+// no tenant label are not represented: nothing can be done for them anyway
+// (no tenant, no credential), and their absence here keeps the walks from
+// visiting a tenant called "".
+func (n *Namespaces) Tenants() []string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 4)
+	for _, t := range n.current {
+		if t == "" {
+			continue
+		}
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
+}
+
+// NamespacesOfTenant returns the namespaces one tenant currently has.
+func (n *Namespaces) NamespacesOfTenant(tenant string) []string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	var out []string
+	for ns, t := range n.current {
+		if t == tenant && tenant != "" {
+			out = append(out, ns)
+		}
+	}
+	return out
+}
+
 // List returns the namespaces currently served.
 func (n *Namespaces) List() []string {
 	n.mu.RLock()
