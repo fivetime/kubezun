@@ -1353,6 +1353,12 @@ Container API 划为不维护区；主干 = capsule + CRI + zun-cni。
 
 ## P：平台侧配套（代码不在本仓库）
 
+> ⭐ **2026-08-13：需求已成文** → [`docs/requirements-platform-cn.md`](docs/requirements-platform-cn.md)
+> ——R1 placement 分叉（含无限期 toleration 的语义论证）/ R2 NodePoolFor 三处同动 /
+> R3 节点不可见确认 / R4 档位标签 / R5 NetworkPolicy 准入拒绝。每项带证据与
+> 可分辨的验收判据；R1–R3 与 kubezun 形态切换同窗口，R4/R5 独立。
+> **kubezoo 团队照它做即可，下面的旧条目为历史语境保留。**
+
 - [ ] **开通控制器：落点定在我们这边，不在 kubezoo（2026-08-08 定）**。
       理由：建 Keystone project + appcred 要 **Keystone admin**，
       放进 kubezoo 就等于让所有租户的前门持有 OpenStack admin——
