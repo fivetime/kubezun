@@ -146,6 +146,9 @@ containerd + kata + VMM 和同一份 OpenStack 资源账，只是入口从 kubec
 
 $$\text{进程数} = \text{regions} \times K \qquad \text{节点数} = \text{进程数} \times \text{AZs} \times \text{archs}$$
 
+⚠️ **三层关系图与"为什么每层都不能合并"见 §3.4.1**——`region → 进程 → Node` 中间两段
+**都是一对多**，"一个 VK 实例 = 一个 Node = 一个 region"只在最简配置下碰巧成立（§3.4.3）。
+
 - **region 是硬边界，不是选择**：一份 `Credentials` 里的 `Region` 解析**全部**服务端点——
   Zun（`zun/client.go:89`）、Neutron（`netpol/client.go:20`）、Cinder/Manila
   （`volume/client.go:19,29`）、Octavia、Barbican。一个进程跨不了 region。
@@ -279,6 +282,35 @@ pod 调过去挂不上。症状正是 `reconciler.go:623-627` 那段注释描述
 
 ### 3.4 数量模型（2026-08-13 改写：节点数与租户数解耦）
 
+#### 3.4.1 三层关系：region → 进程 → Node
+
+⚠️ **中间两段都是一对多，不是一对一。** "一个 VK 实例 = 一个 Node = 一个 region"是
+错的——它只在最简配置下碰巧成立，见 3.4.3。
+
+```
+region ──1:K──▶ VK 进程 ──1:(AZs × archs)──▶ Node
+```
+
+| 层 | 身份由什么组成 | 数量 |
+|---|---|---|
+| **region** | `(region)` | 有几个 OpenStack region |
+| **VK 进程** | `(region, shard)` | `regions × K` |
+| **Node** | `(region, shard, AZ, arch)` | `regions × K × AZs × archs` |
+
+**为什么每一层都不能合并：**
+
+- **region → 进程 是 1:K**。进程**不能跨** region（一份 `Credentials` 的 `Region` 解析
+  全部服务端点，§2）——这一段是硬的。但反过来不成立：**一个 region 可以有多个进程**，
+  因为 K 是爆炸半径旋钮。
+- **进程 → Node 是 1:多**。拓扑坐标只能挂在 Node 标签上，而**一个标签只有一个值**——
+  一个 Node 没法同时声明 `zone=az1` 和 `zone=az2`。所以一个进程要表达 3 个 AZ 就得注册
+  3 个 Node。代码里就是 `--node` **可重复**（`main.go:724-773` `nodeSpecs`），
+  它们共享同一个进程、同一份 informer、同一个凭据解析器。
+  ⚠️ 实践细节：每个 Node 要**各自的 `:10250` 监听地址**（`nodeSpecs` 对重名与重端口都有
+  显式拒绝），所以一个进程会绑多个端口。
+
+#### 3.4.2 公式与坐标
+
 $$\text{节点数} = \underbrace{\text{regions} \times K}_{\text{§2 进程数}} \times \text{AZs} \times \text{archs}$$
 
 **四个坐标各自的理由**（缺一个就有一类语义表达不出来）：
@@ -290,8 +322,29 @@ $$\text{节点数} = \underbrace{\text{regions} \times K}_{\text{§2 进程数}}
 | AZ | zone 标签是 PV 亲和与 WaitForFirstConsumer 的唯一依据；一个标签只有一个值 |
 | 架构 | 镜像不跨架构；`--arch` 同时定标签与 capsule 的 `architecture`（§3.6） |
 
-**举例**：1 region、3 AZ、2 架构、K=50 → 50 进程、**300 个 Node 对象**。
+**举例**：1 region、3 AZ、2 架构、K=50
+
+```
+1 个 region
+    └─ 50 个 VK 进程
+           └─ 每个 6 个 Node（3 AZ × 2 arch）
+                  = 300 个 Node 对象
+```
+
 不管背后是 1000 个租户还是 1000 万个。
+
+#### 3.4.3 ⚠️ 退化情况：为什么"一实例=一节点=一 region"读起来是对的
+
+`K=1`、1 个 AZ、1 种架构时，三层塌成一层：
+
+$$1\ \text{region} = 1\ \text{进程} = 1\ \text{Node}$$
+
+**实验床现在就接近这个配置**（1 region、1 AZ、1 arch），所以那个等式在眼前是成立的。
+但它是**最简配置的巧合，不是关系本身**——任意一个坐标增加，等式立刻散开。
+写运维脚本、算容量、排查"这个 pod 归谁管"时都按 3.4.1 的三层来，不要按眼前看到的那一层。
+
+**⭐ 顺带把不决定节点数的东西也说清：租户数不在上面任何一个公式里。**
+这正是本次改动的全部意义（§1.2）。
 
 生命周期：节点由平台声明式创建/销毁，**不再随 Tenant CRD**。缩节点走标准 drain
 （capsule 无宿主机绑定，迁移即重建）。
