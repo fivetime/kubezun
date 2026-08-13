@@ -391,7 +391,9 @@ func run(o options) error {
 				VolumeType:       o.volumeType,
 				AvailabilityZone: o.storageAZ,
 			},
-			Claims:      set.ClaimInformer().Lister(),
+			// ⚠️ Cluster-scoped kinds only; the namespaced listers are chosen
+			// below, because merely CALLING set.ClaimInformer() materializes
+			// the cluster-wide informer and the factory would start it.
 			Volumes:     set.VolumeInformer().Lister(),
 			Classes:     set.ClassInformer().Lister(),
 			Client:      client.CoreV1(),
@@ -399,11 +401,19 @@ func run(o options) error {
 			// Growing a block volume needs a second step where it is attached,
 			// which only the capsule service can do.
 			Capsules:        capsuleAPI,
-			Pods:            set.AllPodsInformer().Lister(),
 			Tenant:          o.tenant,
 			ServesNamespace: set.Serves,
 		}
-		volCtl, err := kvolume.NewController(volRec, set.ClaimInformer(), set.VolumeInformer())
+		var volCtl *kvolume.Controller
+		if mt != nil {
+			volRec.Claims = mt.scoped.ClaimLister()
+			volRec.Pods = mt.scoped.PodLister()
+			volCtl, err = kvolume.NewControllerFromSource(volRec, mt.scoped, set.VolumeInformer())
+		} else {
+			volRec.Claims = set.ClaimInformer().Lister()
+			volRec.Pods = set.AllPodsInformer().Lister()
+			volCtl, err = kvolume.NewController(volRec, set.ClaimInformer(), set.VolumeInformer())
+		}
 		if err != nil {
 			return err
 		}
@@ -431,12 +441,19 @@ func run(o options) error {
 		}
 		netpolRec = &netpol.Reconciler{
 			Neutron:         &netpol.Neutron{Client: netC},
-			Pods:            set.AllPodsInformer().Lister(),
-			Policies:        set.PolicyInformer().Lister(),
 			ServesNamespace: set.Serves,
 		}
-		netpolCtl, err := netpol.NewController(netpolRec,
-			set.AllPodsInformer(), set.PolicyInformer())
+		var netpolCtl *netpol.Controller
+		if mt != nil {
+			netpolRec.Pods = mt.scoped.PodLister()
+			netpolRec.Policies = mt.scoped.NetworkPolicyLister()
+			netpolCtl, err = netpol.NewControllerFromSource(netpolRec, mt.scoped)
+		} else {
+			netpolRec.Pods = set.AllPodsInformer().Lister()
+			netpolRec.Policies = set.PolicyInformer().Lister()
+			netpolCtl, err = netpol.NewController(netpolRec,
+				set.AllPodsInformer(), set.PolicyInformer())
+		}
 		if err != nil {
 			return err
 		}
@@ -571,8 +588,6 @@ func run(o options) error {
 			Octavia:           octavia,
 			Neutron:           neutron,
 			Subnets:           kservice.NewCapsuleSubnets(capsuleAPI),
-			Services:          set.ServiceInformer().Lister(),
-			Slices:            set.EndpointSliceInformer().Lister(),
 			ServiceClient:     client.CoreV1(),
 			VIPSubnetID:       o.vipSubnet,
 			VIPNetworkID:      o.vipNetwork,
@@ -591,6 +606,8 @@ func run(o options) error {
 			svcRec.Slices = mt.scoped.EndpointSliceLister()
 			controller, err = kservice.NewControllerFromSource(svcRec, mt.scoped)
 		} else {
+			svcRec.Services = set.ServiceInformer().Lister()
+			svcRec.Slices = set.EndpointSliceInformer().Lister()
 			controller, err = kservice.NewController(svcRec, set.ServiceInformer(), set.EndpointSliceInformer())
 		}
 		if err != nil {
@@ -638,9 +655,6 @@ func run(o options) error {
 			Octavia:           octavia,
 			Neutron:           neutron,
 			KeyManager:        keymanager,
-			Ingresses:         set.IngressInformer().Lister(),
-			Services:          set.ServiceInformer().Lister(),
-			Slices:            set.EndpointSliceInformer().Lister(),
 			IngressClient:     client.NetworkingV1(),
 			Secrets:           set.Objects().Secret,
 			Subnets:           kservice.NewCapsuleSubnets(capsuleAPI),
@@ -653,7 +667,18 @@ func run(o options) error {
 			Namespaces:        set.ServedNamespaces,
 			Events:            set.EventRecorder("ingress-controller"),
 		}
-		ingressCtl, err := kingress.NewController(ingRec, set.IngressInformer(), set.EndpointSliceInformer())
+		var ingressCtl *kingress.Controller
+		if mt != nil {
+			ingRec.Ingresses = mt.scoped.IngressLister()
+			ingRec.Services = mt.scoped.ServiceLister()
+			ingRec.Slices = mt.scoped.EndpointSliceLister()
+			ingressCtl, err = kingress.NewControllerFromSource(ingRec, mt.scoped)
+		} else {
+			ingRec.Ingresses = set.IngressInformer().Lister()
+			ingRec.Services = set.ServiceInformer().Lister()
+			ingRec.Slices = set.EndpointSliceInformer().Lister()
+			ingressCtl, err = kingress.NewController(ingRec, set.IngressInformer(), set.EndpointSliceInformer())
+		}
 		if err != nil {
 			return err
 		}

@@ -54,25 +54,46 @@ type Controller struct {
 // selects: a policy that has just stopped selecting a pod has to reach that pod
 // too, and by the time the event arrives there is nothing left to say which
 // pods those were.
-func NewController(r *Reconciler, pods corev1informers.PodInformer,
-	policies networkingv1informers.NetworkPolicyInformer) (*Controller, error) {
+// EventSource is the scoped alternative to the informer pair: pod and policy
+// events for every namespace this process serves, including ones that appear
+// later.
+type EventSource interface {
+	OnPods(cache.ResourceEventHandler)
+	OnPolicies(cache.ResourceEventHandler)
+	HasSynced() bool
+}
+
+// NewControllerFromSource wires the reconciler to a scoped source. The
+// reconciler's Pods and Policies listers must come from the same source, or
+// events and reads disagree about which namespaces exist.
+func NewControllerFromSource(r *Reconciler, src EventSource) (*Controller, error) {
+	c, err := newController(r)
+	if err != nil {
+		return nil, err
+	}
+	src.OnPods(c.podHandler())
+	src.OnPolicies(c.policyHandler())
+	c.synced = []cache.InformerSynced{src.HasSynced}
+	return c, nil
+}
+
+func newController(r *Reconciler) (*Controller, error) {
 	if r == nil {
 		return nil, fmt.Errorf("a reconciler is required")
 	}
-	c := &Controller{
+	return &Controller{
 		reconciler: r,
 		queue: workqueue.NewTypedRateLimitingQueue(
 			workqueue.DefaultTypedControllerRateLimiter[string]()),
 		policies: workqueue.NewTypedRateLimitingQueue(
 			workqueue.DefaultTypedControllerRateLimiter[string]()),
-	}
+	}, nil
+}
 
-	if _, err := pods.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+func (c *Controller) podHandler() cache.ResourceEventHandler {
+	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj any) { c.enqueuePod(obj); c.enqueuePoliciesNear(obj) },
 		UpdateFunc: func(old, cur any) {
-			// Labels decide which policies select a pod, and an address is
-			// what a peer set is made of. Everything else about a pod changes
-			// constantly and changes nothing here.
 			a, aok := old.(*corev1.Pod)
 			b, bok := cur.(*corev1.Pod)
 			if aok && bok && samePolicyInputs(a, b) {
@@ -81,28 +102,34 @@ func NewController(r *Reconciler, pods corev1informers.PodInformer,
 			c.enqueuePod(cur)
 			c.enqueuePoliciesNear(cur)
 		},
-		// ⚠️ A deleted pod must reach the peer sets it was in. Without this its
-		// address stays allowed for ever -- and Neutron reuses addresses, so
-		// the next capsule to be given it inherits the access, whatever its
-		// labels. The one direction in this package that fails open.
+		// ⚠️ A deleted pod must reach the peer sets it was in; see NewController.
 		DeleteFunc: func(obj any) { c.enqueuePoliciesNear(obj) },
-	}); err != nil {
-		return nil, err
 	}
+}
 
-	if _, err := policies.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+func (c *Controller) policyHandler() cache.ResourceEventHandler {
+	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj any) { c.enqueueNamespaceOf(obj); c.enqueuePolicy(obj) },
 		UpdateFunc: func(_, cur any) {
 			c.enqueueNamespaceOf(cur)
 			c.enqueuePolicy(cur)
 		},
-		// A deleted policy leaves its groups to the sweep; there is nothing
-		// left whose peers could need syncing.
 		DeleteFunc: func(obj any) { c.enqueueNamespaceOf(obj) },
-	}); err != nil {
+	}
+}
+
+func NewController(r *Reconciler, pods corev1informers.PodInformer,
+	policies networkingv1informers.NetworkPolicyInformer) (*Controller, error) {
+	c, err := newController(r)
+	if err != nil {
 		return nil, err
 	}
-
+	if _, err := pods.Informer().AddEventHandler(c.podHandler()); err != nil {
+		return nil, err
+	}
+	if _, err := policies.Informer().AddEventHandler(c.policyHandler()); err != nil {
+		return nil, err
+	}
 	c.synced = []cache.InformerSynced{
 		pods.Informer().HasSynced, policies.Informer().HasSynced,
 	}

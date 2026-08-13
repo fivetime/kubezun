@@ -37,6 +37,38 @@ type Controller struct {
 }
 
 // NewController wires a reconciler to the informers the process already runs.
+// EventSource is the scoped alternative to the informer pair.
+type EventSource interface {
+	OnIngresses(cache.ResourceEventHandler)
+	OnEndpointSlices(cache.ResourceEventHandler)
+	HasSynced() bool
+}
+
+// NewControllerFromSource wires the reconciler to a scoped source; its
+// Ingresses/Services/Slices listers must come from the same source.
+func NewControllerFromSource(r *Reconciler, src EventSource) (*Controller, error) {
+	if r == nil {
+		return nil, fmt.Errorf("a reconciler is required")
+	}
+	c := &Controller{
+		reconciler: r,
+		queue: workqueue.NewTypedRateLimitingQueue(
+			workqueue.DefaultTypedControllerRateLimiter[string]()),
+	}
+	src.OnIngresses(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj any) { c.enqueueIngress(obj) },
+		UpdateFunc: func(_, obj any) { c.enqueueIngress(obj) },
+		DeleteFunc: func(obj any) { c.enqueueIngress(obj) },
+	})
+	src.OnEndpointSlices(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj any) { c.enqueueSlice(obj) },
+		UpdateFunc: func(_, obj any) { c.enqueueSlice(obj) },
+		DeleteFunc: func(obj any) { c.enqueueSlice(obj) },
+	})
+	c.synced = []cache.InformerSynced{src.HasSynced}
+	return c, nil
+}
+
 func NewController(
 	r *Reconciler,
 	ingresses networkingv1informers.IngressInformer,

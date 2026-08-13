@@ -28,6 +28,34 @@ type Controller struct {
 }
 
 // NewController wires the reconciler to the informers the process already runs.
+// ClaimSource is the scoped alternative to a claim informer. Volumes stay an
+// informer: PersistentVolumes are cluster-scoped, so there is nothing to
+// narrow them by.
+type ClaimSource interface {
+	OnClaims(cache.ResourceEventHandler)
+	HasSynced() bool
+}
+
+// NewControllerFromSource wires claims from a scoped source; the reconciler's
+// Claims lister must come from the same source.
+func NewControllerFromSource(r *Reconciler, src ClaimSource,
+	volumes corev1informers.PersistentVolumeInformer) (*Controller, error) {
+	if r == nil {
+		return nil, fmt.Errorf("a reconciler is required")
+	}
+	c := &Controller{
+		reconciler: r,
+		queue: workqueue.NewTypedRateLimitingQueue(
+			workqueue.DefaultTypedControllerRateLimiter[string]()),
+	}
+	src.OnClaims(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj any) { c.enqueue(obj) },
+		UpdateFunc: func(_, obj any) { c.enqueue(obj) },
+	})
+	c.synced = []cache.InformerSynced{src.HasSynced, volumes.Informer().HasSynced}
+	return c, nil
+}
+
 func NewController(r *Reconciler,
 	claims corev1informers.PersistentVolumeClaimInformer,
 	volumes corev1informers.PersistentVolumeInformer) (*Controller, error) {

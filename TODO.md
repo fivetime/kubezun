@@ -1073,7 +1073,12 @@ kubetron），K 可以先取一个小值、以后逐个租户迁进新分片。~
       聚合让"移除即清理"结构化成立，无需清理步骤。
       **已接线**：Service controller（`NewControllerFromSource`，实验床验证过，还顺带
       抓到跨租户 VIP 子网回退漏洞）。
-      **待接线**：netpol / ingress / volume 三个 controller 的 FromSource 构造器 + main。
+      **已接线（2026-08-13）**：netpol / ingress / volume 三个 FromSource 构造器 + main
+      条件装配（mt 分支从头不碰 `set.XInformer()` 访问器——调用即物化）。netpol 的
+      handler 提取为 podHandler/policyHandler 供两个构造器共用，防双份漂移。
+      PV/StorageClass 集群域保持 informer。实验床 mt 单元：零 panic、service 路径验证过；
+      ⚠️ **claims 路径只有单测**——实测里 WFFC 的 Pending 分辨不出"看见了在等"和"没看见"，
+      带消费 pod 的完整 PVC 供给回归留给下一次 mt 会话。
       ⚠️ **接线时的坑已查明**：svcRec 构造处无条件调 `set.XInformer().Lister()` 会**物化**
       集群级 informer（调用即创建，Start 就会启动它）——mt 分支必须从头就不碰那些访问器，
       否则收窄名存实亡。PV/StorageClass 是集群域资源，天然不收窄。
