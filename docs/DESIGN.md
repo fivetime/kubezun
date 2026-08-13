@@ -247,7 +247,11 @@ per-node 身份三件事完成后可作为成本优化重评*）：
 ⚠️ **分片形态下这会从"浪费"变成"抵消"**：K 个进程 × 全集群缓存 = 内存与 watch 流量按
 `K × 集群规模` 增长，而不是按集群规模。**分片本来是为了省，这样反而更贵。**
 
-**修法**：抄 kubetron 的服务端过滤——按分片标签或服务命名空间集做 `WithTweakListOptions`。
+**修法**：⚠️ **2026-08-13 查证：服务端过滤这条捷径不存在**——实测 pod/svc 上没有任何
+租户标签（kubezoo 不打），informer 也无法按"namespace 的标签"过滤对象。唯一路径 =
+**动态 per-namespace informer 工厂 + 聚合 lister**：启停机制 `vknode` 已有
+（per-node pod 工厂 + `Namespaces.OnChange`），缺的是跨 namespace 的聚合 Lister。
+完整的中型工程，单独排期。
 ⚠️ **但 `allPods` 是个例外，不能按 namespace 收窄到"本进程服务的租户"**：它的注释写明
 *"A policy's peers are pods wherever they run"*。收窄它之前先确认 peer 选择器的作用域——
 NetworkPolicy 的 peer 不跨租户（选择器带 namespace 限定，§7.7.1），所以按**分片**收窄
@@ -265,6 +269,12 @@ NetworkPolicy 的 peer 不跨租户（选择器带 namespace 限定，§7.7.1）
 > 配额分区"那套已作废，见 §13。
 
 ### 3.1 对象模型（平台对象，租户视图中不可见）
+
+> ✅ **2026-08-13 已实现，但作为与旧形态并存的第二形态**：`--shard`（shard 标签 +
+> `knaas.io/serverless=true` 污点、无 pool）与 `--tenant`（pool 标签 + tenant 污点，
+> **原样保留**）二选一。⚠️ 不能就地切换——实验床还在跑每租户单元、kubezoo 还在注
+> pool selector，改身份会搁浅现有 pod。正式切换 = kubezoo `NodePoolFor` 改造同步上线。
+> 节点名四坐标是约定，代码不强制。
 
 ```yaml
 apiVersion: v1
@@ -319,7 +329,9 @@ pod 调过去挂不上。症状正是 `reconciler.go:623-627` 那段注释描述
 不了任何单个租户的配额，而"镜像分片内全部租户配额之和"是个没有意义的数。
 
 新形态：capacity 报一个**静态大额**（够大到不成为瓶颈），真正的把关落在两道闸门上，
-**两道都是真的**：
+**两道都是真的**。✅ 已实现（2026-08-13）：`--platform-namespace` 模式下 capacity flags
+未设时默认 **cpu=1000 / mem=4Ti / pods=10000**——旧默认 "0" 会注册一个谁都调度不上去的
+节点。显式设置仍然生效：
 
 | 闸门 | 位置 | 管什么 |
 |---|---|---|
@@ -636,6 +648,25 @@ owner key（ownerReference 根的 UID，即 ReplicaSet/StatefulSet 身份），Z
 两侧都要动，缺一边都是静默无效。
 
 ### 4.6 凭据解析与 namespace↔project 绑定（2026-08-13 定案，本次改动的承重件）
+
+> ✅ **已实现并实验床验收（2026-08-13）**。`pkg/tenant.Resolver`（三态校验含）+
+> provider `Capsules` 接口 + 四 controller 的 `ReconcilerFor`/`EachReconciler` 接缝 +
+> `--platform-namespace`/`--tenant-label`/`--shard` 装配。**验收**：一个进程带
+> 111111+222222 于同一节点，111111 凭据（project 4fb711f8）只见己方 capsule、222222
+> （project b0f233fd）只见己方，pod 各 1/1 Running、IP 各来自己方网段——正向对照与隔离
+> 是同一次测量。实现中补的三条，写回设计：
+>
+> 1. **过渡绑定不止凭据**：`knaas.io/network-id`、`knaas.io/vip-subnet-id`、
+>    `knaas.io/vip-network-id` 注解随 Secret 走（每租户的网络不可能是进程 flag），
+>    解析产物是 `Binding{Session, NetworkID, VIPSubnetID, VIPNetworkID}`。
+> 2. **每租户 Reconciler 的 `ServesNamespace` 必须按租户收窄**——共享进程级检查会让
+>    A 的 NetworkPolicy 地址组灌进 B 的 pod IP（B 被 A 的策略放行）。
+> 3. **逐租户 walk 必须报告覆盖了谁**（`Each(fn(tenant, api))`）：status sync 把
+>    "listing 缺席"读作"capsule 没了"并判 Failed，跳过的租户若不可辨认，一次凭据抖动
+>    就判死整租户的 pod（cff9f8b 的形状高一层）。
+>
+> RBAC：VK 的 SA 需要平台命名空间里 secrets 的 **get + patch**（patch 记录首绑）。
+> 记录失败非致命——校验惰性到写成功为止，warn 一条。
 
 一个进程服务多个租户，凭据就不能再是进程级的一个值。**这是整个共享节点形态唯一的真代价，
 也是唯一的重构面。**
