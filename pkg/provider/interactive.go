@@ -32,8 +32,8 @@ const handshakeTimeout = 30 * time.Second
 // being asked to separate the two -- which is why the session is opened with
 // stderr off, and why anything written to the container's stderr arrives on
 // stdout, exactly as it does in a real terminal.
-func (p *Provider) runInteractive(ctx context.Context, podUID string, index int, cmd []string, attach api.AttachIO) error {
-	session, err := p.capsules.ExecInteractive(ctx, podUID, index, cmd)
+func (p *Provider) runInteractive(ctx context.Context, capsules *zun.CapsuleAPI, podUID string, index int, cmd []string, attach api.AttachIO) error {
+	session, err := capsules.ExecInteractive(ctx, podUID, index, cmd)
 	if err != nil {
 		return err
 	}

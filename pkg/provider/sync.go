@@ -52,15 +52,42 @@ func (p *Provider) syncOnce(ctx context.Context) error {
 	}
 	p.mu.RUnlock()
 
-	// One list per cycle rather than one read per pod: capsules carry the pod
-	// they belong to in their labels, so a single call covers the whole node.
-	managed, err := p.capsules.ListManaged(ctx)
+	// One list per tenant per cycle rather than one read per pod: capsules
+	// carry the pod they belong to in their labels, and each tenant's listing
+	// is scoped to its own project, so the union covers the whole node.
+	managed := map[string]*zun.Capsule{}
+	covered := map[string]bool{}
+	err := p.capsules.Each(ctx, func(tenant string, api *zun.CapsuleAPI) error {
+		part, err := api.ListManaged(ctx)
+		if err != nil {
+			// ⚠️ Ends the WHOLE cycle. The loop below reads a pod's absence
+			// from this map as "its capsule is gone" and fails the pod, so a
+			// tenant whose listing failed mid-walk must not leave a partial
+			// map behind. (A tenant the walk SKIPPED is different: it is
+			// absent from covered, and the judgement below refuses to judge
+			// its pods.)
+			return err
+		}
+		covered[tenant] = true
+		for k, v := range part {
+			managed[k] = v
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
 
 	now := metav1.NewTime(time.Now())
 	for _, pod := range tracked {
+		// ⚠️ A pod may only be judged against listings that could have seen
+		// it. Its tenant's walk being skipped — no usable credential this
+		// round — says nothing about its capsule, and reading the empty map
+		// as "gone" would fail every pod of that tenant over a credential
+		// hiccup. Their status stays as it was until their tenant answers.
+		if t, ok := p.capsules.TenantOf(pod.Namespace); !ok || !covered[t] {
+			continue
+		}
 		key := zun.PodKey(pod.Namespace, pod.Name)
 		cap, found := managed[key]
 		if found && cap.PodUID() != "" && cap.PodUID() != string(pod.UID) {

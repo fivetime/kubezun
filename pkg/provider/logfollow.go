@@ -33,7 +33,7 @@ const followInterval = time.Second
 // not want them. Repetition is therefore not "unlikely" but impossible: a line
 // is emitted when its timestamp sorts after the last emitted one, and the
 // runtime writes them in order.
-func (p *Provider) followLogs(ctx context.Context, capsuleUUID string, index int, opts zun.LogOptions) io.ReadCloser {
+func (p *Provider) followLogs(ctx context.Context, capsules *zun.CapsuleAPI, capsuleUUID string, index int, opts zun.LogOptions) io.ReadCloser {
 	reader, writer := io.Pipe()
 
 	// Timestamps are the cursor. Whether the caller wanted them is a
@@ -47,7 +47,7 @@ func (p *Provider) followLogs(ctx context.Context, capsuleUUID string, index int
 
 		var last string
 		for {
-			raw, err := p.capsules.LogsForPod(ctx, capsuleUUID, index, poll)
+			raw, err := capsules.LogsForPod(ctx, capsuleUUID, index, poll)
 			if err != nil {
 				// A capsule that goes away ends the stream rather than failing
 				// it: the reader has had everything there was.

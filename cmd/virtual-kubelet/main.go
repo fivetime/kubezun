@@ -444,7 +444,7 @@ func run(o options) error {
 				return client.CoreV1().ServiceAccounts(namespace).
 					CreateToken(ctx, account, req, metav1.CreateOptions{})
 			},
-		}, capsuleAPI, provider.Caches{
+		}, provider.StaticCapsules{API: capsuleAPI}, provider.Caches{
 			Pods:       set.PodsForNode(spec.name).Lister(),
 			PodsSynced: set.PodsForNode(spec.name).Informer().HasSynced,
 			Objects:    set.Objects(),

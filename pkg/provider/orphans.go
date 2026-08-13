@@ -51,22 +51,30 @@ func (p *Provider) sweepOrphans(ctx context.Context) {
 		return
 	}
 
-	managed, err := p.capsules.ListManagedAll(ctx)
-	if err != nil {
-		log.G(ctx).WithError(err).Warn("orphan sweep skipped: could not list capsules")
-		return
-	}
-	log.G(ctx).WithField("pods", len(managed)).Debug("orphan sweep running")
-
-	for key, capsules := range managed {
-		for _, capsule := range p.orphansAmong(ctx, key, capsules) {
-			log.G(ctx).WithField("pod", key).WithField("capsule", capsule.Name()).
-				Info("deleting orphaned capsule")
-			if err := p.capsules.Delete(ctx, capsule.UUID); err != nil {
-				log.G(ctx).WithError(err).WithField("capsule", capsule.Name()).
-					Warn("could not delete orphaned capsule")
+	// One walk per tenant: a capsule listing is scoped to the project its
+	// credential authenticated as, so "everything this process manages" is the
+	// union of one listing per tenant — and each tenant's orphans are deleted
+	// with that tenant's own credential, never another's.
+	err := p.capsules.Each(ctx, func(_ string, api *zun.CapsuleAPI) error {
+		managed, err := api.ListManagedAll(ctx)
+		if err != nil {
+			log.G(ctx).WithError(err).Warn("orphan sweep skipped one tenant: could not list capsules")
+			return nil // this tenant only; the walk continues
+		}
+		for key, capsules := range managed {
+			for _, capsule := range p.orphansAmong(ctx, key, capsules) {
+				log.G(ctx).WithField("pod", key).WithField("capsule", capsule.Name()).
+					Info("deleting orphaned capsule")
+				if err := api.Delete(ctx, capsule.UUID); err != nil {
+					log.G(ctx).WithError(err).WithField("capsule", capsule.Name()).
+						Warn("could not delete orphaned capsule")
+				}
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		log.G(ctx).WithError(err).Warn("orphan sweep did not finish")
 	}
 }
 

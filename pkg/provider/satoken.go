@@ -229,7 +229,11 @@ func (p *Provider) refreshToken(ctx context.Context, e tokenExpiry) error {
 		return fmt.Errorf("the new token was empty")
 	}
 
-	capsules, err := p.capsules.ListManaged(ctx)
+	api, err := p.capsules.For(ctx, pod.Namespace)
+	if err != nil {
+		return err
+	}
+	capsules, err := api.ListManaged(ctx)
 	if err != nil {
 		return err
 	}
@@ -240,7 +244,7 @@ func (p *Provider) refreshToken(ctx context.Context, e tokenExpiry) error {
 
 	// The mount path is the directory; the token is one file inside it, laid
 	// out the way buildFileVolumes names them.
-	if err := p.capsules.UpdateFile(ctx, cap.UUID, path.Join(mount, "token"), token); err != nil {
+	if err := api.UpdateFile(ctx, cap.UUID, path.Join(mount, "token"), token); err != nil {
 		return err
 	}
 

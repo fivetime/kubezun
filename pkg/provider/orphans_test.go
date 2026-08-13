@@ -206,7 +206,7 @@ func countingZun(t *testing.T, calls *int) *zun.CapsuleAPI {
 func TestOrphanSweepWaitsForThePodCache(t *testing.T) {
 	calls := 0
 	p := newTestProvider(t, "111111-default")
-	p.capsules = countingZun(t, &calls)
+	p.capsules = StaticCapsules{API: countingZun(t, &calls)}
 	// An empty cache, exactly as an unsynced informer presents itself.
 	p.podLister = listerWith(t)
 	p.podsSynced = func() bool { return false }

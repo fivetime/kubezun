@@ -80,86 +80,91 @@ func (p *Provider) podStats(ctx context.Context) []statsv1alpha1.PodStats {
 	}
 	p.mu.RUnlock()
 
-	// One list for the whole node, then one stats call per pod. Zun has no
-	// endpoint that answers for a node, but it does not need one list per pod
-	// either — the capsules carry the pod they belong to.
-	managed, err := p.capsules.ListManaged(ctx)
-	if err != nil {
-		return nil
-	}
-
+	// One list per tenant, then one stats call per pod. Zun has no endpoint
+	// that answers for a node, but it does not need one list per pod either —
+	// the capsules carry the pod they belong to. A tenant whose listing fails
+	// contributes no stats this round, which is the existing posture for a pod
+	// whose stats call fails: missing metrics, never a failed collection.
 	now := metav1.NewTime(time.Now())
 	live := map[string]bool{}
 	out := make([]statsv1alpha1.PodStats, 0, len(tracked))
 
-	for _, pod := range tracked {
-		cap, ok := managed[zun.PodKey(pod.Namespace, pod.Name)]
-		if !ok || cap.UUID == "" || cap.PodUID() != string(pod.UID) {
-			continue
-		}
-		stats, err := p.capsules.Stats(ctx, cap.UUID)
-		if err != nil || len(stats) == 0 {
-			// Between creation and placement there is nothing to report. Skipping
-			// one pod beats failing the collection and leaving the node with no
-			// metrics at all.
-			continue
+	_ = p.capsules.Each(ctx, func(_ string, api *zun.CapsuleAPI) error {
+		managed, err := api.ListManaged(ctx)
+		if err != nil {
+			return nil
 		}
 
-		ps := statsv1alpha1.PodStats{
-			PodRef: statsv1alpha1.PodReference{
-				Name: pod.Name, Namespace: pod.Namespace, UID: string(pod.UID),
-			},
-			StartTime: now,
-		}
-		if pod.Status.StartTime != nil {
-			ps.StartTime = *pod.Status.StartTime
-		}
-
-		var podCores, podMemory uint64
-		var podCoresKnown bool
-		for i := range stats {
-			s := &stats[i]
-			// Zun renames containers, so position is what ties a capsule
-			// container back to the pod's — the same invariant the status path
-			// relies on.
-			name := s.Name
-			if i < len(pod.Spec.Containers) {
-				name = pod.Spec.Containers[i].Name
+		for _, pod := range tracked {
+			cap, ok := managed[zun.PodKey(pod.Namespace, pod.Name)]
+			if !ok || cap.UUID == "" || cap.PodUID() != string(pod.UID) {
+				continue
 			}
-			key := pod.Namespace + "/" + pod.Name + "/" + name
-			live[key] = true
+			stats, err := api.Stats(ctx, cap.UUID)
+			if err != nil || len(stats) == 0 {
+				// Between creation and placement there is nothing to report. Skipping
+				// one pod beats failing the collection and leaving the node with no
+				// metrics at all.
+				continue
+			}
 
-			cs := statsv1alpha1.ContainerStats{
-				Name:      name,
-				StartTime: ps.StartTime,
-				Memory: &statsv1alpha1.MemoryStats{
-					Time:            metav1.NewTime(time.Unix(0, s.Timestamp)),
-					WorkingSetBytes: proto.Uint64(s.MemoryWorkingSetBytes),
-					UsageBytes:      proto.Uint64(s.MemoryUsageBytes),
+			ps := statsv1alpha1.PodStats{
+				PodRef: statsv1alpha1.PodReference{
+					Name: pod.Name, Namespace: pod.Namespace, UID: string(pod.UID),
 				},
-				CPU: &statsv1alpha1.CPUStats{
-					Time:                 metav1.NewTime(time.Unix(0, s.Timestamp)),
-					UsageCoreNanoSeconds: proto.Uint64(s.CPUUsageCoreNanoseconds),
-				},
+				StartTime: now,
 			}
-			if nanocores, ok := p.cpuRates.observe(key, *s); ok {
-				cs.CPU.UsageNanoCores = proto.Uint64(nanocores)
-				podCores += nanocores
-				podCoresKnown = true
+			if pod.Status.StartTime != nil {
+				ps.StartTime = *pod.Status.StartTime
 			}
-			podMemory += s.MemoryWorkingSetBytes
-			ps.Containers = append(ps.Containers, cs)
-		}
 
-		ps.Memory = &statsv1alpha1.MemoryStats{
-			Time: now, WorkingSetBytes: proto.Uint64(podMemory),
+			var podCores, podMemory uint64
+			var podCoresKnown bool
+			for i := range stats {
+				s := &stats[i]
+				// Zun renames containers, so position is what ties a capsule
+				// container back to the pod's — the same invariant the status path
+				// relies on.
+				name := s.Name
+				if i < len(pod.Spec.Containers) {
+					name = pod.Spec.Containers[i].Name
+				}
+				key := pod.Namespace + "/" + pod.Name + "/" + name
+				live[key] = true
+
+				cs := statsv1alpha1.ContainerStats{
+					Name:      name,
+					StartTime: ps.StartTime,
+					Memory: &statsv1alpha1.MemoryStats{
+						Time:            metav1.NewTime(time.Unix(0, s.Timestamp)),
+						WorkingSetBytes: proto.Uint64(s.MemoryWorkingSetBytes),
+						UsageBytes:      proto.Uint64(s.MemoryUsageBytes),
+					},
+					CPU: &statsv1alpha1.CPUStats{
+						Time:                 metav1.NewTime(time.Unix(0, s.Timestamp)),
+						UsageCoreNanoSeconds: proto.Uint64(s.CPUUsageCoreNanoseconds),
+					},
+				}
+				if nanocores, ok := p.cpuRates.observe(key, *s); ok {
+					cs.CPU.UsageNanoCores = proto.Uint64(nanocores)
+					podCores += nanocores
+					podCoresKnown = true
+				}
+				podMemory += s.MemoryWorkingSetBytes
+				ps.Containers = append(ps.Containers, cs)
+			}
+
+			ps.Memory = &statsv1alpha1.MemoryStats{
+				Time: now, WorkingSetBytes: proto.Uint64(podMemory),
+			}
+			ps.CPU = &statsv1alpha1.CPUStats{Time: now}
+			if podCoresKnown {
+				ps.CPU.UsageNanoCores = proto.Uint64(podCores)
+			}
+			out = append(out, ps)
 		}
-		ps.CPU = &statsv1alpha1.CPUStats{Time: now}
-		if podCoresKnown {
-			ps.CPU.UsageNanoCores = proto.Uint64(podCores)
-		}
-		out = append(out, ps)
-	}
+		return nil
+	})
 
 	p.cpuRates.forget(live)
 	return out

@@ -84,7 +84,7 @@ type Config struct {
 // Provider runs pods as Zun capsules for a single tenant.
 type Provider struct {
 	cfg      Config
-	capsules *zun.CapsuleAPI
+	capsules Capsules
 
 	// podLister is the cluster's view of pods, used to tell a capsule whose
 	// pod is gone from one whose pod this process simply has not seen yet.
@@ -166,12 +166,12 @@ type Caches struct {
 	PodsSynced func() bool
 }
 
-// New builds a provider for one tenant.
+// New builds a provider.
 //
-// It takes the capsule API rather than the session it was built from: that is
-// all this needs, and asking for the session would make every caller build the
-// same endpoint again.
-func New(cfg Config, capsules *zun.CapsuleAPI, caches Caches) (*Provider, error) {
+// It takes a Capsules source rather than one API: which tenant's API a call
+// belongs to depends on the pod it is about, and only the call site knows the
+// pod.
+func New(cfg Config, capsules Capsules, caches Caches) (*Provider, error) {
 	if cfg.ServesNamespace == nil {
 		return nil, fmt.Errorf("a namespace check is required")
 	}
@@ -211,11 +211,19 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 
 	key := zun.PodKey(pod.Namespace, pod.Name)
 
+	capsules, err := p.capsules.For(ctx, pod.Namespace)
+	if err != nil {
+		// No credential, no capsule. The error names the tenant, and the pod
+		// stays Pending where a scheduler retry will find the credential once
+		// it exists.
+		return err
+	}
+
 	// Zun does not reject a second capsule under an existing name, so a
 	// retried create — the node controller retries whenever anything after
 	// this fails — would leave a duplicate running and billed for every
 	// attempt. Check before creating rather than relying on the API to refuse.
-	if existing, err := p.capsules.ListManaged(ctx); err == nil {
+	if existing, err := capsules.ListManaged(ctx); err == nil {
 		if c, ok := existing[key]; ok && c.PodUID() == string(pod.UID) {
 			log.G(ctx).WithField("pod", key).WithField("capsule", c.Name()).
 				Info("capsule already exists for this pod; adopting it")
@@ -263,7 +271,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 	}
 
 	log.G(ctx).WithField("pod", key).Info("creating capsule")
-	if _, err := p.capsules.Create(ctx, tpl); err != nil {
+	if _, err := capsules.Create(ctx, tpl); err != nil {
 		return err
 	}
 
@@ -317,7 +325,15 @@ func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) (err error) {
 
 	key := zun.PodKey(pod.Namespace, pod.Name)
 	log.G(ctx).WithField("pod", key).Info("deleting capsule")
-	if err := p.capsules.Delete(ctx, zun.CapsuleName(pod)); err != nil && !errdefs.IsNotFound(err) {
+	capsules, err := p.capsules.For(ctx, pod.Namespace)
+	if err != nil {
+		// ⚠️ Refusing, not skipping: answering "deleted" without a credential
+		// would remove the pod from Kubernetes while its capsule keeps
+		// running, unbilled-for by nobody and pointed at by nothing — the
+		// exact leak the rebind procedure (DESIGN §4.6.4) exists to prevent.
+		return err
+	}
+	if err := capsules.Delete(ctx, zun.CapsuleName(pod)); err != nil && !errdefs.IsNotFound(err) {
 		return err
 	}
 
@@ -530,14 +546,17 @@ func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, con
 			"pod %s/%s has no container named %s", namespace, podName, containerName)
 	}
 
+	capsules, err := p.capsules.For(ctx, pod.Namespace)
+	if err != nil {
+		return nil, err
+	}
 	if opts.Follow {
 		// Zun has no streaming endpoint, so this reads the log repeatedly and
 		// emits only what is new. Exact rather than approximate: see
 		// followLogs for why the runtime's per-line timestamps make it so.
-		return p.followLogs(ctx, string(pod.UID), index, logOpts), nil
+		return p.followLogs(ctx, capsules, string(pod.UID), index, logOpts), nil
 	}
-
-	data, err := p.capsules.LogsForPod(ctx, string(pod.UID), index, logOpts)
+	data, err := capsules.LogsForPod(ctx, string(pod.UID), index, logOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -573,7 +592,11 @@ func (p *Provider) UsePolicies(r *netpol.Reconciler) {
 // address actually lives, and a cache of it would go stale exactly when a
 // capsule is rebuilt -- which is when the port matters most.
 func (p *Provider) portOf(pod *corev1.Pod) string {
-	capsule, err := p.capsules.Get(context.Background(), "kubezun-"+string(pod.UID))
+	capsules, err := p.capsules.For(context.Background(), pod.Namespace)
+	if err != nil {
+		return ""
+	}
+	capsule, err := capsules.Get(context.Background(), "kubezun-"+string(pod.UID))
 	if err != nil {
 		return ""
 	}
@@ -751,14 +774,17 @@ func (p *Provider) RunInContainer(ctx context.Context, namespace, podName, conta
 			"pod %s/%s has no container named %s", namespace, podName, containerName)
 	}
 
+	capsules, err := p.capsules.For(ctx, pod.Namespace)
+	if err != nil {
+		return err
+	}
 	if attach != nil && attach.TTY() {
 		// A terminal is a session, not an answer: the command has not
 		// finished and the point is to type into it. Served on the runtime's
 		// own stream, through the proxy on the node holding the capsule.
-		return p.runInteractive(ctx, string(pod.UID), index, cmd, attach)
+		return p.runInteractive(ctx, capsules, string(pod.UID), index, cmd, attach)
 	}
-
-	result, err := p.capsules.Exec(ctx, string(pod.UID), index, cmd)
+	result, err := capsules.Exec(ctx, string(pod.UID), index, cmd)
 	if err != nil {
 		return err
 	}
