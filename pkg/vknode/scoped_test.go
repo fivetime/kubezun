@@ -6,6 +6,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -131,5 +132,52 @@ func TestHandlersHearNamespacesAddedLater(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("no event from a namespace added after subscription — " +
 			"onboarded tenants' Services would never enqueue")
+	}
+}
+
+// TestAllKindsScopeAndSync covers the four kinds added after Services: same
+// guarantees, asserted per kind so a regression names its victim. The pod
+// check doubles as the shard-scope guarantee for NetworkPolicy peers: a pod
+// in a served namespace MUST appear (narrower than the shard silently shrinks
+// peer sets), an unserved one must not.
+func TestAllKindsScopeAndSync(t *testing.T) {
+	pod := func(ns, name string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}}
+	}
+	client := fake.NewSimpleClientset(
+		pod("t1", "p1"), pod("t9", "hidden"),
+		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: "t1", Name: "np"}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: "t1", Name: "c"}},
+		&networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Namespace: "t1", Name: "i"}},
+	)
+	s := NewScopedFactories(client, 0)
+	s.Track([]string{"t1"}, nil)
+	s.Start(t.Context())
+	waitScoped(t, "sync", s.HasSynced)
+
+	pods, _ := s.PodLister().List(labels.Everything())
+	if len(pods) != 1 || pods[0].Namespace != "t1" {
+		t.Fatalf("pod scope wrong: %d pods (peer sets would be wrong by the same amount)", len(pods))
+	}
+	if nps, _ := s.NetworkPolicyLister().List(labels.Everything()); len(nps) != 1 {
+		t.Fatalf("policy scope wrong: %d", len(nps))
+	}
+	if cs, _ := s.ClaimLister().List(labels.Everything()); len(cs) != 1 {
+		t.Fatalf("claim scope wrong: %d", len(cs))
+	}
+	if is, _ := s.IngressLister().List(labels.Everything()); len(is) != 1 {
+		t.Fatalf("ingress scope wrong: %d", len(is))
+	}
+	// Events for the new kinds reach late subscribers' factories too.
+	heard := make(chan struct{}, 4)
+	s.OnPods(cache.ResourceEventHandlerFuncs{AddFunc: func(any) { heard <- struct{}{} }})
+	s.Track([]string{"t2"}, nil)
+	if _, err := client.CoreV1().Pods("t2").Create(t.Context(), pod("t2", "late"), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-heard:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no pod event from a namespace added after subscription")
 	}
 }

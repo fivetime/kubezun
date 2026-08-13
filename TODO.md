@@ -1063,7 +1063,21 @@ kubetron），K 可以先取一个小值、以后逐个租户迁进新分片。~
       调度不上去。真把关 = ResourceQuota 准入 + Zun project 配额（§3.2）
 - [ ] **（P1）容量改静态大额**（§3.2）：`capacity = 配额镜像` 作废——共享节点镜像不了任一
       租户的配额。把关落到 K8s ResourceQuota 准入 + Zun project 配额两道闸门
-- [ ] **（P1）informer 收窄**（§2.2）——⚠️ **现存缺陷，不是新形态才引入的**：
+- [ ] **（P1）informer 收窄 —— 组件已完成，接线进行中（2026-08-13）**：
+      `vknode.ScopedFactories`：每 served namespace 一个官方单 namespace factory，
+      六类 namespaced 对象（services/slices/pods/policies/ingresses/claims），
+      fan-out lister 实现标准接口（消费方零改动），handler 订阅覆盖后加入的 namespace，
+      HasSynced 闩锁（onboard 不翻 false——第一版被自己测试抓过）。
+      ⚠️ **草图方案已证伪并更正**："per-ns reflector 喂共享 Indexer"不行——Reflector 的
+      Replace 契约是"这是全部"，每个 ns 一 list 就清掉别人的对象。独立 factory + 读侧
+      聚合让"移除即清理"结构化成立，无需清理步骤。
+      **已接线**：Service controller（`NewControllerFromSource`，实验床验证过，还顺带
+      抓到跨租户 VIP 子网回退漏洞）。
+      **待接线**：netpol / ingress / volume 三个 controller 的 FromSource 构造器 + main。
+      ⚠️ **接线时的坑已查明**：svcRec 构造处无条件调 `set.XInformer().Lister()` 会**物化**
+      集群级 informer（调用即创建，Start 就会启动它）——mt 分支必须从头就不碰那些访问器，
+      否则收窄名存实亡。PV/StorageClass 是集群域资源，天然不收窄。
+      （原条目正文含实测数字：）
       `vknode.go:143` 的 `scmFactory` 无任何过滤，八类对象全集群缓存
       （services / endpointslices / ingresses / networkpolicies / **allPods** /
       pvc / pv / storageclasses）。

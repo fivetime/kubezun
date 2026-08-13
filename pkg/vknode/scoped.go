@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -15,6 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	discoveryv1listers "k8s.io/client-go/listers/discovery/v1"
+	networkingv1listers "k8s.io/client-go/listers/networking/v1"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -52,7 +54,35 @@ type scopedFactory struct {
 	cancel   context.CancelFunc
 	services cache.SharedIndexInformer
 	slices   cache.SharedIndexInformer
+	pods     cache.SharedIndexInformer
+	policies cache.SharedIndexInformer
+	ingress  cache.SharedIndexInformer
+	claims   cache.SharedIndexInformer
 }
+
+// informerOf maps a kind name to the informer, one place for registration,
+// sync and the listers to agree on.
+func (f *scopedFactory) informerOf(kind string) cache.SharedIndexInformer {
+	switch kind {
+	case "services":
+		return f.services
+	case "endpointslices":
+		return f.slices
+	case "pods":
+		return f.pods
+	case "networkpolicies":
+		return f.policies
+	case "ingresses":
+		return f.ingress
+	case "persistentvolumeclaims":
+		return f.claims
+	}
+	return nil
+}
+
+// scopedKinds is every kind a factory watches; sync covers them all.
+var scopedKinds = []string{"services", "endpointslices", "pods",
+	"networkpolicies", "ingresses", "persistentvolumeclaims"}
 
 type scopedHandler struct {
 	kind    string // "services" | "endpointslices"
@@ -105,6 +135,10 @@ func (s *ScopedFactories) Track(added, removed []string) {
 			factory:  factory,
 			services: factory.Core().V1().Services().Informer(),
 			slices:   factory.Discovery().V1().EndpointSlices().Informer(),
+			pods:     factory.Core().V1().Pods().Informer(),
+			policies: factory.Networking().V1().NetworkPolicies().Informer(),
+			ingress:  factory.Networking().V1().Ingresses().Informer(),
+			claims:   factory.Core().V1().PersistentVolumeClaims().Informer(),
 		}
 		// Handlers registered before the factory starts, so the initial list
 		// is delivered as Add events the same way a shared informer would.
@@ -125,15 +159,12 @@ func (s *ScopedFactories) startLocked(_ string, f *scopedFactory) {
 }
 
 func (s *ScopedFactories) registerLocked(f *scopedFactory, h scopedHandler) error {
-	switch h.kind {
-	case "services":
-		_, err := f.services.AddEventHandler(h.handler)
-		return err
-	case "endpointslices":
-		_, err := f.slices.AddEventHandler(h.handler)
-		return err
+	inf := f.informerOf(h.kind)
+	if inf == nil {
+		return fmt.Errorf("unknown kind %q", h.kind)
 	}
-	return fmt.Errorf("unknown kind %q", h.kind)
+	_, err := inf.AddEventHandler(h.handler)
+	return err
 }
 
 // OnServices and OnEndpointSlices subscribe a handler to every namespace,
@@ -141,6 +172,14 @@ func (s *ScopedFactories) registerLocked(f *scopedFactory, h scopedHandler) erro
 func (s *ScopedFactories) OnServices(h cache.ResourceEventHandler) { s.subscribe("services", h) }
 func (s *ScopedFactories) OnEndpointSlices(h cache.ResourceEventHandler) {
 	s.subscribe("endpointslices", h)
+}
+func (s *ScopedFactories) OnPods(h cache.ResourceEventHandler)     { s.subscribe("pods", h) }
+func (s *ScopedFactories) OnPolicies(h cache.ResourceEventHandler) { s.subscribe("networkpolicies", h) }
+func (s *ScopedFactories) OnIngresses(h cache.ResourceEventHandler) {
+	s.subscribe("ingresses", h)
+}
+func (s *ScopedFactories) OnClaims(h cache.ResourceEventHandler) {
+	s.subscribe("persistentvolumeclaims", h)
 }
 
 func (s *ScopedFactories) subscribe(kind string, h cache.ResourceEventHandler) {
@@ -174,8 +213,10 @@ func (s *ScopedFactories) HasSynced() bool {
 		if f.cancel == nil {
 			continue // not started yet; Start's caller gates on that
 		}
-		if !f.services.HasSynced() || !f.slices.HasSynced() {
-			return false
+		for _, kind := range scopedKinds {
+			if !f.informerOf(kind).HasSynced() {
+				return false
+			}
 		}
 	}
 	s.synced = true
@@ -271,4 +312,141 @@ func (e emptySliceLister) Get(name string) (*discoveryv1.EndpointSlice, error) {
 func apierrNotFound(resource, namespace, name string) error {
 	return apierrors.NewNotFound(schema.GroupResource{Resource: resource + "s"},
 		namespace+"/"+name)
+}
+
+// PodLister spans the tracked namespaces. ⚠️ This is the shard-scoped pod view
+// DESIGN §2.2 requires for NetworkPolicy peers — never narrower: a policy's
+// peers are pods wherever they run within the tenant, and this set contains
+// every namespace the process serves.
+func (s *ScopedFactories) PodLister() corev1listers.PodLister { return scopedPodLister{s} }
+
+// NetworkPolicyLister spans the tracked namespaces.
+func (s *ScopedFactories) NetworkPolicyLister() networkingv1listers.NetworkPolicyLister {
+	return scopedPolicyLister{s}
+}
+
+// IngressLister spans the tracked namespaces.
+func (s *ScopedFactories) IngressLister() networkingv1listers.IngressLister {
+	return scopedIngressLister{s}
+}
+
+// ClaimLister spans the tracked namespaces.
+func (s *ScopedFactories) ClaimLister() corev1listers.PersistentVolumeClaimLister {
+	return scopedClaimLister{s}
+}
+
+type scopedPodLister struct{ s *ScopedFactories }
+
+func (l scopedPodLister) List(sel labels.Selector) ([]*corev1.Pod, error) {
+	var out []*corev1.Pod
+	for _, f := range l.s.snapshot() {
+		part, err := corev1listers.NewPodLister(f.pods.GetIndexer()).List(sel)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, part...)
+	}
+	return out, nil
+}
+
+func (l scopedPodLister) Pods(ns string) corev1listers.PodNamespaceLister {
+	if f, ok := l.s.snapshot()[ns]; ok {
+		return corev1listers.NewPodLister(f.pods.GetIndexer()).Pods(ns)
+	}
+	return emptyPodLister{ns}
+}
+
+type emptyPodLister struct{ namespace string }
+
+func (e emptyPodLister) List(labels.Selector) ([]*corev1.Pod, error) { return nil, nil }
+func (e emptyPodLister) Get(name string) (*corev1.Pod, error) {
+	return nil, apierrNotFound("pod", e.namespace, name)
+}
+
+type scopedPolicyLister struct{ s *ScopedFactories }
+
+func (l scopedPolicyLister) List(sel labels.Selector) ([]*networkingv1.NetworkPolicy, error) {
+	var out []*networkingv1.NetworkPolicy
+	for _, f := range l.s.snapshot() {
+		part, err := networkingv1listers.NewNetworkPolicyLister(f.policies.GetIndexer()).List(sel)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, part...)
+	}
+	return out, nil
+}
+
+func (l scopedPolicyLister) NetworkPolicies(ns string) networkingv1listers.NetworkPolicyNamespaceLister {
+	if f, ok := l.s.snapshot()[ns]; ok {
+		return networkingv1listers.NewNetworkPolicyLister(f.policies.GetIndexer()).NetworkPolicies(ns)
+	}
+	return emptyPolicyLister{ns}
+}
+
+type emptyPolicyLister struct{ namespace string }
+
+func (e emptyPolicyLister) List(labels.Selector) ([]*networkingv1.NetworkPolicy, error) {
+	return nil, nil
+}
+func (e emptyPolicyLister) Get(name string) (*networkingv1.NetworkPolicy, error) {
+	return nil, apierrNotFound("networkpolicy", e.namespace, name)
+}
+
+type scopedIngressLister struct{ s *ScopedFactories }
+
+func (l scopedIngressLister) List(sel labels.Selector) ([]*networkingv1.Ingress, error) {
+	var out []*networkingv1.Ingress
+	for _, f := range l.s.snapshot() {
+		part, err := networkingv1listers.NewIngressLister(f.ingress.GetIndexer()).List(sel)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, part...)
+	}
+	return out, nil
+}
+
+func (l scopedIngressLister) Ingresses(ns string) networkingv1listers.IngressNamespaceLister {
+	if f, ok := l.s.snapshot()[ns]; ok {
+		return networkingv1listers.NewIngressLister(f.ingress.GetIndexer()).Ingresses(ns)
+	}
+	return emptyIngressLister{ns}
+}
+
+type emptyIngressLister struct{ namespace string }
+
+func (e emptyIngressLister) List(labels.Selector) ([]*networkingv1.Ingress, error) { return nil, nil }
+func (e emptyIngressLister) Get(name string) (*networkingv1.Ingress, error) {
+	return nil, apierrNotFound("ingress", e.namespace, name)
+}
+
+type scopedClaimLister struct{ s *ScopedFactories }
+
+func (l scopedClaimLister) List(sel labels.Selector) ([]*corev1.PersistentVolumeClaim, error) {
+	var out []*corev1.PersistentVolumeClaim
+	for _, f := range l.s.snapshot() {
+		part, err := corev1listers.NewPersistentVolumeClaimLister(f.claims.GetIndexer()).List(sel)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, part...)
+	}
+	return out, nil
+}
+
+func (l scopedClaimLister) PersistentVolumeClaims(ns string) corev1listers.PersistentVolumeClaimNamespaceLister {
+	if f, ok := l.s.snapshot()[ns]; ok {
+		return corev1listers.NewPersistentVolumeClaimLister(f.claims.GetIndexer()).PersistentVolumeClaims(ns)
+	}
+	return emptyClaimLister{ns}
+}
+
+type emptyClaimLister struct{ namespace string }
+
+func (e emptyClaimLister) List(labels.Selector) ([]*corev1.PersistentVolumeClaim, error) {
+	return nil, nil
+}
+func (e emptyClaimLister) Get(name string) (*corev1.PersistentVolumeClaim, error) {
+	return nil, apierrNotFound("persistentvolumeclaim", e.namespace, name)
 }
