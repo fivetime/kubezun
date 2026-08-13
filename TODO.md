@@ -566,6 +566,16 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       **仍未做**:`ipBlock.except`/命名端口/ANP 的**准入拒绝**——kubezun 不在准入路径上,
       NetworkPolicy 也没有 status 可写,只能记日志;真正的拒绝要 Kyverno 或 kubezoo
       网关(§7.7.4),是跨团队协作项。
+- [ ] ⭐ **（P1，升级）压 OVN 那两个数**（DESIGN §7.7.7，实验床 `ovn-appctl stopwatch/show`）：
+      ① northd 在**建删安全组**时的重算耗时；② 计算节点 ovn-controller 在**改端口安全组
+      列表**时的 `lflow_run` 耗时。
+      ⚠️ **2026-08-13 用途升级**：它们不只是"增量 2 的门槛"，而是 **region 数量规划的
+      前置输入**（§7.4.2）——OVN 的分片单位是 region，不知道一个 OVN 控制面能扛多少策略，
+      就不知道该切几个 region，于是 `节点数 = regions × K × AZs × archs` 的第一项无从估算。
+      ⚠️ **这根轴 kubetron 没有**：`grep -rln "NetworkPolicy\|SecurityGroup" /root/kubetron`
+      → 零个文件，B1 的策略由 Cilium 在 eBPF 执行、完全不进 OVN。**所以不能拿它的分片
+      经验套用**——它加 OVN-IC 是为了 chassis，我们要加 region 是为了它没有的那根轴
+      ⚠️ **不可用 devstack 评估**（同机跑满全套 OpenStack，同 §7.4 的告诫）
 - [ ] **⚠️ arm64 虚拟节点没有硬件却照样上报容量（2026-08-08 发现）**：
       CoreDNS 先被调度到 `111111-node-arm64`，全部 `CapsuleUnschedulable`（Placement 拒绝）。
       这正是"节点上报的 capacity 是承诺不是库存"的实例——虚拟节点按配额镜像容量，
@@ -995,11 +1005,19 @@ kubetron），K 可以先取一个小值、以后逐个租户迁进新分片。~
         → 重建；而旧 capsule **继续跑、继续计费、永远不会被回收**（孤儿清扫用新凭据 list，
         看不见它们）；Service 还会**复制一份 LB**（`ensureLoadBalancer` 得到 NotFound
         就 fall through 新建，旧的继续持有 VIP）
-- [ ] **（P1）节点补 `topology.kubernetes.io/region`** + PV nodeAffinity 加一条
-      MatchExpression（§3.1）。⚠️ **必须先于第二个 region 上线**——今天 PV 只按 zone 匹配
-      （`volume/reconciler.go:632-634`），多 region 下 `r1/az1` 与 `r2/az1` 会撞，
+- [ ] ⭐ **（P0，从 P1 上调）节点补 `topology.kubernetes.io/region`** + PV nodeAffinity
+      加一条 MatchExpression（§3.1）。⚠️ **必须先于第二个 region 上线**——今天 PV 只按
+      zone 匹配（`volume/reconciler.go:632-634`），多 region 下 `r1/az1` 与 `r2/az1` 会撞，
       症状是 `reconciler.go:623-627` 注释描述的那个：**claim Bound、pod Pending、
-      两个对象都不说为什么**。改动很小，但**晚做就是静默错配**
+      两个对象都不说为什么**。改动很小，但**晚做就是静默错配**。
+      ⭐ **2026-08-13 上调理由**：多 region 不是"可能会有"，是**逻辑流轴的必然结果**——
+      OVN 的分片单位就是 region（AZ 只是 Chassis 行上 `ovn-cms-options` 的一个字符串，
+      `neutron/common/ovn/utils.py:911-923`，同 region 所有 AZ 共用一套 NB/SB），
+      而 NetworkPolicy 正把我们推向那堵墙（§7.4.1/§7.4.2）
+- [ ] **（P0）绑定改成 `namespace → (project, region)`**（§4.6.1）——不能只记 project。
+      Keystone 的 project 是全局的、可跨 region 有资源，而**卷与网络不跨 region**。
+      ⚠️ 只记 project 的失败形态是"凭据对、region 错"：`Credentials.Region` 解析出另一个
+      region 的端点 → 网络 ID 找不到、卷挂不上，而**两个字段单看都是对的**
 - [ ] **（P1）节点身份去租户化**（§3.1）：名字改 `knaas-<region>-<shard>-<az>-<arch>`；
       去掉 `kubezoo.io/pool`；污点 `knaas.io/tenant=<tid>` → `knaas.io/serverless=true`；
       新增 `knaas.io/shard`

@@ -302,6 +302,9 @@ status:
 ```
 
 ⚠️ **`topology.kubernetes.io/region` 是新增的，且必须先于第二个 region 上线。**
+⭐ **2026-08-13 优先级上调**：多 region 不是"可能会有"，是**逻辑流轴的必然结果**——
+OVN 的分片单位就是 region（§7.4.2），而 NetworkPolicy 把我们推向那堵墙。
+所以这一条**排期内必做**，不是"将来再说"。
 今天节点只带 zone，而 PV 的 nodeAffinity 也**只按 zone 匹配**
 （`volume/reconciler.go:632-634`）。单 region 下无碍；一旦一个集群里同时挂多个 region，
 `r1/az1` 与 `r2/az1` 就会撞——在 r1 建的 Cinder 卷，其 PV 会匹配上 r2 的 az1 节点，
@@ -621,12 +624,22 @@ KeyManager、Subnets（全文件 19 处引用）。
 
 #### 4.6.1 绑定模型
 
-> **一个 namespace 恰好对应一个 project id；一个 project 可以有多个 namespace。**
+> **一个 namespace 恰好对应一个 `(project id, region)`；一个 `(project, region)` 可以有
+> 多个 namespace。**
 
-即 `namespace → project` 是**多对一**。一个租户的若干 namespace（`<tid>-default`、
-`<tid>-kube-system` …）通常映射到同一个 project，但模型本身不要求。
+即绑定是**多对一**。一个租户的若干 namespace（`<tid>-default`、`<tid>-kube-system` …）
+通常映射到同一个二元组，但模型本身不要求。
 
-解析链：`pod.Namespace → project id → Secret → OpenStack clients`。
+解析链：`pod.Namespace → (project, region) → Secret → OpenStack clients`。
+
+⚠️ **为什么绑的是二元组而不是只有 project**（2026-08-13 补）：Keystone 的 project 是
+**全局的**，同一个 project 可以在多个 region 各有资源；而**卷与网络不跨 region**，
+所以一个 namespace 的 pod 必须全部落在**同一个** region。只记 project 而不记 region，
+就会出现"凭据对、region 错"——`Credentials.Region` 解析出另一个 region 的端点，
+于是网络 ID 找不到、卷挂不上，而两个字段单看都是对的。
+
+⚠️ 而 region 不是一个稳定的小数字：**它由 OVN 容量推着涨**（§7.4.2），
+所以"多 region"是必然形态，不是边角情况。
 
 #### 4.6.2 Secret 放平台命名空间，不放租户命名空间
 
@@ -917,6 +930,55 @@ chassis**；虚拟节点是纯逻辑的，在 OVN 里不存在。
 list/秒，与是否活跃无关）。⚠️ **不可用 devstack 评估**（同机跑满全套 OpenStack）。
 先修轮询（复用同步结果、空闲退避、给 fork 加变更通道/ETag）再谈容量与分片；
 zun-compute 已按 host 天然分片，zun-api 无状态可扩容，真正的"分片 Zun"只指拆 DB。
+
+#### 7.4.1 ⚠️ 第二根 OVN 轴：逻辑流。这一根 kubetron 没有，我们独有（2026-08-13）
+
+上面比的是 **chassis**，那根轴我们**更好**。但 OVN 还有一根轴——**ACL / Port_Group /
+Address_Set 这类逻辑流对象**——在这一根上方向**正好相反**：
+
+| 轴 | kubetron（B1） | kubezun（B2'） |
+|---|---|---|
+| chassis | 每个跑租户 pod 的 worker 都是 chassis，500 墙 | 只有 zun-compute 是 chassis ✅ **我们更好** |
+| **逻辑流 / 安全组** | **零** | **全部** ❌ **我们更差** |
+
+**依据**：`grep -rln "NetworkPolicy\|SecurityGroup" /root/kubetron` → **零个文件**。
+kubetron 根本不把 NetworkPolicy 翻进 Neutron——**B1 的策略由 Cilium 在 eBPF 里执行，
+完全不进 OVN**。只有 B2' 走"NetworkPolicy → Neutron 安全组 → OVN 逻辑流"这条路（§7.7）。
+
+⇒ **不要把 kubetron 的分片经验直接搬过来**。它加 OVN-IC 分片是为了 chassis；
+我们要分片是为了**它从来没有过的那根轴**，两者的墙在不同位置、由不同东西推着涨。
+
+**而 K8s 负载在这根轴上比纯 VM 早到墙**（机制上成立，⚠️ 但**没有量过**，见 §7.7.7）：
+
+- 安全组**对象**增删 → **全云** northd 全量重算（`en-sync-sb.c:164-175` → `:503-528`，
+  连 nova 与 Octavia 的 port group 一起重建）。而我们**一条策略一个安全组**（§7.7.3）。
+- 地址组有增量路径（`ovn-controller.c:4380-4399`），**port group 没有**（`:4416-4470`）
+  ——这正是 §7.7.1 选 `remote_address_group_id` 的理由。
+- pod churn 远高于 VM churn；策略数随应用数长，而 VM 项目的安全组通常又少又静态。
+
+#### 7.4.2 ⭐ OVN 的分片单位是 **region**，AZ 分不了（2026-08-13 源码确认）
+
+**AZ 在 OVN 里只是 Chassis 行上 `ovn-cms-options` 里的一个字符串**：
+
+```python
+# neutron/common/ovn/utils.py:911-923
+opt_key = constants.CMS_OPT_AVAILABILITY_ZONES + '='   # "availability-zones="
+```
+
+它唯一的用途是过滤**网关端口**的调度候选（`ovn_client.py:1777-1783`）。
+**同一个 region 的所有 AZ 共用同一套 OVN NB/SB。**
+
+⇒ **要给 OVN 分片，只能加 region。** 推论有三条，都影响形态：
+
+1. **region 数不由地理决定，由 OVN 容量决定。** 在 `节点数 = regions × K × AZs × archs`
+   里，`regions` 是被 OVN 推着涨的那一项，不是配置选项。
+2. **`topology.kubernetes.io/region` 标签从"将来可能需要"变成"必然需要"**（§3.1）——
+   多 region 不是可选项，是逻辑流轴的必然结果。⚠️ 晚做就是同名 AZ 的卷静默错配。
+3. **§7.7.7 那两个没测的数，是 region 数量规划的前置依据**——不知道一个 OVN 能扛多少
+   策略，就不知道该切几个 region。它们从"增量 2 的门槛"升级为"**容量规划的输入**"。
+
+⚠️ 这条边界和 §2 说的"region 是凭据硬边界"（一份 `Credentials` 只解析一个 region 的端点）
+**是同一条线**——不用维护两套划分。
 
 ### 7.5 Service = Octavia，K8s Service CIDR 无关（2026-08-07 实测定案）
 
@@ -1374,6 +1436,11 @@ kubezun --convert-network-policy=detach --convert-confirm
 **增量 2 之前必须自己压两个数**（实验床 `ovn-appctl stopwatch/show` 即可读）：
 ① northd 在**建删安全组**时的重算耗时；② 计算节点 ovn-controller 在**改端口安全组
 列表**时的 `lflow_run` 耗时。**这两个数决定这套设计能不能撑过第一批租户。**
+
+⭐ **2026-08-13 用途升级：它们同时是 region 数量规划的前置输入**（§7.4.2）。
+OVN 的分片单位是 region，而**不知道一个 OVN 控制面能扛多少策略，就不知道该切几个
+region**——于是 `节点数 = regions × K × AZs × archs` 里的第一项无从估算。
+这两个数从"增量 2 的门槛"变成"**容量规划的输入**"，优先级随之上升。
 
 ---
 
