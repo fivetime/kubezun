@@ -8,6 +8,7 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
 )
 
 // Microversion carrying the capsule fields this provider relies on.
@@ -66,6 +67,9 @@ type Client struct {
 	// from the same one, so a tenant authenticates once and holds one token.
 	provider *gophercloud.ProviderClient
 	region   string
+	// project is which OpenStack project the credential authenticated as, read
+	// from the token rather than from configuration. See projectOf.
+	project string
 }
 
 // NewClient authenticates and returns a client for the capsule API.
@@ -95,7 +99,38 @@ func NewClient(ctx context.Context, creds Credentials) (*Client, error) {
 	// "OpenStack-API-Version: container <v>" and answers 406 to anything else.
 	sc.Type = "container"
 	sc.Microversion = Microversion
-	return &Client{sc: sc, provider: pc, region: creds.Region}, nil
+
+	project, err := projectOf(pc)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{sc: sc, provider: pc, region: creds.Region, project: project}, nil
+}
+
+// projectOf reads which OpenStack project a credential authenticated as.
+//
+// ⚠️ Read here rather than taken from configuration, because the point of
+// having it is to catch configuration that disagrees with reality. A
+// credential swapped for one in another project is otherwise silent: every
+// call succeeds, against the wrong project.
+func projectOf(pc *gophercloud.ProviderClient) (string, error) {
+	result, ok := pc.GetAuthResult().(tokens.CreateResult)
+	if !ok {
+		// Identity v2, or a session built some other way. Nothing to compare
+		// against, and refusing here would break a deployment that never had
+		// this check. The binding check treats an empty project as unknown.
+		return "", nil
+	}
+	project, err := result.ExtractProject()
+	if err != nil {
+		return "", fmt.Errorf("reading the project this credential authenticates as: %w", err)
+	}
+	if project == nil {
+		// An unscoped token. It can list nothing and create nothing, so this
+		// is worth failing on rather than discovering one call later.
+		return "", fmt.Errorf("this credential is not scoped to a project")
+	}
+	return project.ID, nil
 }
 
 // NewClientAt wraps an already-built service client, for a caller that holds a
@@ -114,5 +149,18 @@ func (c *Client) Provider() *gophercloud.ProviderClient { return c.provider }
 // Region the tenant's endpoints are resolved in.
 func (c *Client) Region() string { return c.region }
 
+// Project is the OpenStack project this client authenticated as. Empty when it
+// could not be determined, which the binding check reads as unknown rather
+// than as a mismatch.
+func (c *Client) Project() string { return c.project }
+
 // ServiceClient exposes the underlying client for the capsule calls.
 func (c *Client) ServiceClient() *gophercloud.ServiceClient { return c.sc }
+
+// NewClientForTest builds a client that reports the given binding and can do
+// nothing else. The binding check is the reason: it compares what a credential
+// authenticated as against what was recorded, and a test of that comparison
+// needs to state both sides without a Keystone.
+func NewClientForTest(project, region string) *Client {
+	return &Client{project: project, region: region}
+}

@@ -31,8 +31,19 @@ import (
 type Namespaces struct {
 	informer cache.SharedIndexInformer
 
-	mu      sync.RWMutex
-	current map[string]struct{}
+	// tenantLabel names the label whose value identifies the tenant. Empty
+	// leaves TenantOf answering "unknown", which is what a deployment serving
+	// one tenant per process needs.
+	tenantLabel string
+
+	mu sync.RWMutex
+	// current maps each served namespace to its tenant, or to the empty string
+	// when no tenant label is configured or the namespace carries none.
+	// ⚠️ The tenant is recorded here rather than looked up on demand because
+	// the answer decides which OpenStack credential a pod's capsule is created
+	// with (DESIGN §4.6). A lookup that can fail mid-flight would have to
+	// choose between refusing and guessing.
+	current map[string]string
 
 	// observers are told when the set changes, so informers scoped to a
 	// namespace can be started and stopped with it.
@@ -41,14 +52,22 @@ type Namespaces struct {
 
 // NewNamespaces watches the namespaces carrying the given label selector.
 func NewNamespaces(client kubernetes.Interface, selector string) *Namespaces {
+	return NewNamespacesWithTenantLabel(client, selector, "")
+}
+
+// NewNamespacesWithTenantLabel also records, for each namespace, the value of
+// the given label — the tenant a namespace belongs to, which decides whose
+// OpenStack credential its pods are created with.
+func NewNamespacesWithTenantLabel(client kubernetes.Interface, selector, tenantLabel string) *Namespaces {
 	factory := informers.NewSharedInformerFactoryWithOptions(client, 0,
 		informers.WithTweakListOptions(func(o *metav1.ListOptions) {
 			o.LabelSelector = selector
 		}))
 
 	n := &Namespaces{
-		informer: factory.Core().V1().Namespaces().Informer(),
-		current:  map[string]struct{}{},
+		informer:    factory.Core().V1().Namespaces().Informer(),
+		tenantLabel: tenantLabel,
+		current:     map[string]string{},
 	}
 
 	n.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -65,12 +84,16 @@ func (n *Namespaces) add(obj any) {
 	if !ok {
 		return
 	}
+	var tenant string
+	if n.tenantLabel != "" {
+		tenant = ns.Labels[n.tenantLabel]
+	}
 	n.mu.Lock()
-	if _, exists := n.current[ns.Name]; exists {
+	if known, exists := n.current[ns.Name]; exists && known == tenant {
 		n.mu.Unlock()
 		return
 	}
-	n.current[ns.Name] = struct{}{}
+	n.current[ns.Name] = tenant
 	observers := append([]func([]string, []string){}, n.observers...)
 	n.mu.Unlock()
 
@@ -112,6 +135,19 @@ func (n *Namespaces) Serves(namespace string) bool {
 	defer n.mu.RUnlock()
 	_, ok := n.current[namespace]
 	return ok
+}
+
+// TenantOf says which tenant a namespace belongs to, and whether the namespace
+// is served at all.
+//
+// ⚠️ Fails closed for the same reason Serves does: an unserved namespace answers
+// false, and a caller that treats "unknown tenant" as "use the default one"
+// would create a pod's capsule in whichever project happened to be configured.
+func (n *Namespaces) TenantOf(namespace string) (string, bool) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	tenant, ok := n.current[namespace]
+	return tenant, ok
 }
 
 // List returns the namespaces currently served.
