@@ -1395,6 +1395,15 @@ Container API 划为不维护区；主干 = capsule + CRI + zun-cni。
       lr_out_snat 流能看出差异。⚠️ 排障中三次判据坑：ovn-trace 的 ct_lb 默认不选后端
       （分辨不出 DNAT）、busybox nslookup 对 NXDOMAIN 返回非零、
       `port list -c security_group_ids` 列名无效静默为空
+- [x] ⓪ **平台一次性:SG 缺省规则模板对齐 CNI 全开语义(2026-08-13 定案)**——
+      default 组:CIDR 双向全开(⚠️ ingress 用显式 CIDR 不用 remote_group——LB
+      hairpin/SNAT 后源地址可为 VIP/外部 IP,不在任何组里,remote_group 会拒,
+      t2 DNS 即死于此);自建组:**只注入 egress 两条**,去掉 PARENT ingress
+      (它是唯一带 remote_group 的注入,会留在 knp-allow-ingress 组里踩 §13 规模轴;
+      自建组=显式白名单管理,与 K8s"写策略才隔离"同构;SG 纯叠加,default+空组仍全开)。
+      ⚠️ 模板只对新建组生效,存量租户 default SG 要手工补 ingress 全开并清 remote_group
+      规则。完整命令与注释已交用户笔记。kubezun 侧防御已验证:deny-all 无条件清空、
+      baseline 删反方向、EnsureRuleSet 删外来规则(`neutron.go:273-279`)
 - [ ] ⑧ 333333 按本清单完整开通（project/appcred/网络/VIP/router+豁免/单元/证书/RBAC/
       Secret/coredns placement）——它从未开通过
 
