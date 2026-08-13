@@ -146,7 +146,7 @@ func (p *Provider) syncOnce(ctx context.Context) error {
 			continue
 		}
 
-		phase := zun.PodPhase(cap.Status)
+		phase := zun.PhaseOf(cap)
 		// Ready has to satisfy three separate things before traffic is sent
 		// here: the capsule runs, it has an address to reach it on, and its
 		// containers say they are serving. The last one is the only source

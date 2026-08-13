@@ -1,6 +1,9 @@
 package zun
 
 import (
+	"strconv"
+	"strings"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -82,6 +85,23 @@ func PodPhase(status string) corev1.PodPhase {
 	return corev1.PodUnknown
 }
 
+// PhaseOf is PodPhase with the containers consulted: a capsule reads
+// "Stopped" whether its containers succeeded or died, so the phase has to ask
+// them. ⚠️ Without this a pod whose command failed reports Succeeded, and a
+// Job controller marks the Job complete on the strength of it.
+func PhaseOf(cap *Capsule) corev1.PodPhase {
+	phase := PodPhase(cap.Status)
+	if phase != corev1.PodSucceeded {
+		return phase
+	}
+	for i := range cap.Containers {
+		if exitCode(&cap.Containers[i]) != 0 {
+			return corev1.PodFailed
+		}
+	}
+	return phase
+}
+
 // PodConditions reports the conditions for a capsule status. ready tells
 // whether the data plane is usable as well: a capsule whose Neutron port has
 // not reached ACTIVE is running but unreachable, and reporting Ready then
@@ -131,10 +151,19 @@ func ContainerState(c *Container) corev1.ContainerState {
 		// Stopped is a terminal state, not a running one: a container that
 		// exited must not be reported as Running or a Job never completes and
 		// a Deployment never restarts it.
+		//
+		// ⚠️ The reason follows the exit code, the way kubelet's does: a
+		// nonzero exit reported as "Completed" reads as success everywhere a
+		// human or a Job controller looks.
+		code := exitCode(c)
+		reason := "Completed"
+		if code != 0 {
+			reason = "Error"
+		}
 		return corev1.ContainerState{
 			Terminated: &corev1.ContainerStateTerminated{
-				ExitCode:   exitCode(c),
-				Reason:     "Completed",
+				ExitCode:   code,
+				Reason:     reason,
 				Message:    c.StatusDetail,
 				StartedAt:  started,
 				FinishedAt: metav1.NewTime(c.UpdatedAt.Time),
@@ -175,10 +204,22 @@ func failureMessage(c *Container) string {
 	return c.StatusDetail
 }
 
-// exitCode reports the container's exit status. Zun does not expose the real
-// code, so a failed container must not claim 0: that is the code callers read
-// as success.
+// exitCode reports the container's exit status.
+//
+// The real code arrives in status_detail as "exit:<code>" (fork
+// cri/driver.py, _record_exit). ⚠️ The fallback below is for a record that
+// carries none — an older fork, or a status call that failed — and it must
+// distinguish those from "exited zero": a failed container must not claim 0,
+// because that is the code callers read as success. That guess is exactly how
+// a Permission-denied write was judged Completed before the fork recorded
+// codes; the heuristic remains only as the honest answer where no code was
+// ever told.
 func exitCode(c *Container) int32 {
+	if rest, ok := strings.CutPrefix(c.StatusDetail, "exit:"); ok {
+		if code, err := strconv.ParseInt(rest, 10, 32); err == nil {
+			return int32(code)
+		}
+	}
 	switch c.Status {
 	case "Error", "Dead":
 		return 1

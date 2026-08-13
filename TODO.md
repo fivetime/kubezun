@@ -1188,11 +1188,17 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
 这是一条线性工作且只整体部署）。维护边界先立：docker driver / kuryr_network /
 Container API 划为不维护区；主干 = capsule + CRI + zun-cni。
 
-- [ ] ⚠️ **（P1，2026-08-13 发现）容器退出码不保真**：容器内命令失败（`echo > /d/proof`
-      Permission denied → sh 退出 1），pod 却报 `Completed / exitCode 0 / startedAt null`。
-      **调用方会把失败读成成功**——Job 控制器按它判成败，这是 fail-open 方向。落点大概率
-      在 fork 的状态映射或 CRI 退出码传递（`_populate_container_state` 一带）；先复现
-      再定位，⚠️ 判据要能区分"Zun 没给退出码"和"我们丢了它"
+- [x] **容器退出码保真 —— 已修并 E2E 验证（2026-08-13，fork + kubezun 双侧）**：
+      根因两层——CRI `ListContainers` 响应**本来就没有 exit_code 字段**（fork 只拿 state，
+      EXITED→STOPPED 丢码），kubezun 只能按状态名猜（Stopped→0）。修法：fork 在 EXITED
+      时补一次 `ContainerStatus` 调用，把码记进 `status_detail`（`exit:<code>`，容器再次
+      RUNNING 时清除防止旧死状态套新生）；kubezun 解析它，reason 跟码走（≠0→Error），
+      `PhaseOf` 让 Stopped capsule + 非零容器 = **PodFailed**。
+      **E2E**：`exit 42` → `Failed/Error/exitCode:42`（修前 `Succeeded/Completed/0`）；
+      正向对照 `exit 0` → `Succeeded/Completed/0` 不变。
+      ⚠️ 状态调用失败时 detail 留空而非猜测——"没被告知"与"退出 0"保持可分辨，
+      降级路径回落旧启发式。⚠️ 遗留小项：`startedAt` 仍 null（fork 已写 started_at，
+      未追查到 API 序列化端，纯展示问题不阻塞）
 - [ ] **反亲和（平台默认启用，DESIGN §4.5）**——⚠️ 这不是新能力，是**现行为主动反 HA**：
       实测 8/8 capsule 全落 `incus-node-04`，含 3 副本 StatefulSet（keeper-0/1/2）和
       2 副本 Deployment（coredns）；判据已排除"只有一台可用"——三个 `zun-compute` 全部

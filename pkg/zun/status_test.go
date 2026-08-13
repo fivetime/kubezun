@@ -350,3 +350,39 @@ func TestFailedContainerCarriesItsReason(t *testing.T) {
 		t.Errorf("fell back wrongly: %q", st.Terminated.Message)
 	}
 }
+
+// TestExitCodeIsCarriedNotGuessed is the fidelity contract: the recorded code
+// wins, the reason follows it, and a record with no code keeps the old
+// heuristic — absent must stay distinguishable from "exited zero".
+func TestExitCodeIsCarriedNotGuessed(t *testing.T) {
+	failed := &Container{Status: "Stopped", StatusDetail: "exit:3"}
+	if got := exitCode(failed); got != 3 {
+		t.Fatalf("recorded code lost: %d", got)
+	}
+	st := ContainerState(failed)
+	if st.Terminated == nil || st.Terminated.Reason != "Error" {
+		t.Fatalf("a nonzero exit did not read as Error: %+v", st)
+	}
+
+	clean := &Container{Status: "Stopped", StatusDetail: "exit:0"}
+	if st := ContainerState(clean); st.Terminated.Reason != "Completed" || st.Terminated.ExitCode != 0 {
+		t.Fatalf("a clean exit misread: %+v", st.Terminated)
+	}
+
+	// No record: an older fork, or the status call failed. The heuristic
+	// remains — and a Stopped container with no code must NOT invent one.
+	legacy := &Container{Status: "Stopped"}
+	if got := exitCode(legacy); got != 0 {
+		t.Fatalf("absent code was invented: %d", got)
+	}
+
+	// The phase asks the containers: Stopped capsule + failed container = Failed.
+	cap := &Capsule{Status: "Stopped", Containers: []Container{*failed}}
+	if got := PhaseOf(cap); got != corev1.PodFailed {
+		t.Fatalf("a pod with a failed container read as %s — a Job would complete on it", got)
+	}
+	capOK := &Capsule{Status: "Stopped", Containers: []Container{*clean}}
+	if got := PhaseOf(capOK); got != corev1.PodSucceeded {
+		t.Fatalf("a clean pod misread as %s", got)
+	}
+}
