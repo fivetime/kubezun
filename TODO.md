@@ -1054,9 +1054,13 @@ kubetron），K 可以先取一个小值、以后逐个租户迁进新分片。~
       Keystone 的 project 是全局的、可跨 region 有资源，而**卷与网络不跨 region**。
       ⚠️ 只记 project 的失败形态是"凭据对、region 错"：`Credentials.Region` 解析出另一个
       region 的端点 → 网络 ID 找不到、卷挂不上，而**两个字段单看都是对的**
-- [ ] **（P1）节点身份去租户化**（§3.1）：名字改 `knaas-<region>-<shard>-<az>-<arch>`；
-      去掉 `kubezoo.io/pool`；污点 `knaas.io/tenant=<tid>` → `knaas.io/serverless=true`；
-      新增 `knaas.io/shard`
+- [x] **（P1）节点身份去租户化 —— 已做（2026-08-13）**：`--shard`（与 `--tenant` 互斥的
+      两种部署形态）：设 shard 时节点带 `knaas.io/shard` 标签 + `knaas.io/serverless=true`
+      污点、不打 pool；`--tenant` 形态**原样保留**——实验床还在跑每租户单元、kubezoo 还在
+      注 pool selector，直接改身份会断现有部署。名字四坐标是约定不是代码强制
+- [x] **（P1）容量改静态大额 —— 已做（2026-08-13）**：`--platform-namespace` 模式下
+      capacity flags 未设（"0"）时默认 cpu=1000/mem=4Ti/pods=10000——零容量的节点谁都
+      调度不上去。真把关 = ResourceQuota 准入 + Zun project 配额（§3.2）
 - [ ] **（P1）容量改静态大额**（§3.2）：`capacity = 配额镜像` 作废——共享节点镜像不了任一
       租户的配额。把关落到 K8s ResourceQuota 准入 + Zun project 配额两道闸门
 - [ ] **（P1）informer 收窄**（§2.2）——⚠️ **现存缺陷，不是新形态才引入的**：
@@ -1071,7 +1075,11 @@ kubetron），K 可以先取一个小值、以后逐个租户迁进新分片。~
         Services 26 / 6。**两个租户时就已经 6 倍过取**
       - ⚠️ **分片形态下会从"浪费"变成"抵消"**：`K × 集群规模` 而非 `集群规模`。
         分片本来是为了省，这样反而更贵
-      - **修法**：抄 kubetron 的服务端过滤（`WithTweakListOptions`）
+      - **修法**：⚠️ **2026-08-13 查证：服务端标签过滤这条捷径不存在**——实测 pod/svc
+        上没有任何租户标签（kubezoo 不打），而 informer 无法按"namespace 的标签"过滤
+        对象。唯一路径 = **动态 per-namespace informer 工厂 + 聚合 lister**：
+        `vknode.Namespaces.OnChange` 已有启停机制（per-node pod 工厂就是这么做的），
+        缺的是跨 namespace 的聚合 Lister 实现。是一件完整的中型工程，勿顺手做
       - ⚠️ **`allPods` 是例外，只能收窄到分片、不能到单租户**——它的注释写明
         "A policy's peers are pods wherever they run"
 - [ ] **（P2）分片装配：声明式归属**（§2.1，抄 kubetron

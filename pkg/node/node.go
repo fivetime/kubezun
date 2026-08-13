@@ -15,6 +15,16 @@ const (
 	// tolerate everything with operator=Exists would land on this node.
 	TenantTaintKey = "knaas.io/tenant"
 
+	// ServerlessTaintKey is the shared-node form of the same protection
+	// (DESIGN §3.1): the node belongs to no tenant, so the taint value cannot
+	// be one. Same reasoning as above for not using the virtual-kubelet
+	// default taint.
+	ServerlessTaintKey = "knaas.io/serverless"
+
+	// ShardLabelKey names the shard a shared node belongs to, for operators
+	// tracing which process owns a pod. Not a scheduling input.
+	ShardLabelKey = "knaas.io/shard"
+
 	// PoolLabelKey is the placement anchor the gateway injects onto tenant
 	// pods, so it must match what that transformer writes.
 	PoolLabelKey = "kubezoo.io/pool"
@@ -57,7 +67,13 @@ type Options struct {
 	// on zone alone. The failure is a claim that stays Bound and a pod that
 	// stays Pending with neither object saying why -- the same shape §14 of the
 	// volume reconciler already documents for the cross-zone case.
-	Region   string
+	Region string
+	// Shard marks a shared node with its process's shard (DESIGN §3.4.1).
+	// Setting it — with Tenant empty — produces the de-tenanted node identity:
+	// serverless taint instead of the tenant taint, shard label instead of the
+	// pool label. Tenant and Shard are the two deployment forms, not two
+	// fields to combine.
+	Shard    string
 	Version  string
 	OS       string
 	Arch     string
@@ -95,6 +111,9 @@ func Build(o Options) *corev1.Node {
 	}
 	if o.Tenant != "" {
 		labels[PoolLabelKey] = o.Tenant
+	}
+	if o.Shard != "" {
+		labels[ShardLabelKey] = o.Shard
 	}
 	if o.Region != "" {
 		// Paired with the zone below, and the pairing is the point: a zone name
@@ -134,10 +153,19 @@ func Build(o Options) *corev1.Node {
 		},
 	}
 
-	if o.Tenant != "" {
+	switch {
+	case o.Tenant != "":
 		n.Spec.Taints = []corev1.Taint{{
 			Key:    TenantTaintKey,
 			Value:  o.Tenant,
+			Effect: corev1.TaintEffectNoSchedule,
+		}}
+	case o.Shard != "":
+		// A shared node still needs its taint: without one, every chart's
+		// plain Deployment in the platform's own namespaces could land here.
+		n.Spec.Taints = []corev1.Taint{{
+			Key:    ServerlessTaintKey,
+			Value:  "true",
 			Effect: corev1.TaintEffectNoSchedule,
 		}}
 	}

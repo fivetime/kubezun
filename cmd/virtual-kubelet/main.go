@@ -70,6 +70,7 @@ type options struct {
 	volumeType           string
 	storageAZ            string
 	platformNamespace    string
+	shard                string
 	tenantLabel          string
 	enforceNetworkPolicy bool
 	convertNetworkPolicy string
@@ -160,6 +161,11 @@ func main() {
 			"⚠️ Never a tenant-visible namespace: a Secret does not have to be "+
 			"visible to be used, and a pod can mount any Secret of its own "+
 			"namespace (DESIGN §4.6.2)")
+	flag.StringVar(&o.shard, "shard", os.Getenv("KUBEZUN_SHARD"),
+		"shard name of this process under the shared-node form (DESIGN §3.4). "+
+			"Set it with --platform-namespace and WITHOUT --tenant: nodes then "+
+			"carry the knaas.io/shard label and the knaas.io/serverless taint "+
+			"instead of any tenant identity")
 	flag.StringVar(&o.tenantLabel, "tenant-label", envOr("KUBEZUN_TENANT_LABEL", "kubezoo.io/tenant"),
 		"namespace label whose value names the tenant; the gateway writes it "+
 			"and refuses changes, so it is as hard to forge as the namespace name")
@@ -303,6 +309,20 @@ func run(o options) error {
 	// what keeps this rollout safe to do in steps.
 	var mt *multiTenant
 	if o.platformNamespace != "" {
+		// Shared-node capacity: static and large (DESIGN §3.2). The old
+		// "mirror the tenant's quota" cannot mean anything on a node several
+		// tenants share, and the flags' zero default would advertise a node
+		// nothing can schedule onto. Real admission control is ResourceQuota
+		// at admission and Zun's project quota — both real, neither here.
+		if o.capacityCPU == "0" {
+			o.capacityCPU = "1000"
+		}
+		if o.capacityMem == "0" {
+			o.capacityMem = "4Ti"
+		}
+		if o.capacityPod == "0" {
+			o.capacityPod = "10000"
+		}
 		if watcher == nil {
 			return fmt.Errorf("--platform-namespace needs --namespace-selector: " +
 				"per-tenant credentials are resolved through the namespaces' tenant label")
@@ -433,6 +453,7 @@ func run(o options) error {
 		nodeObj := knode.Build(knode.Options{
 			Name:   spec.name,
 			Tenant: o.tenant,
+			Shard:  o.shard,
 			Zone:   spec.zone,
 			// From the credential rather than a flag of its own: one set of
 			// credentials resolves every service endpoint within one region
