@@ -1,7 +1,10 @@
 # KNaaS 共享节点形态:平台侧(kubezoo)配合需求
 
-2026-08-13。背景:kubezun 已切换为共享虚拟节点形态(DESIGN §1.2 定案、§4.6 落地面),
-kubezun 侧工程已完成并实验床验收(一个进程带两个租户,capsule 各落各 project)。
+2026-08-14(v2,发出前按两天实测更新)。背景:kubezun 已切换为共享虚拟节点形态
+(DESIGN §1.2 定案、§4.6 落地面),kubezun 侧工程已完成并实验床验收:一个进程带两个租户、
+capsule 各落各 project;三个租户(111111/222222/333333)均已按开通清单跑通
+(网络/DNS/LB/logs 全链路)。v2 新增 R6 与 R1 的存量迁移条款——都是实测踩出来的,
+不补上 R1 做完也落不了地。
 **正式切换卡在下面几项 kubezoo 侧改动上**——本文档是完整需求,每项带证据与验收判据,
 kubezun 侧不再有未查证的依赖。
 
@@ -36,6 +39,16 @@ B1 档维持现状不动。
 zun-compute 自身周期任务执行,`zun/compute/manager.py:1393`,不经控制面)。300s 后驱逐的
 净效果是:删掉活着的负载 → 替补 pod 落回**同一个**不可用节点 → Pending。纯损失。
 驱逐换不来迁移,因为 selector 钉死在同一类节点上。
+
+**⚠️ v2 新增:存量负载迁移条款(没有它,R1 只对新对象生效)。**
+placement 变换只作用于**经网关的写**;已存在的 Deployment/StatefulSet 的 pod 模板里
+**已经写入了** `pool=<tid>` selector(当年创建时注入的),R1 上线后它们的 pod 照旧
+钉在租户节点上。实测依据:我们给三个租户搬 coredns 时,改的就是存量模板。所以 R1 必须
+配一个存量迁移手段,二选一:
+- kubezoo 提供 mutate-existing(对存量 workload 模板重写 placement),或
+- 明确"由平台迁移工具逐租户改写模板"并把顺序写进切换手册(R1 先上线 → 逐租户改模板
+  → pod 滚动落到共享节点 → 该租户的旧节点退役)。
+⚠️ 过渡期是**混合态**:未迁移租户的新 pod 仍去旧节点,这是预期而非故障——切换手册要写明。
 
 **验收判据**(⚠️ 要能分辨"对了"和"没生效"):
 
@@ -101,6 +114,23 @@ B1 租户(Cilium 全支持)不受影响。
 
 ---
 
+## R6 租户系统负载(coredns)的模板必须随档位带 placement(v2 新增)
+
+**现状(实测,三个租户全中)**:平台为每个租户在 `<tid>-kube-system` 创建的 coredns
+Deployment,模板**不带任何 placement** → 默认调度器把它放上 B1 真实 worker(Cilium IP,
+`240.24.x`),**根本不在租户网里**。对 B1 档租户这是对的;对 KNaaS 档租户,DNS 从此
+与租户网络无关——我们为 111111/222222/333333 逐个手工补的就是这个。
+
+**要求**:创建租户 coredns(及未来任何租户系统负载)时,模板按档位注 placement:
+B1 档维持现状;KNaaS 档注与 R1 相同的 selector + toleration。已开通租户的存量 coredns
+随 R1 的存量迁移一并处理。
+
+**验收判据**:新开通一个 KNaaS 租户,**不做任何手工干预**,其 coredns pod 的 IP 落在
+该租户的 Neutron 子网内(不是 `240.24.x`),且 capsule 内 `nslookup` 经该租户自己的
+kube-dns VIP 答出。
+
+---
+
 ## kubezun 侧已就绪、供对接时直接使用的接口
 
 | 物件 | 值 |
@@ -110,3 +140,4 @@ B1 租户(Cilium 全支持)不受影响。
 | 进程形态 | `kubezun --shard <s> --platform-namespace <ns> --namespace-selector '<tenant-label> in (…)'` |
 | 每租户绑定 | Secret `<platform-ns>/<tenant>`,注解 `knaas.io/{project-id,region,network-id,vip-subnet-id,vip-network-id}` |
 | namespace→租户 | `kubezoo.io/tenant` 标签(现有机制,我们把它当授权边界依赖——**继续保证网关写入且拒改**) |
+| 现成样板 | `knaas-system` 命名空间已有 111111/222222/333333 三份 Secret(含全部注解),三租户全链路验收过;开通全清单见 kubezun `TODO.md` O 段(**开通控制器在我们侧**,含东西向 SNAT 豁免与 SG 缺省模板等 OpenStack 侧前置——列在此仅供理解上下文,不是给 kubezoo 的活) |
