@@ -348,3 +348,25 @@ func TestEmptySecurityGroupsVanishFromTheTemplate(t *testing.T) {
 			"verified before relying on this.")
 	}
 }
+
+// TestOwnerUIDGroupsReplicasNotPods pins the anti-affinity grouping key: two
+// replicas of one workload share the label, a bare pod carries none. Grouping
+// by pod name or pod UID makes every replica its own group and the weigher
+// spreads nothing — silently.
+func TestOwnerUIDGroupsReplicasNotPods(t *testing.T) {
+	truthy := true
+	owned := func(name string) *corev1.Pod {
+		p := pod(func(p *corev1.Pod) { p.Name = name })
+		p.OwnerReferences = []metav1.OwnerReference{{
+			UID: "sts-1", Kind: "StatefulSet", Name: "keeper", Controller: &truthy}}
+		return p
+	}
+	a, b := ownedLabels(owned("keeper-0")), ownedLabels(owned("keeper-1"))
+	if a[LabelOwnerUID] == "" || a[LabelOwnerUID] != b[LabelOwnerUID] {
+		t.Fatalf("replicas of one workload did not share an owner: %q vs %q",
+			a[LabelOwnerUID], b[LabelOwnerUID])
+	}
+	if bare := ownedLabels(pod()); bare[LabelOwnerUID] != "" {
+		t.Fatalf("a bare pod claimed an owner: %q", bare[LabelOwnerUID])
+	}
+}

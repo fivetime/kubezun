@@ -7,6 +7,7 @@ import (
 
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // Label keys written onto every capsule this provider owns. They are the only
@@ -17,6 +18,16 @@ const (
 	LabelNamespace = "knaas.io/pod-namespace"
 	LabelPodName   = "knaas.io/pod-name"
 	LabelPodUID    = "knaas.io/pod-uid"
+
+	// LabelOwnerUID is the UID of the workload the pod belongs to -- its
+	// controller ownerReference: the StatefulSet, the ReplicaSet. The Zun
+	// scheduler's anti-affinity weigher groups by it (DESIGN §4.5).
+	//
+	// ⚠️ Not the pod name and not the pod UID: keeper-0 and keeper-1 differ in
+	// both, and the point is that they are the same thing three times. A pod
+	// with no controller gets no label, which the weigher reads as "no
+	// opinion" -- a bare pod has no replicas to spread.
+	LabelOwnerUID = "knaas.io/owner-uid"
 	// LabelNodeName records which virtual node created the capsule. A tenant
 	// runs one node per architecture, so several providers share a namespace,
 	// and each one's pod informer is filtered to its own node — meaning a
@@ -387,12 +398,7 @@ func BuildTemplate(pod *corev1.Pod, opts TemplateOptions) ([]byte, error) {
 		Metadata: metadata{
 			Name:        CapsuleName(pod),
 			Annotations: annotationsFor(opts),
-			Labels: map[string]string{
-				LabelManagedBy: ManagedByValue,
-				LabelNamespace: pod.Namespace,
-				LabelPodName:   pod.Name,
-				LabelPodUID:    string(pod.UID),
-			},
+			Labels:      ownedLabels(pod),
 		},
 		Spec:             spec{RestartPolicy: restartPolicy(pod)},
 		AvailabilityZone: opts.AvailabilityZone,
@@ -556,4 +562,18 @@ type ClaimMount struct {
 	VolumeID string
 	// Export is "host:/path", when Kind is "nfs".
 	Export string
+}
+
+// ownedLabels stamps the capsule with what it is and whose it is.
+func ownedLabels(pod *corev1.Pod) map[string]string {
+	labels := map[string]string{
+		LabelManagedBy: ManagedByValue,
+		LabelNamespace: pod.Namespace,
+		LabelPodName:   pod.Name,
+		LabelPodUID:    string(pod.UID),
+	}
+	if owner := metav1.GetControllerOf(pod); owner != nil {
+		labels[LabelOwnerUID] = string(owner.UID)
+	}
+	return labels
 }

@@ -1216,7 +1216,22 @@ Container API 划为不维护区；主干 = capsule + CRI + zun-cni。
       ⚠️ 状态调用失败时 detail 留空而非猜测——"没被告知"与"退出 0"保持可分辨，
       降级路径回落旧启发式。⚠️ 遗留小项：`startedAt` 仍 null（fork 已写 started_at，
       未追查到 API 序列化端，纯展示问题不阻塞）
-- [ ] **反亲和（平台默认启用，DESIGN §4.5）**——⚠️ 这不是新能力，是**现行为主动反 HA**：
+- [x] **反亲和 —— 已实现并实测（2026-08-14,fork + kubezun 双侧,平台默认启用）**：
+      fork:weigher 种子框架(`scheduler/weights/`,排序永不过滤 → 软性是构造保证,
+      配置删不掉)+ `OwnerAntiAffinityWeigher`(每台已有同 owner capsule 计 -1,
+      每次调度一次 listing 缓存在 context 上);kubezun:capsule 打
+      `knaas.io/owner-uid`(pod 的 controller ownerReference UID,单测钉住
+      "副本同组、裸 pod 无组")。
+      ⚠️ **首次部署静默无效,根因值得记**:`Container.list` 返回的行 labels 全空——
+      capsule 的模板 labels 只在 capsule 行上,必须 `Capsule.list`。症状是"部署了、
+      调度照旧",没有任何报错——判据(三副本分布)是唯一能看出它没生效的东西。
+      **验收①(强)**:keeper 3 副本滚动后 **04/05/06 各一台**。
+      **验收②(软性)**:停 05/06 的 zun-compute 后建 2 副本,一副本确证落 04;
+      ⚠️ 第二副本因清理抢跑未取到确证(结构上软性由"只排序"保证,NoValidHost 无从产生),
+      如实记录,下次顺手补测。
+      ⚠️ 旧 capsule 无 owner 标签,滚动/重建后才参与散布——存量不迁移,自然换代。
+      原条目正文:
+- [~] ~~（原文）反亲和（平台默认启用，DESIGN §4.5）~~——⚠️ 这不是新能力，是**现行为主动反 HA**：
       实测 8/8 capsule 全落 `incus-node-04`，含 3 副本 StatefulSet（keeper-0/1/2）和
       2 副本 Deployment（coredns）；判据已排除"只有一台可用"——三个 `zun-compute` 全部
       `up`、同 AZ、无 disabled，node-05/06 的 Placement 用量 `0 0 0` 完全空着。
