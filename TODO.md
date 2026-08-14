@@ -566,6 +566,23 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       **仍未做**:`ipBlock.except`/命名端口/ANP 的**准入拒绝**——kubezun 不在准入路径上,
       NetworkPolicy 也没有 status 可写,只能记日志;真正的拒绝要 Kyverno 或 kubezoo
       网关(§7.7.4),是跨团队协作项。
+- [ ] **（P2）外部评审采纳项（2026-08-14,verdict 带验证）**：
+      ✅ **采纳 (b)**:把 `EnsureAddressGroup`/`EnsureRuleSet` 从 pod 热路径挪到策略队列
+      ——已验证属实:`reconciler.go:155,162,272` 每个 pod 事件付 O(选中策略数) 次 Neutron
+      往返,且 pod 队列无合并窗口(`controller.go:147,220` 直接 Add,策略队列才有
+      AddAfter)。改法:策略 worker 维护 policy→groupID 表,pod 路径只读 ID,塌缩成
+      一次 ports.Get + 至多一次 Update。⚠️ 两个边界:缓存未命中(pod 先于策略 worker)
+      → 重入队退避,不回退到内联 Ensure;策略删除后 groupID 失效 → Update 拿 400 时
+      fail-closed 重试,等 sweep/worker 收敛
+      ✅ **采纳(文档)**:secgroup_rules 配额按 **Σ(peers × ports × families)** 估,
+      不按策略规则条数——比 DESIGN 现在"放开几个数量级"更具体,并入 §7.7.5b 运维清单
+      ⛔ **否决 (a) 删 deny-all 锚**——评审说"Zun 模板路径没验之前别动",验了:拦路虎
+      在**我们自己**的序列化层且今天就在生效:`template.go:281`
+      `json:"securityGroups,omitempty"`,空列表整个被丢 → 字段缺失 → 端口拿 project
+      default SG → **全隔离 pod 静默全开**。这正是历史上"empty vs absent"那次事故的
+      机制,锚就是当时的修复。删锚省的是 1/3 的 PG 重建成本(两个 baseline 组照样在),
+      换来的是"链条上任何一层把空集折叠成缺省"永久成为静默 fail-open——
+      封闭白名单形状的脆弱性,不换
 - [ ] ⭐ **（P1，升级）压 OVN 那两个数**（DESIGN §7.7.7，实验床 `ovn-appctl stopwatch/show`）：
       ① northd 在**建删安全组**时的重算耗时；② 计算节点 ovn-controller 在**改端口安全组
       列表**时的 `lflow_run` 耗时。
