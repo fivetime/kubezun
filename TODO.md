@@ -1083,7 +1083,9 @@ kubetron），K 可以先取一个小值、以后逐个租户迁进新分片。~
       OVN 的分片单位就是 region（AZ 只是 Chassis 行上 `ovn-cms-options` 的一个字符串，
       `neutron/common/ovn/utils.py:911-923`，同 region 所有 AZ 共用一套 NB/SB），
       而 NetworkPolicy 正把我们推向那堵墙（§7.4.1/§7.4.2）
-- [ ] **（P0）绑定改成 `namespace → (project, region)`**（§4.6.1）——不能只记 project。
+- [x] **（P0）绑定改成 `namespace → (project, region)` —— 已做（随解析器一并完成，
+      de5b11c）**：`Resolver.checkBinding` 的 `want` 同时含 `ProjectAnnotation` 与
+      `RegionAnnotation`（`resolver.go:230-233`），三态校验对两者都生效。
       Keystone 的 project 是全局的、可跨 region 有资源，而**卷与网络不跨 region**。
       ⚠️ 只记 project 的失败形态是"凭据对、region 错"：`Credentials.Region` 解析出另一个
       region 的端点 → 网络 ID 找不到、卷挂不上，而**两个字段单看都是对的**
