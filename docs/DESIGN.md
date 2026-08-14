@@ -1491,7 +1491,41 @@ kubezun --convert-network-policy=detach --convert-confirm
 限定在可表达子集（数字端口、podSelector/namespaceSelector 由我们算成**一个**地址组、
 普通 `ipBlock` CIDR）。
 
-#### 7.7.7 ⚠️ 没有人给过数字
+#### 7.7.7 数字来了(2026-08-14 实测),两根轴都比恐惧的好
+
+**实测环境**:devstack 全家桶同机(节点小、端口少:~30 LSP / 15 datapath),
+**绝对值仅作量级参考,曲线形状才是结论**。方法:`ovn-appctl stopwatch/reset` →
+单次操作 → 读 `build_lflows`(northd)与 `flow-generation`(node-04 ovn-controller)
+的 Maximum;每点 ≥2 次。
+
+| 操作 | 基数 8 | 基数 100 | 基数 400 | 基数 1000 |
+|---|---|---|---|---|
+| SG 建(northd) | 18–24ms | 16–21ms | 19–21ms | **14–16ms** |
+| SG 删(northd) | 16–21ms | 14ms | 17ms | — |
+| 端口加/减组(northd) | — | — | — | 11–17ms |
+| 端口加/减组(controller flow-generation) | — | — | — | **≤1ms(9 样本,真跑了)** |
+| address group 加地址(两侧) | — | — | — | **0ms** |
+
+基数 = 该 project 的 SG 数,PG 已确认物化(400 组时 NB 里 527 PG / 1733 ACL)。
+
+**三条结论**:
+
+1. **northd 对 SG 建删的重算在 8 → 1000 组区间完全平坦**(~20ms)。§13 引用的
+   `en-sync-sb.c` 全云重算路径在 2026.1 的 OVN 上**没有表现为随组数增长的成本**——
+   或者 northd 的增量处理已覆盖,或者这个规模远够不着弯折点。
+2. **ovn-controller 对端口组变更有增量路径**:1000 PG 基数下 flow-generation ≤1ms
+   (样本非零,确认执行过)。⚠️ **§13 那句"port-group 无 delta 路径
+   (ovn-controller.c:4416-4470)"对当前版本是过时的**——当时读的代码与现在跑的版本
+   不一致,以实测为准。
+3. **address group 轴免费**(两侧 0ms)——"peer churn 压到地址组"这个设计押注被证实。
+
+**对设计的含义**:每策略一 SG 的对象经济学依旧正确(对象数=策略数),但"策略建删是
+全云重算"的恐惧在千级策略内**不成立**;region 容量规划(§7.4.2)在中小规模不再被
+这两个数阻塞。**未证的仍要写明**:端口数轴没测(实验床只有 ~30 端口,ACL×port 的
+乘积才是真正的 lflow 体量);万级策略、数百计算节点下的弯折点在哪,得上真环境。
+
+> 原文存档:本节此前题为"没有人给过数字",记载 OVN 自身不压测这类对象、
+> 流传数字无可复现出处——现已被上表替代,方法保留可复跑(`/tmp/nptest/driver.sh`)。
 
 **OVN 自己不压测我们要造的那类对象**：`tests/perf-northd.at:197-215` 的 200HV×200port
 规模测试建的全是逻辑交换机/路由器/端口，**零 ACL、零 Port_Group、零 Address_Set**；
