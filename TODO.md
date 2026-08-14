@@ -1096,7 +1096,9 @@ kubetron），K 可以先取一个小值、以后逐个租户迁进新分片。~
       调度不上去。真把关 = ResourceQuota 准入 + Zun project 配额（§3.2）
 - [ ] **（P1）容量改静态大额**（§3.2）：`capacity = 配额镜像` 作废——共享节点镜像不了任一
       租户的配额。把关落到 K8s ResourceQuota 准入 + Zun project 配额两道闸门
-- [ ] **（P1）informer 收窄 —— 组件已完成，接线进行中（2026-08-13）**：
+- [x] **（P1）informer 收窄 —— 组件与四个 controller 全部接线完成（2026-08-13/14）**：
+      ⚠️ **棋盘卫生笔记**：下面的记录早就写着"已接线"，行首勾选符一直没跟着翻——
+      2026-08-14 巡查连同 P0 绑定项一起补，两条都是完工漏打勾，不是遗留工作。
       `vknode.ScopedFactories`：每 served namespace 一个官方单 namespace factory，
       六类 namespaced 对象（services/slices/pods/policies/ingresses/claims），
       fan-out lister 实现标准接口（消费方零改动），handler 订阅覆盖后加入的 namespace，
