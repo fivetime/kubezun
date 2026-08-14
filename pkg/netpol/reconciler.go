@@ -1,6 +1,8 @@
 package netpol
 
 import (
+	"sync"
+
 	"context"
 	"fmt"
 	"sort"
@@ -33,6 +35,50 @@ type Reconciler struct {
 	baseline struct {
 		ingress, egress, denyAll string
 	}
+
+	// ruleGroups is policy key → its rules-group id, written by the policy
+	// worker (SyncPolicyPeers) and only read on the pod path. This is what
+	// keeps Neutron off the pod hot path: before it, every pod event paid one
+	// read per policy selecting it, and the pod queue has no coalescing.
+	ruleMu     sync.Mutex
+	ruleGroups map[string]string
+}
+
+// ErrPolicyPending says a pod's policy has not been through the policy worker
+// yet, so its group id is unknown.
+//
+// ⚠️ The caller must requeue and WAIT, never fall back to creating the group
+// inline: the fallback path is the hot path this cache exists to close, and a
+// fallback that "only happens on misses" is the hot path again the first time
+// the cache is cold for a burst of pods.
+type ErrPolicyPending struct{ Policy string }
+
+func (e ErrPolicyPending) Error() string {
+	return "policy " + e.Policy + " has not been prepared yet; the pod will be retried"
+}
+
+// rememberRuleGroup records what the policy worker built.
+func (r *Reconciler) rememberRuleGroup(policyKey, groupID string) {
+	r.ruleMu.Lock()
+	defer r.ruleMu.Unlock()
+	if r.ruleGroups == nil {
+		r.ruleGroups = map[string]string{}
+	}
+	r.ruleGroups[policyKey] = groupID
+}
+
+// ForgetPolicy drops a deleted policy's entry; the sweep owns its groups.
+func (r *Reconciler) ForgetPolicy(policyKey string) {
+	r.ruleMu.Lock()
+	defer r.ruleMu.Unlock()
+	delete(r.ruleGroups, policyKey)
+}
+
+func (r *Reconciler) ruleGroupOf(policyKey string) (string, bool) {
+	r.ruleMu.Lock()
+	defer r.ruleMu.Unlock()
+	id, ok := r.ruleGroups[policyKey]
+	return id, ok
 }
 
 // EnsureBaseline resolves the two constant groups once, at startup.
@@ -123,8 +169,6 @@ func (r *Reconciler) policyGroupsFor(ctx context.Context, pod *corev1.Pod, polic
 		if !t.Subject.Matches(labels.Set(pod.Labels)) {
 			continue
 		}
-		r.ReportRefusals(ctx, p, t.Refused)
-
 		set := PolicyRules(t)
 		if set.Empty() {
 			// A policy that isolates and allows nothing -- the deny-all
@@ -134,37 +178,19 @@ func (r *Reconciler) policyGroupsFor(ctx context.Context, pod *corev1.Pod, polic
 			continue
 		}
 
-		// The peer sets first: a rule naming an address group that does not
-		// exist is refused, and a refusal in the middle leaves the pod holding
-		// half a policy.
-		keys := make([]string, 0, len(set.Peers))
-		for key := range set.Peers {
-			keys = append(keys, key)
+		// ⚠️ Read-only. The groups and their peer sets are built by the policy
+		// worker (SyncPolicyPeers); this path pays no Neutron call at all.
+		// Before the cache, every pod event paid one read per selecting
+		// policy on a queue with no coalescing -- the hottest path in the
+		// serverless line doing idempotent bookkeeping that belongs to the
+		// policy dimension (2026-08-14 review, accepted).
+		id, ok := r.ruleGroupOf(p.Namespace + "/" + p.Name)
+		if !ok {
+			return nil, ErrPolicyPending{Policy: p.Namespace + "/" + p.Name}
 		}
-		sort.Strings(keys)
-
-		// Only that they exist, not what is in them. ⚠️ Membership belongs to
-		// the policy, not to whichever pod happened to be reconciled: this
-		// runs for the policy's SUBJECT pods, and a peer pod is usually not
-		// one of them. Syncing here meant a new replica of a peer was never
-		// added and a deleted one never removed -- the set drifted into
-		// whatever it held the last time a subject pod was touched.
-		// SyncPolicyPeers, driven by its own queue, owns the contents.
-		peers := make(map[string]string, len(set.Peers))
-		for _, key := range keys {
-			id, err := r.Neutron.EnsureAddressGroup(ctx, AddressGroupName(key))
-			if err != nil {
-				return nil, err
-			}
-			peers[key] = id
+		if id != "" {
+			out = append(out, id)
 		}
-
-		id, err := r.Neutron.EnsureRuleSet(ctx,
-			GroupNameFor(p.Namespace, p.Name), p.Namespace+"/"+p.Name, set, peers)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, id)
 	}
 	return out, nil
 }
@@ -261,6 +287,7 @@ func (r *Reconciler) SyncPolicyPeers(ctx context.Context, p *networkingv1.Networ
 	if err != nil {
 		return err
 	}
+	r.ReportRefusals(ctx, p, t.Refused)
 	set := PolicyRules(t)
 	keys := make([]string, 0, len(set.Peers))
 	for key := range set.Peers {
@@ -268,6 +295,7 @@ func (r *Reconciler) SyncPolicyPeers(ctx context.Context, p *networkingv1.Networ
 	}
 	sort.Strings(keys)
 
+	peers := make(map[string]string, len(set.Peers))
 	for _, key := range keys {
 		id, err := r.Neutron.EnsureAddressGroup(ctx, AddressGroupName(key))
 		if err != nil {
@@ -280,7 +308,23 @@ func (r *Reconciler) SyncPolicyPeers(ctx context.Context, p *networkingv1.Networ
 		if err := r.Neutron.SyncAddresses(ctx, id, addresses); err != nil {
 			return err
 		}
+		peers[key] = id
 	}
+
+	// The rules group too: this worker is where every Neutron write of a
+	// policy now lives, so the pod path can be a cache read. ⚠️ Recorded only
+	// after the write succeeds -- recording first would hand pods a group id
+	// that may not exist.
+	if set.Empty() {
+		r.rememberRuleGroup(p.Namespace+"/"+p.Name, "")
+		return nil
+	}
+	id, err := r.Neutron.EnsureRuleSet(ctx,
+		GroupNameFor(p.Namespace, p.Name), p.Namespace+"/"+p.Name, set, peers)
+	if err != nil {
+		return err
+	}
+	r.rememberRuleGroup(p.Namespace+"/"+p.Name, id)
 	return nil
 }
 

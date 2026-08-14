@@ -1,6 +1,8 @@
 package netpol
 
 import (
+	"errors"
+
 	"context"
 	"fmt"
 	"reflect"
@@ -296,7 +298,10 @@ func (c *Controller) syncPolicy(ctx context.Context, key string) error {
 	}
 	p, err := c.reconciler.Policies.NetworkPolicies(namespace).Get(name)
 	if err != nil {
-		// Gone. Its groups are the sweep's business.
+		// Gone. Its groups are the sweep's business; the cache entry is ours,
+		// and leaving it would hand new pods the id of a group the sweep is
+		// about to delete.
+		c.reconciler.ForgetPolicy(key)
 		return nil
 	}
 	r, err := c.reconcilerOf(ctx, namespace)
@@ -364,6 +369,15 @@ func (c *Controller) work(ctx context.Context) {
 			continue
 		}
 		if err := r.ReconcilePod(ctx, key); err != nil {
+			var pending ErrPolicyPending
+			if errors.As(err, &pending) {
+				// The policy worker has not built this policy's groups yet.
+				// Nudge it now rather than waiting for the resync, and retry
+				// the pod with backoff. ⚠️ Never build inline here: the
+				// fallback path would be the hot path again on every cold
+				// start.
+				c.policies.Add(pending.Policy)
+			}
 			log.G(ctx).WithError(err).WithField("pod", key).
 				Warn("could not align this pod's security groups; will retry")
 			c.queue.AddRateLimited(key)

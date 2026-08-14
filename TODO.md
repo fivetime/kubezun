@@ -566,8 +566,17 @@ DESIGN 回答"为什么这样设计"，本文件回答"还剩什么没做"。
       **仍未做**:`ipBlock.except`/命名端口/ANP 的**准入拒绝**——kubezun 不在准入路径上,
       NetworkPolicy 也没有 status 可写,只能记日志;真正的拒绝要 Kyverno 或 kubezoo
       网关(§7.7.4),是跨团队协作项。
-- [ ] **（P2）外部评审采纳项（2026-08-14,verdict 带验证）**：
-      ✅ **采纳 (b)**:把 `EnsureAddressGroup`/`EnsureRuleSet` 从 pod 热路径挪到策略队列
+- [x] **（P2 → 已做）外部评审 (b):Neutron 写全部挪出 pod 热路径（2026-08-14 实现并实测）**：
+      策略 worker(`SyncPolicyPeers`)现在拥有一条策略的**全部** Neutron 写(地址组 +
+      内容 + rules 组),写成功后才记入 `ruleGroups` 缓存;pod 路径(`policyGroupsFor`)
+      纯缓存读,未命中返回 `ErrPolicyPending` → controller 立即催策略队列 + pod 退避重入,
+      **绝不内联回退**(回退路径就是冷启动时的热路径复辟)。策略删除 → `ForgetPolicy`
+      (残留缓存会把 sweep 将删的组 id 发给新 pod)。`ReportRefusals` 随写路径搬到策略
+      worker,顺带消掉每 pod 一条的重复告警。
+      **测试的妙处**:夹具的 Neutron 本来就是 nil——**nil 即零调用证明**,旧代码在这两个
+      场景直接 panic,天然红。实验床回归:重启后 keeper(无标签)仍被挡、新建
+      `role=client` pod 经冷缓存路径放行——执行语义双向不变。
+      原 verdict 记录:
       ——已验证属实:`reconciler.go:155,162,272` 每个 pod 事件付 O(选中策略数) 次 Neutron
       往返,且 pod 队列无合并窗口(`controller.go:147,220` 直接 Add,策略队列才有
       AddAfter)。改法:策略 worker 维护 policy→groupID 表,pod 路径只读 ID,塌缩成
