@@ -327,3 +327,24 @@ func joinCommand(cmd []any) string {
 	}
 	return strings.Join(parts, " ")
 }
+
+// TestEmptySecurityGroupsVanishFromTheTemplate documents the omitempty trap
+// the deny-all anchor exists to neutralize: an explicitly empty list does not
+// serialize as "securityGroups": [] — it serializes as NOTHING, and an absent
+// field means the project default group downstream. If this test ever fails
+// (because omitempty was removed and emptiness became explicit), the anchor's
+// necessity should be re-argued with the whole chain verified — until then,
+// netpol's TestFullyIsolatedPodNeverGetsAnEmptyGroupList keeps the empty list
+// unreachable.
+func TestEmptySecurityGroupsVanishFromTheTemplate(t *testing.T) {
+	p := pod()
+	tpl, err := BuildTemplate(p, TemplateOptions{SecurityGroups: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(tpl), "securityGroups") {
+		t.Fatal("an empty securityGroups now serializes explicitly — omitempty " +
+			"was removed. Re-argue the deny-all anchor with the full chain " +
+			"verified before relying on this.")
+	}
+}
