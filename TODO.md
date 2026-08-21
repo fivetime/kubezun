@@ -1457,7 +1457,20 @@ memory_swap 列再改名,不可逆(当前列还不存在,无实际损失)。
       devmapper,等于 133 上 fc 档一直会创建失败,这次恢复后三台一致
       (md5 9bd05b,原文件留 .pre-restore)。**教训同"算哈希不看 git"**:
       插件状态(ok/skip)每台都要问,配置文件长得一样不等于生效状态一样。
-- [ ] **P2b qemu/clh 档硬顶(现在所有 capsule 走的路,仍无界)——机制已核清**:
+- [x] **P2b-实测 erofs 硬顶已坐实(2026-08-21,133 实测,runc 与 kata-qemu 双档)**:
+      三台装 erofs-utils → erofs snapshotter+differ 全 ok(之前 skip 就是缺
+      mkfs.erofs),`conf.d/60-erofs.toml` 配 `default_size='2GB'`(三台对称)。
+      **实测**(ctr 路径,绕开 CNI——裸 crictl sandbox 会被 zun-cni 拒,无 Zun 记录):
+      ① runc+erofs:容器内 `/` 总量 1946MB,dd 写到 1.9G **ENOSPC**,容器视角 100%;
+      ② **kata-qemu+erofs(生产档)**:guest 内同样 1946MB/ENOSPC——顶穿过 virtiofs
+      在 VM 里成立。宿主根盘增量两次都钉在 1994MiB(=顶),容器删除后**全额回收**
+      (基线漂移仅 8MB)。⚠️ 判据完整性:EXIT=1 + 容器内 df 100% + 宿主增量三者同时
+      取到,且回收核对过——不是只看"没报错"。
+- [ ] **P2c 切生产(剩最后一步,要挑窗口)**:qemu/clh 两 handler 的 snapshotter
+      从 overlayfs 切 erofs(runtime + images runtime_platforms 两处,照 fc 档
+      50-kata.toml 的样子)——切换后新 capsule 拉起会在 erofs 重新解包镜像,首次慢
+      一拍;`default_size` 定多大(2G?与 fc 的 8G 对齐?)是产品决定。
+      原 P2b 机制备忘:
       ① **v2.3.4 就够做统一硬顶**:erofs snapshotter 的 `default_size` toml 项
       (v2.3.3 起就有,`blockMode: defaultSize > 0`)= 每容器定长块镜像,ENOSPC
       真硬顶;还差三步:装 erofs-utils(三台都没有 mkfs.erofs)→ 配
