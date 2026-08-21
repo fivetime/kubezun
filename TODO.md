@@ -1225,6 +1225,15 @@ fork 仓库已就位：`/root/k8s-zun-provider/openstack/zun` = `github.com/five
 这是一条线性工作且只整体部署）。维护边界先立：docker driver / kuryr_network /
 Container API 划为不维护区；主干 = capsule + CRI + zun-cni。
 
+⚠️ **部署配对约束(2026-08-21 核实)**:另一工作线的 13 个提交带 3 个 alembic
+migration(a1f5be2c7d90→b7c04e19af32→c3d17e5b8f42,flavor 限额/卷 IO/swap 改名),
+**开发云两边都还没上**——DB 停在上游 head 3f2b36231bee(列级核过,无混合态,现状
+无损)。**下次把 fork 主干整体同步到 /opt/stack/zun 时必须同窗跑
+`/opt/stack/data/venv/bin/zun-db-manage upgrade`**:新 models 引用
+container.swap/pids_limit 等不存在的列,新代码配旧库在 create/show 路径直接
+OperationalError;反向(先升库后升代码)安全。注意 c3d17e5b8f42 会先清空
+memory_swap 列再改名,不可逆(当前列还不存在,无实际损失)。
+
 - [x] **容器退出码保真 —— 已修并 E2E 验证（2026-08-13，fork + kubezun 双侧）**：
       根因两层——CRI `ListContainers` 响应**本来就没有 exit_code 字段**（fork 只拿 state，
       EXITED→STOPPED 丢码），kubezun 只能按状态名猜（Stopped→0）。修法：fork 在 EXITED
@@ -1234,8 +1243,13 @@ Container API 划为不维护区；主干 = capsule + CRI + zun-cni。
       **E2E**：`exit 42` → `Failed/Error/exitCode:42`（修前 `Succeeded/Completed/0`）；
       正向对照 `exit 0` → `Succeeded/Completed/0` 不变。
       ⚠️ 状态调用失败时 detail 留空而非猜测——"没被告知"与"退出 0"保持可分辨，
-      降级路径回落旧启发式。⚠️ 遗留小项：`startedAt` 仍 null（fork 已写 started_at，
-      未追查到 API 序列化端，纯展示问题不阻塞）
+      降级路径回落旧启发式。~~⚠️ 遗留小项：`startedAt` 仍 null~~——**已修（2026-08-21,三跳全查清）**:
+      丢失点不止序列化端,是**三跳独立缺口**,修任何一跳都看不见效果:
+      ① fork API view `_basic_keys` 没列 `started_at`(有值也被剥);② CRI 驱动只在
+      EXITED 分支写(RUNNING 的容器 DB 里就是 NULL);③ kubezun 的
+      `statusFingerprint` 不含时间戳(值到了也判"没变化"不推送——顺带发现
+      terminated 只比 Reason 不比 exitCode,`exit 1→2` 同为 Error 也不传播,一起修)。
+      fork `24b33540` + kubezun `9831439`,三租户实测 Running/Stopped 均出值
 - [x] **反亲和 —— 已实现并实测（2026-08-14,fork + kubezun 双侧,平台默认启用）**：
       fork:weigher 种子框架(`scheduler/weights/`,排序永不过滤 → 软性是构造保证,
       配置删不掉)+ `OwnerAntiAffinityWeigher`(每台已有同 owner capsule 计 -1,
@@ -1246,9 +1260,13 @@ Container API 划为不维护区；主干 = capsule + CRI + zun-cni。
       capsule 的模板 labels 只在 capsule 行上,必须 `Capsule.list`。症状是"部署了、
       调度照旧",没有任何报错——判据(三副本分布)是唯一能看出它没生效的东西。
       **验收①(强)**:keeper 3 副本滚动后 **04/05/06 各一台**。
-      **验收②(软性)**:停 05/06 的 zun-compute 后建 2 副本,一副本确证落 04;
-      ⚠️ 第二副本因清理抢跑未取到确证(结构上软性由"只排序"保证,NoValidHost 无从产生),
-      如实记录,下次顺手补测。
+      **验收②(软性)——2026-08-21 补测完成,证据齐**(方案改为"副本数>主机数",
+      不必停服务,且证据在清理前先落盘):5 副本 3 主机 → **5/5 全 Running、零
+      NoValidHost**,超出的副本回落已用主机(04×3/06×2)。
+      **验收③(weigher 直接观测,补测时白捡)**:计数 3/0/2 时串行扩容第 6 副本
+      → **精确落在计数为 0 的 05**。⚠️ 顺带记一条固有行为:并发突发(5 副本一次
+      建)时决策互相看不见(capsule 行还没带 host),散布可能不均(实测 3/0/2)——
+      这是软排序的设计属性不是缺陷,串行/滚动创建则散布精确。
       ⚠️ 旧 capsule 无 owner 标签,滚动/重建后才参与散布——存量不迁移,自然换代。
       原条目正文:
 - [~] ~~（原文）反亲和（平台默认启用，DESIGN §4.5）~~——⚠️ 这不是新能力，是**现行为主动反 HA**：
@@ -1420,6 +1438,28 @@ Container API 划为不维护区；主干 = capsule + CRI + zun-cni。
       kubelet 必须保留 containerd 时才需要（DESIGN §7）
 - [ ] （候选）nets/固定 IP 按 PoC 结论补齐
 - [ ] （顺手）linux_net.py ovs-vsctl → ovsdb（上游自己的 TODO，linux_net.py:48）
+
+## R:rootfs 写放大防线(2026-08-21,四路核实后立项——背景:租户任意路径写入不得写爆宿主机)
+
+- [ ] **P1 `/var/lib/containerd` 挪独立盘——核实后确认做不了原地挪,卡在虚拟化层**:
+      三台开发节点(133-135)均为单 400G virtio 盘 VM,vda2 占满整盘、无 LVM、无备用
+      设备;且共置比预想更糟——kubelet、CRI-O 存储(6-8G/台)、kata-fc thin-pool 的
+      loop 文件全在同一个根 ext4 上。**要挪必须在 incus 虚拟化层给每台加一块虚拟盘**
+      (要挪的数据 <1G 实块 + 20G 稀疏文件,挪本身是分钟级)——需要用户/平台侧供盘,
+      加盘后顺带把 CRI-O 存储和 thin-pool 后备一起挪。
+      ⚠️ 当前实际敞口:devmapper 路径(fc)有 20G 池顶;**overlayfs 路径(runc/
+      kata-qemu/kata-clh,即现在所有 capsule)完全无界**,可直接写满根盘。
+- [ ] **P2 per-容器 rootfs 硬顶——机制已核清,分三层**:
+      ① containerd 的 per-snapshot 标签 `containerd.io/snapshot/max-size`
+      (`core/snapshots/snapshotter.go:60`)是标准接口,erofs snapshotter 真实现
+      (给可写层建定长块镜像);**部署的 v2.3.3 没有这个标签**(strings 探针 0 vs
+      对照 7),最早载于 **v2.4.0-beta.0**(f2b7791b,2026-04),暂无稳定版——
+      等 2.4.0 stable 或评估 beta;内核侧 erofs 模块齐(CONFIG_EROFS_FS=m + zstd)。
+      ② **CRI 协议对 Linux 没有 rootfs 大小字段**(`rootfs_size_in_bytes` 只在
+      WindowsContainerResources),按租户差异化须走 fork 越界通道(同 socket 上
+      snapshot 服务预建带标签的 snapshot,FORK.md §4.3.2 规矩内,但比 pause 重)。
+      ③ 不等 ①② 的过渡:节点级统一上限(devmapper `base_image_size` 或 erofs
+      `defaultSize`)+ 租户文档明说"大空间走 PVC"。
 
 ## O：租户开通清单（2026-08-13，给 222222 补齐时逐项踩出来的——开通控制器的规格）
 
