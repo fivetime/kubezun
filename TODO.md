@@ -1439,6 +1439,30 @@ memory_swap 列再改名,不可逆(当前列还不存在,无实际损失)。
 - [ ] （候选）nets/固定 IP 按 PoC 结论补齐
 - [ ] （顺手）linux_net.py ovs-vsctl → ovsdb（上游自己的 TODO，linux_net.py:48）
 
+## 缺口清修(2026-08-21,kubelet 契约盘点后一次清完,全部 E2E 验收)
+
+- [x] **runtimeClassName → capsule runtime 全链打通**(fork `00c4ab93`×2 + kubezun
+      `9d1cc4a` 前一提交):三处缺口一次修——① capsule 模板 schema 不收 runtime
+      (对象 v1.19 就有列,API 够不着);② kubezun 静默丢弃 pod 的 runtimeClassName;
+      ③ **CRI 驱动从不上报 runtimes,节点全是空表** → RuntimeFilter 把带 runtime 的
+      capsule 全判 NoValidHost(第一个带 runtime 的 capsule 就死在这)。上报改从
+      CRI Status 的 runtime_handlers 取(containerd 自己的配置,不会漂)。
+      **E2E**:pod `runtimeClassName: kata-fc` → capsule runtime=kata-fc 落 04,
+      容器内 `/` = `/dev/vdc` 7963MB——**devmapper 8G 硬顶第一次经完整产品路径成立**
+      (此前只有 ctr 旁路证据)。集群已建 RuntimeClass 对象 kata-fc(cluster 级,保留)。
+      ⚠️ RuntimeClass 治理归平台:B1 节点没有的 handler 也能被租户点名,失败是
+      runtime 自己的报错——平台要么按档位建 RuntimeClass,要么准入限制。
+- [x] **ephemeral-storage 两半修齐**(kubezun `9d1cc4a`):
+      ① 实测出比 fail-open 更早的一层:**节点根本不上报 ephemeral-storage 容量**,
+      声明了它的 pod 永远 Pending("Insufficient ephemeral-storage")——现按静态
+      配额镜像上报(`--capacity-ephemeral-storage`,默认 200Gi);
+      ② 调度进来之后不静默:CreatePod 发 Warning 事件 `EphemeralStorageNotEnforced`
+      (租户 describe 可见),明说可写层是平台定长、要保证空间走 PVC。不拒绝——
+      声明意图没有错,但绝不无声。
+- [x] **/metrics/resource 空族 500**(kubezun `d98f382`):空的 container 族对
+      prometheus 编码器是错误不是"没数据",一个租户的 pod 重启就打断 metrics-server
+      对该节点的整次抓取;空族改省略,节点两族恒在。实测 60s 零 500,kubectl top 正常。
+
 ## R:rootfs 写放大防线(2026-08-21,四路核实后立项——背景:租户任意路径写入不得写爆宿主机)
 
 - [ ] **P1 `/var/lib/containerd` 挪独立盘——核实后确认做不了原地挪,卡在虚拟化层**:
