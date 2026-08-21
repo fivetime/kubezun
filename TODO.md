@@ -1449,12 +1449,22 @@ memory_swap 列再改名,不可逆(当前列还不存在,无实际损失)。
       加盘后顺带把 CRI-O 存储和 thin-pool 后备一起挪。
       ⚠️ 当前实际敞口:devmapper 路径(fc)有 20G 池顶;**overlayfs 路径(runc/
       kata-qemu/kata-clh,即现在所有 capsule)完全无界**,可直接写满根盘。
-- [ ] **P2 per-容器 rootfs 硬顶——机制已核清,分三层**:
-      ① containerd 的 per-snapshot 标签 `containerd.io/snapshot/max-size`
-      (`core/snapshots/snapshotter.go:60`)是标准接口,erofs snapshotter 真实现
-      (给可写层建定长块镜像);**部署的 v2.3.3 没有这个标签**(strings 探针 0 vs
-      对照 7),最早载于 **v2.4.0-beta.0**(f2b7791b,2026-04),暂无稳定版——
-      等 2.4.0 stable 或评估 beta;内核侧 erofs 模块齐(CONFIG_EROFS_FS=m + zstd)。
+- [x] **P2a devmapper 档硬顶已生效(2026-08-21,用户升级 v2.3.4 + 配齐)**:
+      三节点 containerd 升至 **v2.3.4**(带 erofs 丢层修复 #13876);devmapper
+      插件三台全 ok,`base_image_size='8GB'` = fc 档 per-容器统一硬顶已上线。
+      ⚠️ 顺带修掉一处 8-07 起的漂移:133 的 kata.toml 与它的 .bak 方向调换
+      (好的躺在 .bak 里),devmapper 在 133 skip 了两周——50-kata.toml 把 fc 指向
+      devmapper,等于 133 上 fc 档一直会创建失败,这次恢复后三台一致
+      (md5 9bd05b,原文件留 .pre-restore)。**教训同"算哈希不看 git"**:
+      插件状态(ok/skip)每台都要问,配置文件长得一样不等于生效状态一样。
+- [ ] **P2b qemu/clh 档硬顶(现在所有 capsule 走的路,仍无界)——机制已核清**:
+      ① **v2.3.4 就够做统一硬顶**:erofs snapshotter 的 `default_size` toml 项
+      (v2.3.3 起就有,`blockMode: defaultSize > 0`)= 每容器定长块镜像,ENOSPC
+      真硬顶;还差三步:装 erofs-utils(三台都没有 mkfs.erofs)→ 配
+      `default_size` → qemu/clh 两 handler 切 snapshotter(已拉镜像会重新解包,
+      切换窗口要留意)。内核模块齐(CONFIG_EROFS_FS=m + zstd)。
+      per-snapshot **差异化**标签 `containerd.io/snapshot/max-size` 仍要等
+      v2.4.0(f2b7791b,现只有 beta)——但那只服务"按套餐分档",防写爆不需要它。
       ② **CRI 协议对 Linux 没有 rootfs 大小字段**(`rootfs_size_in_bytes` 只在
       WindowsContainerResources),按租户差异化须走 fork 越界通道(同 socket 上
       snapshot 服务预建带标签的 snapshot,FORK.md §4.3.2 规矩内,但比 pause 重)。
