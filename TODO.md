@@ -1476,8 +1476,17 @@ memory_swap 列再改名,不可逆(当前列还不存在,无实际损失)。
       真硬顶;还差三步:装 erofs-utils(三台都没有 mkfs.erofs)→ 配
       `default_size` → qemu/clh 两 handler 切 snapshotter(已拉镜像会重新解包,
       切换窗口要留意)。内核模块齐(CONFIG_EROFS_FS=m + zstd)。
-      per-snapshot **差异化**标签 `containerd.io/snapshot/max-size` 仍要等
-      v2.4.0(f2b7791b,现只有 beta)——但那只服务"按套餐分档",防写爆不需要它。
+      per-snapshot **差异化**(按套餐分档,防写爆不需要):**2026-08-21 把 2.4.0
+      的链路逐环核完,单靠 2.4.0 做不到**——snapshotter 层完成(erofs 按快照读
+      `max-size` 标签)、ctr 有 `--snapshotter-label`、sandbox 路径有 annotation
+      透传(`podsandbox/sandbox_run.go:188`,但只盖 pause 快照),**唯独 CRI 的
+      Linux 容器路径没接**(`snapshotterOpts()` 只做 remap;Windows 对照组全通:
+      `rootfs_size_in_bytes`→label,`container_create_windows.go:39-44`)。
+      正确路线 = **2.4.0 + 给 CRI 插件补几行**(照 sandbox/Windows 两个先例,把
+      ContainerConfig.Annotations 过 FilterInheritedLabels 进 snapshot opts),
+      Zun 侧一行 annotation;⚠️ 撤回旧说法"fork 预建带标签 snapshot"——
+      WithNewSnapshot 对已存在 key 报 AlreadyExists,预建不 compose,只会害创建失败。
+      Linux/Windows 的不对称本身是好的上游提案论据,到时先提 PR 别养私有补丁。
       ② **CRI 协议对 Linux 没有 rootfs 大小字段**(`rootfs_size_in_bytes` 只在
       WindowsContainerResources),按租户差异化须走 fork 越界通道(同 socket 上
       snapshot 服务预建带标签的 snapshot,FORK.md §4.3.2 规矩内,但比 pause 重)。
