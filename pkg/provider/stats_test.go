@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -153,3 +154,42 @@ func TestAdoptingAPodKeepsItsPublishedStatus(t *testing.T) {
 		t.Errorf("phase = %q, want Pending", p.pods["ns/new"].Status.Phase)
 	}
 }
+
+// TestMetricsResourceOmitsEmptyFamilies pins the scrape-killing shape: the
+// prometheus text encoder rejects a family with zero metrics, and the API
+// layer turns that into a 500 — so a tenant whose only pod is restarting
+// broke metrics-server's whole scrape of the node.
+func TestMetricsResourceOmitsEmptyFamilies(t *testing.T) {
+	p := &Provider{
+		pods:     map[string]*corev1.Pod{},
+		deleted:  map[string]types.UID{},
+		capsules: noCapsules{},
+		cpuRates: newRates(),
+	}
+	fams, err := p.GetMetricsResource(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range fams {
+		if len(f.Metric) == 0 {
+			t.Fatalf("family %q has no metrics; the text encoder rejects this "+
+				"and every scrape of the node returns 500", f.GetName())
+		}
+	}
+	// The node families must survive: a scrape of an idle node is empty of
+	// containers, not empty of answers.
+	if len(fams) < 2 {
+		t.Fatalf("expected at least the two node families, got %d", len(fams))
+	}
+}
+
+// noCapsules is the idle-node backend: no tenants, no capsules, no calls.
+type noCapsules struct{}
+
+func (noCapsules) For(context.Context, string) (*zun.CapsuleAPI, error) {
+	return nil, context.Canceled
+}
+func (noCapsules) Each(context.Context, func(string, *zun.CapsuleAPI) error) error {
+	return nil
+}
+func (noCapsules) TenantOf(string) (string, bool) { return "", false }

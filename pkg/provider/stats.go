@@ -252,7 +252,7 @@ func (p *Provider) GetMetricsResource(ctx context.Context) ([]*dto.MetricFamily,
 	}
 
 	now := time.Now().UnixMilli()
-	return []*dto.MetricFamily{
+	families := []*dto.MetricFamily{
 		family("node_cpu_usage_seconds_total", dto.MetricType_COUNTER,
 			"Cumulative cpu time consumed by this node", []*dto.Metric{{
 				Counter: &dto.Counter{Value: proto.Float64(float64(nodeCPU) / 1e9)}, TimestampMs: &now,
@@ -261,13 +261,25 @@ func (p *Provider) GetMetricsResource(ctx context.Context) ([]*dto.MetricFamily,
 			"Current working set of this node", []*dto.Metric{{
 				Gauge: &dto.Gauge{Value: proto.Float64(float64(nodeMem))}, TimestampMs: &now,
 			}}),
+	}
+	// A family with no metrics is not "nothing to report" to the text
+	// encoder, it is an error -- and the handler turns it into a 500, so a
+	// tenant with zero running containers took the whole scrape down with
+	// it (measured: metrics-server got 500s from a node whose only pod was
+	// restarting). Empty families are omitted, not sent hollow.
+	for _, f := range []*dto.MetricFamily{
 		family("container_cpu_usage_seconds_total", dto.MetricType_COUNTER,
 			"Cumulative cpu time consumed by a container", containerCPU),
 		family("container_memory_working_set_bytes", dto.MetricType_GAUGE,
 			"Current working set of a container", containerMem),
 		family("container_start_time_seconds", dto.MetricType_GAUGE,
 			"Start time of a container since the epoch", containerStart),
-	}, nil
+	} {
+		if len(f.Metric) > 0 {
+			families = append(families, f)
+		}
+	}
+	return families, nil
 }
 
 func family(name string, kind dto.MetricType, help string, metrics []*dto.Metric) *dto.MetricFamily {
