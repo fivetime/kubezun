@@ -52,6 +52,7 @@ type options struct {
 	capacityCPU          string
 	capacityMem          string
 	capacityPod          string
+	capacityEphemeral    string
 	logLevel             string
 	nsSelector           string
 	ingressProvider      string
@@ -121,6 +122,10 @@ func main() {
 		"node memory capacity; mirror the tenant's quota")
 	flag.StringVar(&o.capacityPod, "capacity-pods", envOr("KUBEZUN_CAPACITY_PODS", "0"),
 		"maximum pods; mirror the tenant's quota")
+	flag.StringVar(&o.capacityEphemeral, "capacity-ephemeral-storage",
+		envOr("KUBEZUN_CAPACITY_EPHEMERAL", "200Gi"),
+		"advertised ephemeral-storage capacity; without one, any pod declaring "+
+			"the resource is unschedulable on this node")
 	flag.StringVar(&o.vipNetwork, "vip-network-id", os.Getenv("KUBEZUN_VIP_NETWORK_ID"),
 		"network the VIP subnet belongs to; the Service address port is created on it")
 	flag.StringVar(&o.vipSubnet, "vip-subnet-id", os.Getenv("KUBEZUN_VIP_SUBNET_ID"),
@@ -494,15 +499,17 @@ func run(o options) error {
 			// exec fail with a NotFound that looks like a missing pod.
 			KubeletPort: kubeletPortOf(spec.listen),
 			Capacity: knode.Capacity{
-				CPU:    o.capacityCPU,
-				Memory: o.capacityMem,
-				Pods:   o.capacityPod,
+				CPU:              o.capacityCPU,
+				Memory:           o.capacityMem,
+				Pods:             o.capacityPod,
+				EphemeralStorage: o.capacityEphemeral,
 			},
 		})
 		nodeObj.Status.Conditions = []corev1.NodeCondition{knode.ReadyCondition()}
 
 		p, err := provider.New(provider.Config{
 			ServesNamespace:  set.Serves,
+			Events:           set.EventRecorder("kubezun"),
 			NetworkID:        o.networkID,
 			AvailabilityZone: spec.zunAZ,
 			Architecture:     spec.arch,

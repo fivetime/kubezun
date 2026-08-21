@@ -17,6 +17,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 
 	"github.com/fivetime/kubezun/pkg/netpol"
@@ -87,6 +88,10 @@ type Config struct {
 	// behind it. Nil means this node serves no claims, and a pod naming one is
 	// refused rather than started without its data.
 	ResolveClaim func(namespace, claim string) (zun.ClaimMount, error)
+
+	// Events surfaces per-pod warnings to the tenant. Nil drops them; no
+	// behavior depends on delivery.
+	Events record.EventRecorder
 }
 
 // Provider runs pods as Zun capsules for a single tenant.
@@ -135,6 +140,20 @@ type Provider struct {
 	tokens TokenMinter
 	// tokenExpiries is when each pod's token runs out, guarded by mu.
 	tokenExpiries map[string]tokenExpiry
+}
+
+// declaresEphemeralStorage reports whether any container asked for the one
+// resource this node cannot enforce.
+func declaresEphemeralStorage(pod *corev1.Pod) bool {
+	for _, c := range pod.Spec.Containers {
+		if _, ok := c.Resources.Limits[corev1.ResourceEphemeralStorage]; ok {
+			return true
+		}
+		if _, ok := c.Resources.Requests[corev1.ResourceEphemeralStorage]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // ObjectReader reads one object at a time.
@@ -218,6 +237,20 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) (err error) {
 	}
 
 	key := zun.PodKey(pod.Namespace, pod.Name)
+
+	// ⚠️ ephemeral-storage is accepted by the API server and enforced by
+	// nobody here: no kubelet watches these pods, so the eviction that backs
+	// this field on an ordinary node never runs, and the writable layer is
+	// capped at a platform-set size regardless of the number in the spec.
+	// The pod is not refused -- the workload is not wrong to declare its
+	// intent -- but the tenant must be able to see the field did nothing,
+	// or they will size a workload against a limit that does not exist.
+	if p.cfg.Events != nil && declaresEphemeralStorage(pod) {
+		p.cfg.Events.Eventf(pod, corev1.EventTypeWarning, "EphemeralStorageNotEnforced",
+			"ephemeral-storage requests and limits are not enforced on this node: "+
+				"the container writable layer has a fixed platform-set size; "+
+				"use a PersistentVolumeClaim for data that needs guaranteed space")
+	}
 
 	capsules, err := p.capsules.For(ctx, pod.Namespace)
 	if err != nil {

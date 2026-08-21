@@ -48,6 +48,13 @@ type Capacity struct {
 	CPU    string
 	Memory string
 	Pods   string
+	// EphemeralStorage is advertised so pods declaring the resource can
+	// schedule at all: a node listing no ephemeral-storage answers every
+	// such pod with "Insufficient ephemeral-storage" -- measured, a pod
+	// carrying only a limit never left Pending. The number is the same
+	// static-quota mirror as the others; per-pod enforcement is the
+	// writable-layer cap, and the pod gets a warning event saying so.
+	EphemeralStorage string
 }
 
 // Options describes a tenant's virtual node.
@@ -187,11 +194,15 @@ func buildCapacity(c Capacity) corev1.ResourceList {
 	if c.Pods == "" {
 		c.Pods = "0"
 	}
-	return corev1.ResourceList{
+	out := corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse(c.CPU),
 		corev1.ResourceMemory: resource.MustParse(c.Memory),
 		corev1.ResourcePods:   resource.MustParse(c.Pods),
 	}
+	if c.EphemeralStorage != "" {
+		out[corev1.ResourceEphemeralStorage] = resource.MustParse(c.EphemeralStorage)
+	}
+	return out
 }
 
 // ReadyCondition reports a node whose control and data planes are both usable.
