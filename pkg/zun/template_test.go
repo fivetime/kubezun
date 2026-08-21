@@ -370,3 +370,30 @@ func TestOwnerUIDGroupsReplicasNotPods(t *testing.T) {
 		t.Fatalf("a bare pod claimed an owner: %q", bare[LabelOwnerUID])
 	}
 }
+
+// TestRuntimeClassNameReachesTheTemplate pins the tier-selection chain's first
+// hop: a pod's runtimeClassName must land in the template verbatim, and its
+// absence must leave the field out entirely — an empty string sent anyway
+// would read as "the empty runtime" to a schema that validates the key.
+func TestRuntimeClassNameReachesTheTemplate(t *testing.T) {
+	fc := "kata-fc"
+	pd := pod(func(p *corev1.Pod) { p.Spec.RuntimeClassName = &fc })
+	raw, err := BuildTemplate(pd, TemplateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decode(t, raw)
+	if got["runtime"] != "kata-fc" {
+		t.Fatalf("runtimeClassName did not reach the template: %v — the tier "+
+			"the tenant asked for silently fell back to the node default", got["runtime"])
+	}
+
+	raw, err = BuildTemplate(pod(), TemplateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = decode(t, raw)
+	if _, present := got["runtime"]; present {
+		t.Fatal("an unset runtimeClassName sent a runtime key anyway")
+	}
+}

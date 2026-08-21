@@ -292,6 +292,7 @@ type template struct {
 	SecurityGroups   []string `json:"securityGroups,omitempty"`
 	AvailabilityZone string   `json:"availabilityZone,omitempty"`
 	Architecture     string   `json:"architecture,omitempty"`
+	Runtime          string   `json:"runtime,omitempty"`
 }
 
 // annotationsFor carries settings the capsule needs but has no field for.
@@ -403,6 +404,14 @@ func BuildTemplate(pod *corev1.Pod, opts TemplateOptions) ([]byte, error) {
 		Spec:             spec{RestartPolicy: restartPolicy(pod)},
 		AvailabilityZone: opts.AvailabilityZone,
 		Architecture:     opts.Architecture,
+		// The pod's runtimeClassName, verbatim. Before this it was silently
+		// dropped -- a tenant asking for the Firecracker tier ran under the
+		// node default and nothing anywhere said so. Verbatim on purpose:
+		// which handlers exist is the compute node's truth, and a whitelist
+		// here would go stale the day the platform adds a tier. A name no
+		// node offers fails the capsule with the runtime's own error, which
+		// the pod reports -- loud, attributable, and not this layer's guess.
+		Runtime: runtimeClass(pod),
 	}
 	if opts.NodeName != "" {
 		// Written only when known: an empty value would claim ownership by a
@@ -516,6 +525,14 @@ func buildResources(r corev1.ResourceRequirements) *resources {
 		out.Requests.Memory = mem.Value() / (1024 * 1024)
 	}
 	return out
+}
+
+// runtimeClass is the pod's requested runtime tier, empty when unset.
+func runtimeClass(pod *corev1.Pod) string {
+	if pod.Spec.RuntimeClassName == nil {
+		return ""
+	}
+	return *pod.Spec.RuntimeClassName
 }
 
 // restartPolicy returns the value the capsule template schema accepts. The
