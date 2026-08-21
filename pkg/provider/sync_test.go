@@ -128,3 +128,40 @@ func TestSyncDoesNotJudgeAPodWhoseTenantWasSkipped(t *testing.T) {
 		t.Fatal("the answering tenant was never listed, so the check above proves nothing")
 	}
 }
+
+// TestFingerprintHearsALateStartTime pins the third hop of the startedAt
+// chain: the backend learns a container's start time on a poll AFTER the one
+// that reported it running, so the only visible difference between two
+// statuses is the timestamp. Measured before this: the Zun API served
+// started_at while every pod stayed null — the fingerprint judged the two
+// statuses identical and the update was never sent.
+func TestFingerprintHearsALateStartTime(t *testing.T) {
+	pod := &corev1.Pod{Status: corev1.PodStatus{
+		Phase: corev1.PodRunning,
+		ContainerStatuses: []corev1.ContainerStatus{{
+			Name:  "c",
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+		}},
+	}}
+	before := statusFingerprint(pod)
+	pod.Status.ContainerStatuses[0].State.Running.StartedAt =
+		metav1.NewTime(time.Date(2026, 8, 16, 17, 43, 13, 0, time.UTC))
+	if statusFingerprint(pod) == before {
+		t.Fatal("a start time arriving without any other change was invisible " +
+			"to the fingerprint; the pod would report startedAt null forever")
+	}
+
+	// The exit-code half of the same blindness: 1 and 2 both read "Error".
+	term := func(code int32) *corev1.Pod {
+		return &corev1.Pod{Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					Reason: "Error", ExitCode: code,
+				}},
+			}},
+		}}
+	}
+	if statusFingerprint(term(1)) == statusFingerprint(term(2)) {
+		t.Fatal("two different exit codes under one reason fingerprint the same")
+	}
+}

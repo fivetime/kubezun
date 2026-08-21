@@ -249,10 +249,17 @@ func statusFingerprint(pod *corev1.Pod) string {
 
 func containerStateKey(st corev1.ContainerState) string {
 	switch {
+	// The timestamps are part of the key: a start time can arrive on a later
+	// poll than the state itself (the backend learns it lazily), and without
+	// it here the status would stay steady-looking and never be re-sent.
 	case st.Running != nil:
-		return "running"
+		return "running@" + strconv.FormatInt(st.Running.StartedAt.Unix(), 10)
 	case st.Terminated != nil:
-		return "terminated:" + st.Terminated.Reason
+		// The exit code too: 1 and 2 both read "Error", and a reason-only key
+		// would swallow the difference a Job's consumer acts on.
+		return "terminated:" + st.Terminated.Reason +
+			":" + strconv.Itoa(int(st.Terminated.ExitCode)) +
+			"@" + strconv.FormatInt(st.Terminated.StartedAt.Unix(), 10)
 	case st.Waiting != nil:
 		return "waiting:" + st.Waiting.Reason
 	}
