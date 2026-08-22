@@ -33,6 +33,11 @@ spec:
         any:
           - resources:
               kinds: [Pod]
+              # ⚠️ Without this a rule matches DELETE too, and a validate rule that denies
+              # an object also denies REMOVING it: anything that got in before the policy
+              # — or through a gap — is locked in place forever. Measured: a pod left by
+              # a boundary test could not be deleted for nine days, force included.
+              operations: [CREATE, UPDATE]
               namespaceSelector:
                 matchExpressions:
                   - {key: knaas.io/tenant, operator: Exists}
@@ -74,6 +79,11 @@ spec:
         any:
           - resources:
               kinds: [Pod]
+              # ⚠️ Without this a rule matches DELETE too, and a validate rule that denies
+              # an object also denies REMOVING it: anything that got in before the policy
+              # — or through a gap — is locked in place forever. Measured: a pod left by
+              # a boundary test could not be deleted for nine days, force included.
+              operations: [CREATE, UPDATE]
               namespaceSelector:
                 matchExpressions:
                   - {key: knaas.io/tenant, operator: Exists}
@@ -108,6 +118,11 @@ spec:
         any:
           - resources:
               kinds: [Pod]
+              # ⚠️ Without this a rule matches DELETE too, and a validate rule that denies
+              # an object also denies REMOVING it: anything that got in before the policy
+              # — or through a gap — is locked in place forever. Measured: a pod left by
+              # a boundary test could not be deleted for nine days, force included.
+              operations: [CREATE, UPDATE]
               namespaceSelector:
                 matchExpressions:
                   - {key: knaas.io/tenant, operator: Exists}
@@ -146,6 +161,11 @@ spec:
         any:
           - resources:
               kinds: [Pod]
+              # ⚠️ Without this a rule matches DELETE too, and a validate rule that denies
+              # an object also denies REMOVING it: anything that got in before the policy
+              # — or through a gap — is locked in place forever. Measured: a pod left by
+              # a boundary test could not be deleted for nine days, force included.
+              operations: [CREATE, UPDATE]
               namespaceSelector:
                 matchExpressions:
                   - {key: knaas.io/tenant, operator: Exists}
@@ -188,6 +208,11 @@ spec:
         any:
           - resources:
               kinds: [DaemonSet]
+              # ⚠️ Without this a rule matches DELETE too, and a validate rule that denies
+              # an object also denies REMOVING it: anything that got in before the policy
+              # — or through a gap — is locked in place forever. Measured: a pod left by
+              # a boundary test could not be deleted for nine days, force included.
+              operations: [CREATE, UPDATE]
               namespaceSelector:
                 matchExpressions:
                   - {key: knaas.io/tenant, operator: Exists}
