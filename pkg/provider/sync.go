@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,6 +29,22 @@ const capsuleAppearGrace = 30 * time.Second
 // node ever having seen it, and nothing in Zun retries. Failing the pod lets
 // its controller replace it, which is the only thing that recovers.
 const capsuleCreateTimeout = 10 * time.Minute
+
+// terminalCapsuleGrace is how long a pod that has finished keeps its capsule.
+//
+// ⚠️ A capsule holds a Neutron port, and the port holds an address out of the
+// tenant's own subnet. Kubernetes keeps terminal pod objects around for
+// post-mortem -- PodGC's default threshold is 12500 of them -- so without this
+// a workload that crash-loops takes an address out of a /24 on every attempt
+// and never gives one back, while the tenant's live pod count stays flat. A
+// real kubelet has no such problem: the sandbox is torn down when the pod
+// finishes and only the log files outlive it.
+//
+// The wait is the trade this cannot avoid: `kubectl logs` on a finished pod
+// reads the capsule, so reclaiming it immediately would take the post-mortem
+// away with the address. An hour is long enough to look, short enough that a
+// crash loop cannot exhaust a subnet.
+const terminalCapsuleGrace = time.Hour
 
 func (p *Provider) syncLoop(ctx context.Context) {
 	t := time.NewTicker(syncInterval)
@@ -97,6 +114,16 @@ func (p *Provider) syncOnce(ctx context.Context) error {
 			// never ran. The orphan sweep removes it; until then this pod has
 			// no capsule.
 			found = false
+		}
+		if found && isTerminal(pod) {
+			// The pod is finished but its capsule is still there, holding the
+			// address. Nothing will come for it: the pod controller ignores
+			// terminal pods (virtual-kubelet node/podcontroller.go:620), so
+			// even deleting the pod object does not reach DeletePod -- the
+			// orphan sweep is what eventually collects it, and only once the
+			// object is gone, which may be never.
+			p.reclaimFinished(ctx, pod, cap)
+			continue
 		}
 		if !found {
 			// A pod already reported terminal has nothing left to reconcile;
@@ -230,6 +257,52 @@ func (p *Provider) updateStatus(pod *corev1.Pod, mutate func(*corev1.Pod)) {
 	if changed {
 		notify(updated)
 	}
+}
+
+func isTerminal(pod *corev1.Pod) bool {
+	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
+}
+
+// reclaimFinished releases a finished pod's capsule, and with it the address
+// the capsule was holding, once the grace period has passed.
+//
+// The pod's own status already carries the outcome -- exit code, reason, and
+// both timestamps -- so nothing a consumer reads is lost with the capsule; the
+// logs are, which is what the grace period is for.
+func (p *Provider) reclaimFinished(ctx context.Context, pod *corev1.Pod, cap *zun.Capsule) {
+	finished := finishedAt(pod)
+	if finished.IsZero() || time.Since(finished) < terminalCapsuleGrace {
+		return
+	}
+	capsules, err := p.capsules.For(ctx, pod.Namespace)
+	if err != nil {
+		return // no credential this round; the next sweep comes back
+	}
+	key := zun.PodKey(pod.Namespace, pod.Name)
+	if err := capsules.Delete(ctx, cap.UUID); err != nil && !errdefs.IsNotFound(err) {
+		log.G(ctx).WithField("pod", key).WithField("capsule", cap.UUID).
+			WithError(err).Warn("could not release a finished pod's capsule")
+		return
+	}
+	log.G(ctx).WithField("pod", key).WithField("capsule", cap.UUID).
+		Info("released a finished pod's capsule and its address")
+}
+
+// finishedAt is when the last of a pod's containers stopped. Falls back to the
+// pod's start time so a terminal pod whose containers report nothing -- failed
+// before any container ran -- still ages out instead of holding an address
+// forever.
+func finishedAt(pod *corev1.Pod) time.Time {
+	var last time.Time
+	for _, cs := range pod.Status.ContainerStatuses {
+		if t := cs.State.Terminated; t != nil && t.FinishedAt.After(last) {
+			last = t.FinishedAt.Time
+		}
+	}
+	if last.IsZero() && pod.Status.StartTime != nil {
+		last = pod.Status.StartTime.Time
+	}
+	return last
 }
 
 func statusFingerprint(pod *corev1.Pod) string {

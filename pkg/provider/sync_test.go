@@ -165,3 +165,53 @@ func TestFingerprintHearsALateStartTime(t *testing.T) {
 		t.Fatal("two different exit codes under one reason fingerprint the same")
 	}
 }
+
+// TestFinishedPodReleasesItsCapsule pins the address leak: a pod that has
+// finished keeps a capsule, the capsule keeps a Neutron port, and the port
+// keeps an address out of the tenant's own subnet. Nothing else collects it —
+// the pod controller ignores terminal pods, so even deleting the object does
+// not reach DeletePod — so a crash-looping workload drains a /24 while its
+// live pod count never moves.
+func TestFinishedPodReleasesItsCapsule(t *testing.T) {
+	finished := func(ago time.Duration) *corev1.Pod {
+		end := metav1.NewTime(time.Now().Add(-ago))
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "111111-default", Name: "job", UID: "u1"},
+			Status: corev1.PodStatus{
+				Phase:     corev1.PodFailed,
+				StartTime: &end,
+				ContainerStatuses: []corev1.ContainerStatus{{
+					Name: "c",
+					State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 1, Reason: "Error", FinishedAt: end,
+					}},
+				}},
+			},
+		}
+	}
+
+	// Inside the grace period the capsule stays: the logs are still readable
+	// and that is what the wait buys.
+	if got := finishedAt(finished(5 * time.Minute)); time.Since(got) > terminalCapsuleGrace {
+		t.Fatal("a pod that finished five minutes ago was judged past its grace period")
+	}
+	// Past it, the capsule is due for release.
+	if got := finishedAt(finished(2 * time.Hour)); time.Since(got) < terminalCapsuleGrace {
+		t.Fatal("a pod that finished two hours ago was not judged past its grace period")
+	}
+
+	// ⚠️ The pod that failed before any container ran reports no terminated
+	// state at all; without the start-time fallback it would hold its address
+	// forever, which is the leak in its worst shape.
+	noContainers := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "111111-default", Name: "stillborn"},
+		Status: corev1.PodStatus{
+			Phase:     corev1.PodFailed,
+			StartTime: &metav1.Time{Time: time.Now().Add(-3 * time.Hour)},
+		},
+	}
+	if finishedAt(noContainers).IsZero() {
+		t.Fatal("a pod that failed before any container ran has no age, so its " +
+			"capsule would never be released")
+	}
+}
