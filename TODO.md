@@ -1439,6 +1439,33 @@ memory_swap 列再改名,不可逆(当前列还不存在,无实际损失)。
 - [ ] （候选）nets/固定 IP 按 PoC 结论补齐
 - [ ] （顺手）linux_net.py ovs-vsctl → ovsdb（上游自己的 TODO，linux_net.py:48）
 
+## 终态 pod 的两个泄漏(2026-08-22,查"测试床 pod 为什么失败"顺出来的)
+
+**起因先说清**:8-16 17:34 整个实验床(node-01 + 133/134/135)被重启,四台开机时间
+同在一分钟内;容器 17:35:20 记 `exit:255`(随宿主机被杀),17:43 替补起来并稳定运行
+至今——**自愈链路是通的,那次失败不是缺陷**。pod 上那句 `namespace ... is not served
+by node ...` 是重启后命名空间缓存未同步时的 fail-closed 快照,与今日无关。
+
+但残留清不掉这件事本身查出两个真缺口,均已修:
+
+- [x] **终态 pod 无限期扣住 capsule 和 IP**(kubezun `7f913c0`):capsule 持有 Neutron
+      端口、端口持有租户子网里的一个地址,而**三方都不来收**——sync 跳过终态 pod、
+      VK 库的 pod 控制器同样忽略终态 pod(`podcontroller.go:620`,所以**删对象都到不了
+      DeletePod**)、K8s PodGC 默认阈值 12500。⇒ 崩溃循环的工作负载能把 /24 抽干,
+      而租户活着的 pod 数一动不动(真 kubelet 无此问题:pod 结束即拆 sandbox,只有
+      日志文件留下)。现改为**最后一个容器停止满 1 小时后释放 capsule**;1 小时是
+      躲不掉的取舍(`kubectl logs` 读的就是 capsule),pod 自身状态已含退出码/原因/
+      两个时间戳,消费者读到的东西不变。⚠️ 钉住最坏形状:**容器还没跑起来就失败的
+      pod 没有 terminated 状态**,不回落到 startTime 就永远不释放。
+- [x] **Kyverno 策略把自己的违规对象锁死**(kubezun `7f913c0`):规则 match 不写
+      operations 就**连 DELETE 一起匹配**,而 validate 规则拒绝一个对象 = 同时拒绝
+      **删除**它。实测:越界测试留下的 pod **卡了 9 天,force 也删不掉**,每次报错
+      都是策略在准确描述一个没人能处置的违规。五条规则全部限定 CREATE/UPDATE。
+      ⚠️ 改完复验过边界仍在:在租户2 命名空间建点名租户1 pool 的 pod,mutate 规则
+      照旧把它改写回自己的 pool(**纠正而非拒绝,是更强的形态**),validate 是兜底。
+- [x] **测试床已清空**:0 失败 pod、0 Stopped capsule(6 Running = 三租户 coredns),
+      释放 5 个 IP。
+
 ## 缺口清修(2026-08-21,kubelet 契约盘点后一次清完,全部 E2E 验收)
 
 - [x] **runtimeClassName → capsule runtime 全链打通**(fork `00c4ab93`×2 + kubezun
